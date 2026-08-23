@@ -1,6 +1,9 @@
 pub mod event;
 
-pub use event::{ExecEvent, ObservedEvent};
+pub use event::{
+    ExecEvent, FileEvent, FileKind, NetEvent, ObservedEvent, RenameEvent, TrafficSummary,
+    humanize_bytes,
+};
 
 pub const LABEL_WIDTH: usize = 10;
 
