@@ -1,0 +1,25 @@
+[package]
+name = "electric-eye-ebpf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "electric-eye-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1"
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+
+[workspace]

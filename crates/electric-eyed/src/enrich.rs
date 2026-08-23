@@ -1,7 +1,30 @@
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessStat {
+    pub ppid: u32,
+    pub start_ticks: u64,
+}
+
 pub fn resolve_exe(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+pub fn process_stat(pid: u32) -> Option<ProcessStat> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat(&raw)
+}
+
+pub fn parse_stat(raw: &str) -> Option<ProcessStat> {
+    let after_comm = raw.rsplit_once(") ")?;
+    let fields = after_comm.1.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 20 {
+        return None;
+    }
+    Some(ProcessStat {
+        ppid: fields[1].parse().ok()?,
+        start_ticks: fields[19].parse().ok()?,
+    })
 }
 
 pub fn argv0(pid: u32) -> Option<String> {
@@ -50,6 +73,24 @@ mod tests {
         assert!(resolve_exe(bogus).is_none());
         assert!(argv0(bogus).is_none());
         assert!(systemd_unit(bogus).is_none());
+    }
+
+    #[test]
+    fn parses_stat_with_parens_in_comm() {
+        let raw = "123 (chrome:renderer) S 456 123 123 0 -1 4194560 ".to_owned()
+            + &"0 ".repeat(12)
+            + "987654 0 0 0 0 0 0";
+        let stat = parse_stat(&raw).expect("well-formed stat line must parse");
+        assert_eq!(stat.ppid, 456);
+        assert_eq!(stat.start_ticks, 987654);
+    }
+
+    #[test]
+    fn rejects_malformed_stat() {
+        assert!(parse_stat("garbage").is_none());
+        assert!(parse_stat("").is_none());
+        let short = "12 (sh) S 1".to_string();
+        assert!(parse_stat(&short).is_none());
     }
 
     fn find_absent_pid() -> u32 {

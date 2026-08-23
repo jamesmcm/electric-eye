@@ -73,9 +73,11 @@ fn print_exec(event: &RawExecEvent, registry: &ProvenanceRegistry) {
         .or_else(|| enrich::argv0(event.pid).map(PathBuf::from))
         .unwrap_or_else(|| "(exited)".into());
 
+    let stat = enrich::process_stat(event.pid);
+
     let exec = ExecEvent {
         pid: event.pid,
-        ppid: event.ppid,
+        ppid: stat.map(|s| s.ppid).unwrap_or(event.ppid),
         uid: event.uid,
         comm: event.comm_str(),
         exe,
