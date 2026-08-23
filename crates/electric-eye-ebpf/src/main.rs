@@ -35,7 +35,7 @@ fn try_emit() -> Result<(), i64> {
         return Ok(());
     };
 
-    let Some(mut slot) = (unsafe { EXEC_EVENTS.reserve::<RawExecEvent>(0) }) else {
+    let Some(mut slot) = EXEC_EVENTS.reserve::<RawExecEvent>(0) else {
         return Ok(());
     };
 
