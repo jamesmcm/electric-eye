@@ -1,0 +1,21 @@
+[package]
+name = "electric-eyed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "electric-eyed"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+libc.workspace = true
+aya = "0.13"
+electric-eye-core = { path = "../electric-eye-core" }
+electric-eye-nix = { path = "../electric-eye-nix" }
+
+[dev-dependencies]
+tempfile = "3"

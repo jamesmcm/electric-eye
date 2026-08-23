@@ -1,0 +1,12 @@
+[package]
+name = "electric-eye-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "electric-eye"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
