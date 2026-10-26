@@ -16,19 +16,20 @@ use aya_ebpf::{
 pub const KIND_EXEC: u32 = 0;
 pub const KIND_CONNECT: u32 = 1;
 pub const KIND_LISTEN: u32 = 2;
-pub const KIND_FILE_WRITE: u32 = 3;
+pub const KIND_FILE_OPEN: u32 = 3;
 pub const KIND_FILE_UNLINK: u32 = 4;
 pub const KIND_FILE_RENAME: u32 = 5;
 pub const KIND_EXIT: u32 = 6;
 pub const KIND_ACCEPT: u32 = 7;
+pub const KIND_FILE_WRITE: u32 = 8;
+pub const KIND_FD_DUP: u32 = 9;
+pub const KIND_FD_CLOSE: u32 = 10;
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 const IPPROTO_TCP: u16 = 6;
 
-const TCP_ESTABLISHED: i32 = 1;
 const TCP_SYN_SENT: i32 = 2;
-const TCP_SYN_RECV: i32 = 3;
 const TCP_LISTEN: i32 = 10;
 
 const O_ACCMODE: i32 = 0o3;
@@ -58,10 +59,13 @@ pub struct SockOffsets {
 pub struct SyscallOffsets {
     pub openat_filename: u32,
     pub openat_flags: u32,
+    pub openat_ret: u32,
     pub openat2_filename: u32,
     pub openat2_how: u32,
+    pub openat2_ret: u32,
     pub open_filename: u32,
     pub open_flags: u32,
+    pub open_ret: u32,
     pub unlinkat_pathname: u32,
     pub unlink_pathname: u32,
     pub rmdir_pathname: u32,
@@ -71,6 +75,36 @@ pub struct SyscallOffsets {
     pub renameat_newname: u32,
     pub renameat2_oldname: u32,
     pub renameat2_newname: u32,
+    pub write_fd: u32,
+    pub write_count: u32,
+    pub accept_ret: u32,
+    pub accept4_ret: u32,
+    pub accept_fd: u32,
+    pub accept_sockaddr: u32,
+    pub accept_addrlen: u32,
+    pub accept4_fd: u32,
+    pub accept4_sockaddr: u32,
+    pub accept4_addrlen: u32,
+    pub dup2_oldfd: u32,
+    pub dup2_newfd: u32,
+    pub dup3_oldfd: u32,
+    pub dup3_newfd: u32,
+    pub close_fd: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PendingOpen {
+    pub path: u64,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PendingAccept {
+    pub peer: u64,
+    pub peer_len: u64,
+    pub listen_fd: u32,
 }
 
 #[repr(C)]
@@ -106,9 +140,43 @@ pub struct RawPathEvent {
     pub kind: u32,
     pub pid: u32,
     pub uid: u32,
-    pub pad: u32,
+    pub flags: u32,
+    pub fd: u32,
     pub comm: [u8; 16],
     pub path: [u8; PATH_LEN],
+}
+
+#[repr(C)]
+pub struct RawWriteEvent {
+    pub kind: u32,
+    pub pid: u32,
+    pub uid: u32,
+    pub fd: u32,
+    pub count: u64,
+    pub comm: [u8; 16],
+}
+
+#[repr(C)]
+pub struct RawAcceptEvent {
+    pub kind: u32,
+    pub pid: u32,
+    pub uid: u32,
+    pub fd: u32,
+    pub listen_fd: u32,
+    pub family: u32,
+    pub port: u32,
+    pub addr: [u8; 16],
+    pub comm: [u8; 16],
+}
+
+#[repr(C)]
+pub struct RawFdEvent {
+    pub kind: u32,
+    pub pid: u32,
+    pub uid: u32,
+    pub oldfd: u32,
+    pub newfd: u32,
+    pub comm: [u8; 16],
 }
 
 #[repr(C)]
@@ -132,10 +200,20 @@ static SOCK_OFFSETS: HashMap<u32, SockOffsets> = HashMap::with_max_entries(1, 0)
 static SYSCALL_OFFSETS: HashMap<u32, SyscallOffsets> = HashMap::with_max_entries(1, 0);
 
 #[map]
+static PENDING_OPEN: HashMap<u32, PendingOpen> = HashMap::with_max_entries(8192, 0);
+
+#[map]
+static PENDING_ACCEPT: HashMap<u32, PendingAccept> = HashMap::with_max_entries(4096, 0);
+
+#[map]
 static NET_BYTES: HashMap<u32, NetTotals> = HashMap::with_max_entries(16384, 0);
 
 fn current_tgid() -> u32 {
     (bpf_get_current_pid_tgid() >> 32) as u32
+}
+
+fn current_tid() -> u32 {
+    bpf_get_current_pid_tgid() as u32
 }
 
 fn current_ids() -> (u32, u32) {
@@ -169,7 +247,7 @@ fn read_user_path(ptr: u64, buf: &mut [u8; PATH_LEN]) -> Result<(), ()> {
     Ok(())
 }
 
-fn emit_path_record(p: *mut RawPathEvent, kind: u32, path_ptr: u64) -> bool {
+fn emit_path_record(p: *mut RawPathEvent, kind: u32, path_ptr: u64, flags: u32, fd: u32) -> bool {
     let Ok(comm) = current_comm() else {
         return false;
     };
@@ -178,18 +256,19 @@ fn emit_path_record(p: *mut RawPathEvent, kind: u32, path_ptr: u64) -> bool {
         (*p).kind = kind;
         (*p).pid = pid;
         (*p).uid = uid;
-        (*p).pad = 0;
+        (*p).flags = flags;
+        (*p).fd = fd;
         (*p).comm = comm;
     }
     read_user_path(path_ptr, unsafe { &mut (*p).path }).is_ok()
 }
 
-fn reserve_path_event(kind: u32, path_ptr: u64) {
+fn reserve_path_event(kind: u32, path_ptr: u64, flags: u32, fd: u32) {
     let Some(mut slot) = EVENTS.reserve::<RawPathEvent>(0) else {
         return;
     };
     let p = slot.as_mut_ptr();
-    if emit_path_record(p, kind, path_ptr) {
+    if emit_path_record(p, kind, path_ptr, flags, fd) {
         slot.submit(0);
     } else {
         slot.discard(0);
@@ -222,6 +301,44 @@ fn reserve_rename_event(old_ptr: u64, new_ptr: u64) {
 
 fn writable_open(flags: i32) -> bool {
     (flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)) != 0
+}
+
+fn note_open(path: u64, flags: u32) {
+    if path == 0 {
+        return;
+    }
+    let key = current_tid();
+    let _ = PENDING_OPEN.insert(&key, PendingOpen { path, flags }, 0);
+}
+
+fn finish_open(ctx: &TracePointContext, ret_offset: u32) -> Result<(), ()> {
+    let key = current_tid();
+    let Some(pending) = PENDING_OPEN.get_ptr(&key).map(|p| unsafe { *p }) else {
+        return Ok(());
+    };
+    let _ = PENDING_OPEN.remove(&key);
+    let ret: i64 = ctx_read(ctx, ret_offset as usize)?;
+    if ret < 0 || ret > u32::MAX as i64 {
+        return Ok(());
+    }
+    reserve_path_event(KIND_FILE_OPEN, pending.path, pending.flags, ret as u32);
+    Ok(())
+}
+
+enum OpenKind {
+    Openat,
+    Openat2,
+    Open,
+}
+
+fn try_finish_open(ctx: &TracePointContext, kind: OpenKind) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let ret_offset = match kind {
+        OpenKind::Openat => offs.openat_ret,
+        OpenKind::Openat2 => offs.openat2_ret,
+        OpenKind::Open => offs.open_ret,
+    };
+    finish_open(ctx, ret_offset)
 }
 
 #[tracepoint(category = "sched", name = "sched_process_exec")]
@@ -287,12 +404,10 @@ fn electric_eye_sock_state(ctx: TracePointContext) -> i32 {
 fn try_sock_state(ctx: &TracePointContext) -> Result<(), ()> {
     let offs: SockOffsets = unsafe { *SOCK_OFFSETS.get(&0).ok_or(())? };
 
-    let oldstate: i32 = ctx_read(ctx, offs.oldstate as usize)?;
     let newstate: i32 = ctx_read(ctx, offs.newstate as usize)?;
     let kind = match newstate {
         TCP_SYN_SENT => KIND_CONNECT,
         TCP_LISTEN => KIND_LISTEN,
-        TCP_ESTABLISHED if oldstate == TCP_SYN_RECV => KIND_ACCEPT,
         _ => return Ok(()),
     };
 
@@ -362,8 +477,16 @@ fn try_openat(ctx: &TracePointContext) -> Result<(), ()> {
         return Ok(());
     }
     let filename: u64 = ctx_read(ctx, offs.openat_filename as usize)?;
-    reserve_path_event(KIND_FILE_WRITE, filename);
+    note_open(filename, flags as u32);
     Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_exit_openat")]
+fn electric_eye_openat_exit(ctx: TracePointContext) -> i32 {
+    match try_finish_open(&ctx, OpenKind::Openat) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
 }
 
 #[tracepoint(category = "syscalls", name = "sys_enter_openat2")]
@@ -385,8 +508,16 @@ fn try_openat2(ctx: &TracePointContext) -> Result<(), ()> {
         return Ok(());
     }
     let filename: u64 = ctx_read(ctx, offs.openat2_filename as usize)?;
-    reserve_path_event(KIND_FILE_WRITE, filename);
+    note_open(filename, flags as u32);
     Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_exit_openat2")]
+fn electric_eye_openat2_exit(ctx: TracePointContext) -> i32 {
+    match try_finish_open(&ctx, OpenKind::Openat2) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
 }
 
 #[tracepoint(category = "syscalls", name = "sys_enter_open")]
@@ -404,8 +535,16 @@ fn try_open(ctx: &TracePointContext) -> Result<(), ()> {
         return Ok(());
     }
     let filename: u64 = ctx_read(ctx, offs.open_filename as usize)?;
-    reserve_path_event(KIND_FILE_WRITE, filename);
+    note_open(filename, flags as u32);
     Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_exit_open")]
+fn electric_eye_open_exit(ctx: TracePointContext) -> i32 {
+    match try_finish_open(&ctx, OpenKind::Open) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
 }
 
 #[tracepoint(category = "syscalls", name = "sys_enter_unlinkat")]
@@ -419,7 +558,7 @@ fn electric_eye_unlinkat(ctx: TracePointContext) -> i32 {
 fn try_unlinkat(ctx: &TracePointContext) -> Result<(), ()> {
     let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
     let pathname: u64 = ctx_read(ctx, offs.unlinkat_pathname as usize)?;
-    reserve_path_event(KIND_FILE_UNLINK, pathname);
+    reserve_path_event(KIND_FILE_UNLINK, pathname, 0, 0);
     Ok(())
 }
 
@@ -434,7 +573,7 @@ fn electric_eye_unlink(ctx: TracePointContext) -> i32 {
 fn try_unlink(ctx: &TracePointContext) -> Result<(), ()> {
     let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
     let pathname: u64 = ctx_read(ctx, offs.unlink_pathname as usize)?;
-    reserve_path_event(KIND_FILE_UNLINK, pathname);
+    reserve_path_event(KIND_FILE_UNLINK, pathname, 0, 0);
     Ok(())
 }
 
@@ -449,7 +588,7 @@ fn electric_eye_rmdir(ctx: TracePointContext) -> i32 {
 fn try_rmdir(ctx: &TracePointContext) -> Result<(), ()> {
     let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
     let pathname: u64 = ctx_read(ctx, offs.rmdir_pathname as usize)?;
-    reserve_path_event(KIND_FILE_UNLINK, pathname);
+    reserve_path_event(KIND_FILE_UNLINK, pathname, 0, 0);
     Ok(())
 }
 
@@ -495,6 +634,225 @@ fn try_renameat2(ctx: &TracePointContext) -> Result<(), ()> {
     let oldname: u64 = ctx_read(ctx, offs.renameat2_oldname as usize)?;
     let newname: u64 = ctx_read(ctx, offs.renameat2_newname as usize)?;
     reserve_rename_event(oldname, newname);
+    Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_write")]
+fn electric_eye_write(ctx: TracePointContext) -> i32 {
+    match try_write(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_write(ctx: &TracePointContext) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let fd: u32 = ctx_read(ctx, offs.write_fd as usize)?;
+    let count: u64 = ctx_read(ctx, offs.write_count as usize)?;
+    if count == 0 {
+        return Ok(());
+    }
+    let Ok(comm) = current_comm() else {
+        return Ok(());
+    };
+    let (pid, uid) = current_ids();
+    push_record(RawWriteEvent {
+        kind: KIND_FILE_WRITE,
+        pid,
+        uid,
+        fd,
+        count,
+        comm,
+    });
+    Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_accept")]
+fn electric_eye_accept_enter(ctx: TracePointContext) -> i32 {
+    match note_accept(&ctx, false) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint(category = "syscalls", name = "sys_exit_accept")]
+fn electric_eye_accept_exit(ctx: TracePointContext) -> i32 {
+    match finish_accept(&ctx, false) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_accept4")]
+fn electric_eye_accept4_enter(ctx: TracePointContext) -> i32 {
+    match note_accept(&ctx, true) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint(category = "syscalls", name = "sys_exit_accept4")]
+fn electric_eye_accept4_exit(ctx: TracePointContext) -> i32 {
+    match finish_accept(&ctx, true) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn note_accept(ctx: &TracePointContext, accept4: bool) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let (fd_off, peer_off, len_off) = if accept4 {
+        (offs.accept4_fd, offs.accept4_sockaddr, offs.accept4_addrlen)
+    } else {
+        (offs.accept_fd, offs.accept_sockaddr, offs.accept_addrlen)
+    };
+    let listen_fd: u32 = ctx_read(ctx, fd_off as usize)?;
+    let peer: u64 = ctx_read(ctx, peer_off as usize)?;
+    let peer_len: u64 = ctx_read(ctx, len_off as usize)?;
+    let key = current_tid();
+    let _ = PENDING_ACCEPT.insert(
+        &key,
+        PendingAccept {
+            peer,
+            peer_len,
+            listen_fd,
+        },
+        0,
+    );
+    Ok(())
+}
+
+fn finish_accept(ctx: &TracePointContext, accept4: bool) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let key = current_tid();
+    let Some(pending) = PENDING_ACCEPT.get_ptr(&key).map(|p| unsafe { *p }) else {
+        return Ok(());
+    };
+    let _ = PENDING_ACCEPT.remove(&key);
+    let ret_offset = if accept4 {
+        offs.accept4_ret
+    } else {
+        offs.accept_ret
+    };
+    let ret: i64 = ctx_read(ctx, ret_offset as usize)?;
+    if ret < 0 || ret > u32::MAX as i64 {
+        return Ok(());
+    }
+    let (family, addr, port) = read_sockaddr(pending.peer);
+    let Ok(comm) = current_comm() else {
+        return Ok(());
+    };
+    let (pid, uid) = current_ids();
+    push_record(RawAcceptEvent {
+        kind: KIND_ACCEPT,
+        pid,
+        uid,
+        fd: ret as u32,
+        listen_fd: pending.listen_fd,
+        family,
+        port: port as u32,
+        addr,
+        comm,
+    });
+    Ok(())
+}
+
+fn read_sockaddr(peer: u64) -> (u32, [u8; 16], u16) {
+    let mut addr = [0u8; 16];
+    if peer == 0 {
+        return (0, addr, 0);
+    }
+    let family: u16 = match unsafe { bpf_probe_read_user(peer as *const u16) } {
+        Ok(value) => value,
+        Err(_) => return (0, addr, 0),
+    };
+    let port_be: u16 = match unsafe { bpf_probe_read_user((peer + 2) as *const u16) } {
+        Ok(value) => value,
+        Err(_) => return (0, addr, 0),
+    };
+    let port = u16::from_be(port_be);
+    match family {
+        AF_INET => {
+            let raw: [u8; 4] = match unsafe { bpf_probe_read_user((peer + 4) as *const [u8; 4]) } {
+                Ok(value) => value,
+                Err(_) => return (0, [0; 16], 0),
+            };
+            addr[..4].copy_from_slice(&raw);
+        }
+        AF_INET6 => {
+            addr = match unsafe { bpf_probe_read_user((peer + 8) as *const [u8; 16]) } {
+                Ok(value) => value,
+                Err(_) => return (0, [0; 16], 0),
+            };
+        }
+        _ => return (0, [0; 16], 0),
+    }
+    (family as u32, addr, port)
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_dup2")]
+fn electric_eye_dup2(ctx: TracePointContext) -> i32 {
+    match try_dup(&ctx, false) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_dup3")]
+fn electric_eye_dup3(ctx: TracePointContext) -> i32 {
+    match try_dup(&ctx, true) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_dup(ctx: &TracePointContext, dup3: bool) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let (old_off, new_off) = if dup3 {
+        (offs.dup3_oldfd, offs.dup3_newfd)
+    } else {
+        (offs.dup2_oldfd, offs.dup2_newfd)
+    };
+    let oldfd: u32 = ctx_read(ctx, old_off as usize)?;
+    let newfd: u32 = ctx_read(ctx, new_off as usize)?;
+    let Ok(comm) = current_comm() else {
+        return Ok(());
+    };
+    let (pid, uid) = current_ids();
+    push_record(RawFdEvent {
+        kind: KIND_FD_DUP,
+        pid,
+        uid,
+        oldfd,
+        newfd,
+        comm,
+    });
+    Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_close")]
+fn electric_eye_close(ctx: TracePointContext) -> i32 {
+    match try_close(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_close(ctx: &TracePointContext) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let fd: u32 = ctx_read(ctx, offs.close_fd as usize)?;
+    let Ok(comm) = current_comm() else {
+        return Ok(());
+    };
+    let (pid, uid) = current_ids();
+    push_record(RawFdEvent {
+        kind: KIND_FD_CLOSE,
+        pid,
+        uid,
+        oldfd: fd,
+        newfd: 0,
+        comm,
+    });
     Ok(())
 }
 

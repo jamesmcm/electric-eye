@@ -121,7 +121,9 @@ fn event_comm(event: &ObservedEvent) -> String {
         ObservedEvent::Connect(event)
         | ObservedEvent::Accept(event)
         | ObservedEvent::Listen(event) => event.comm.clone(),
-        ObservedEvent::FileWrite(event) | ObservedEvent::FileUnlink(event) => event.comm.clone(),
+        ObservedEvent::FileOpen(event)
+        | ObservedEvent::FileWrite(event)
+        | ObservedEvent::FileUnlink(event) => event.comm.clone(),
         ObservedEvent::FileRename(event) => event.comm.clone(),
         ObservedEvent::Traffic(summary) => summary.comm.clone(),
     }
@@ -271,6 +273,8 @@ mod tests {
                 comm: "curl".into(),
                 path: "/tmp/x".into(),
                 kind: FileKind::Unlink,
+                bytes: None,
+                count: None,
             }),
             unit: None,
             nix: None,

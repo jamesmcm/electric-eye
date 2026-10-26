@@ -21,7 +21,16 @@ const DEFAULT_OBJECT: &str = "target/bpfel-unknown-none/release/electric-eye-ebp
 const INSTALLED_OBJECT: &str = "/usr/lib/electric-eye/electric-eye-ebpf";
 const TRAFFIC_WINDOW: Duration = Duration::from_secs(5);
 const TRAFFIC_TOP: usize = 8;
+const WRITE_TOP: usize = 32;
 const PID_CACHE_LIMIT: usize = 8192;
+const WRITE_WINDOW_LIMIT: usize = 4096;
+
+struct WriteStat {
+    uid: u32,
+    comm: String,
+    count: u64,
+    bytes: u64,
+}
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -120,6 +129,18 @@ fn is_noise_path(path: &str) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
+fn classify_open(flags: u32) -> FileKind {
+    const O_CREAT: u32 = 0o100;
+    const O_TRUNC: u32 = 0o1000;
+    if flags & O_TRUNC != 0 {
+        FileKind::Truncate
+    } else if flags & O_CREAT != 0 {
+        FileKind::Create
+    } else {
+        FileKind::Open
+    }
+}
+
 fn print_banner(json: bool) {
     startup_line(json, "electric-eyed starting");
     startup_line(json, format!("kernel: {}", probe::kernel_release()));
@@ -151,7 +172,10 @@ struct Session {
     cwd_by_pid: HashMap<u32, PathBuf>,
     ppid_by_pid: HashMap<u32, u32>,
     start_by_pid: HashMap<u32, u64>,
+    fd_paths: HashMap<(u32, u32), String>,
     traffic_window: HashMap<u32, (u64, u64)>,
+    write_window: HashMap<(u32, String), WriteStat>,
+    own_pid: u32,
     json: bool,
     state: Arc<Mutex<api::SharedState>>,
 }
@@ -264,21 +288,66 @@ impl Session {
             addr: event.addr,
             local_port: event.sport as u16,
             remote_port: event.dport as u16,
+            hostname: None,
+            fd: None,
         }
     }
 
-    fn emit_file(&mut self, kind: FileKind, pid: u32, uid: u32, comm: &str, path: String) {
+    fn accept_event(&mut self, event: &collector::RawAcceptEvent) -> NetEvent {
+        self.remember_comm(event.pid, &event.comm_str());
+        let comm = event.comm_str();
+        let endpoint = enrich::accepted_socket(event.pid, event.fd);
+        let local_port = enrich::listener_port(event.pid, event.listen_fd)
+            .or_else(|| endpoint.as_ref().map(|endpoint| endpoint.local_port))
+            .unwrap_or(0);
+        if event.family != 0 {
+            return NetEvent {
+                pid: event.pid,
+                uid: event.uid,
+                comm,
+                family: event.family,
+                addr: event.addr,
+                local_port,
+                remote_port: event.port as u16,
+                hostname: None,
+                fd: Some(event.fd),
+            };
+        }
+        match endpoint {
+            Some(endpoint) => NetEvent {
+                pid: event.pid,
+                uid: event.uid,
+                comm,
+                family: endpoint.family,
+                addr: endpoint.remote_addr,
+                local_port: endpoint.local_port,
+                remote_port: endpoint.remote_port,
+                hostname: None,
+                fd: Some(event.fd),
+            },
+            None => NetEvent {
+                pid: event.pid,
+                uid: event.uid,
+                comm,
+                family: 0,
+                addr: [0; 16],
+                local_port: 0,
+                remote_port: 0,
+                hostname: None,
+                fd: Some(event.fd),
+            },
+        }
+    }
+
+    fn emit_file(&mut self, event: FileEvent) {
+        let pid = event.pid;
         let exe = enrich::resolve_exe(pid);
-        let event = FileEvent {
-            pid,
-            uid,
-            comm: comm.to_string(),
-            path,
-            kind,
-        };
-        let observed = match kind {
-            FileKind::Write => ObservedEvent::FileWrite(event),
+        let observed = match event.kind {
             FileKind::Unlink => ObservedEvent::FileUnlink(event),
+            FileKind::Write => ObservedEvent::FileWrite(event),
+            FileKind::Open | FileKind::Create | FileKind::Truncate => {
+                ObservedEvent::FileOpen(event)
+            }
         };
         self.emit(observed, pid, exe);
     }
@@ -318,6 +387,7 @@ impl Session {
                 self.cwd_by_pid.remove(&event.pid);
                 self.ppid_by_pid.remove(&event.pid);
                 self.start_by_pid.remove(&event.pid);
+                self.fd_paths.retain(|(pid, _), _| *pid != event.pid);
             }
             RawEvent::Connect(event) => {
                 let net = self.net_event(&event);
@@ -325,39 +395,94 @@ impl Session {
                 self.emit(ObservedEvent::Connect(net), event.pid, exe);
             }
             RawEvent::Accept(event) => {
-                let net = self.net_event(&event);
+                let net = self.accept_event(&event);
                 let exe = enrich::resolve_exe(event.pid);
                 self.emit(ObservedEvent::Accept(net), event.pid, exe);
+            }
+            RawEvent::FdDup(event) => {
+                self.remember_comm(event.pid, &event.comm_str());
+                if let Some(path) = self.fd_paths.get(&(event.pid, event.oldfd)).cloned() {
+                    self.fd_paths.insert((event.pid, event.newfd), path);
+                }
+            }
+            RawEvent::FdClose(event) => {
+                self.remember_comm(event.pid, &event.comm_str());
+                self.fd_paths.remove(&(event.pid, event.oldfd));
             }
             RawEvent::Listen(event) => {
                 let net = self.net_event(&event);
                 let exe = enrich::resolve_exe(event.pid);
                 self.emit(ObservedEvent::Listen(net), event.pid, exe);
             }
-            RawEvent::FileWrite(event) => {
+            RawEvent::FileOpen(event) => {
                 self.remember_comm(event.pid, &event.comm_str());
                 let path = self.resolve_path(event.pid, &event.path_str());
-                if !is_noise_path(&path) {
-                    self.emit_file(
-                        FileKind::Write,
-                        event.pid,
-                        event.uid,
-                        &event.comm_str(),
-                        path,
-                    );
+                if is_noise_path(&path) {
+                    return;
                 }
+                if self.fd_paths.len() >= PID_CACHE_LIMIT {
+                    self.fd_paths.clear();
+                }
+                self.fd_paths.insert((event.pid, event.fd), path.clone());
+                self.emit_file(FileEvent {
+                    pid: event.pid,
+                    uid: event.uid,
+                    comm: event.comm_str(),
+                    path,
+                    kind: classify_open(event.flags),
+                    bytes: None,
+                    count: None,
+                });
+            }
+            RawEvent::FileWrite(event) => {
+                if event.pid == self.own_pid {
+                    return;
+                }
+                self.remember_comm(event.pid, &event.comm_str());
+                let path = self
+                    .fd_paths
+                    .get(&(event.pid, event.fd))
+                    .cloned()
+                    .or_else(|| {
+                        enrich::resolve_fd_path(event.pid, event.fd)
+                            .map(|p| p.display().to_string())
+                    });
+                let Some(path) = path else {
+                    return;
+                };
+                if is_noise_path(&path) {
+                    return;
+                }
+                if self.write_window.len() >= WRITE_WINDOW_LIMIT
+                    && !self.write_window.contains_key(&(event.pid, path.clone()))
+                {
+                    return;
+                }
+                let stat = self
+                    .write_window
+                    .entry((event.pid, path))
+                    .or_insert_with(|| WriteStat {
+                        uid: event.uid,
+                        comm: event.comm_str(),
+                        count: 0,
+                        bytes: 0,
+                    });
+                stat.count += 1;
+                stat.bytes += event.count;
             }
             RawEvent::FileUnlink(event) => {
                 self.remember_comm(event.pid, &event.comm_str());
                 let path = self.resolve_path(event.pid, &event.path_str());
                 if !is_noise_path(&path) {
-                    self.emit_file(
-                        FileKind::Unlink,
-                        event.pid,
-                        event.uid,
-                        &event.comm_str(),
+                    self.emit_file(FileEvent {
+                        pid: event.pid,
+                        uid: event.uid,
+                        comm: event.comm_str(),
                         path,
-                    );
+                        kind: FileKind::Unlink,
+                        bytes: None,
+                        count: None,
+                    });
                 }
             }
             RawEvent::FileRename(event) => {
@@ -372,6 +497,29 @@ impl Session {
                 });
                 self.emit(observed, event.pid, exe);
             }
+        }
+    }
+
+    fn flush_write_window(&mut self) {
+        if self.write_window.is_empty() {
+            return;
+        }
+        let mut writes: Vec<((u32, String), WriteStat)> = self.write_window.drain().collect();
+        writes.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.bytes));
+        let total = writes.len();
+        for ((pid, path), stat) in writes.into_iter().take(WRITE_TOP) {
+            self.emit_file(FileEvent {
+                pid,
+                uid: stat.uid,
+                comm: stat.comm,
+                path,
+                kind: FileKind::Write,
+                bytes: Some(stat.bytes),
+                count: Some(stat.count),
+            });
+        }
+        if total > WRITE_TOP {
+            log::debug!("write window contained {total} paths; reported top {WRITE_TOP}");
         }
     }
 
@@ -514,7 +662,10 @@ fn run() -> ExitCode {
         cwd_by_pid: HashMap::new(),
         ppid_by_pid: HashMap::new(),
         start_by_pid: HashMap::new(),
+        fd_paths: HashMap::new(),
         traffic_window: HashMap::new(),
+        write_window: HashMap::new(),
+        own_pid: std::process::id(),
         json: options.json,
         state: Arc::clone(&state),
     };
@@ -533,6 +684,7 @@ fn run() -> ExitCode {
         if last_traffic.elapsed() >= TRAFFIC_WINDOW {
             last_traffic = Instant::now();
             session.print_traffic_window(&mut collector);
+            session.flush_write_window();
         }
         if let Some(socket) = &socket {
             api::serve_pending(socket, &state);
@@ -541,6 +693,7 @@ fn run() -> ExitCode {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+    session.flush_write_window();
     ExitCode::SUCCESS
 }
 
@@ -586,6 +739,14 @@ mod tests {
     fn rejects_unknown_flags() {
         let args: Vec<String> = vec!["--bogus".into()];
         assert!(Options::parse(&args).is_err());
+    }
+
+    #[test]
+    fn classifies_open_flags() {
+        assert_eq!(classify_open(0o1), FileKind::Open);
+        assert_eq!(classify_open(0o1 | 0o100), FileKind::Create);
+        assert_eq!(classify_open(0o1 | 0o100 | 0o1000), FileKind::Truncate);
+        assert_eq!(classify_open(0o2 | 0o1000), FileKind::Truncate);
     }
 
     #[test]

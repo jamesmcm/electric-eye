@@ -11,9 +11,13 @@ attribution plus a small local query API.
 ## What works
 
 - `EXEC` / `EXIT` with pid, ppid, uid and stable `(pid, start_ticks)` identity
-- `CONNECT`, `LISTEN` and `ACCEPT` for IPv4/IPv6 TCP
-- writable `open`/`openat`/`openat2`, `unlink`/`unlinkat`/`rmdir`,
-  `rename`/`renameat`/`renameat2`
+- `CONNECT`, `LISTEN` and `ACCEPT` for IPv4/IPv6 TCP. ACCEPT is captured at
+  `accept()`/`accept4()` exit, so it is attributed to the accepting server
+  rather than the packet-processing context.
+- `OPEN` / `CREATE` / `TRUNC` for writable opens, and aggregated `WRITE`
+  summaries for actual `write(2)` syscalls (including fd redirection via
+  `dup2`/`dup3`)
+- `unlink`/`unlinkat`/`rmdir` and `rename`/`renameat`/`renameat2`
 - per-process TCP/UDP sent/received byte totals (top-N every 5 seconds)
 - systemd unit and Nix store-path suffixes on human output
 - JSON Lines output (`--json`) and a read-only Unix socket API
@@ -119,15 +123,10 @@ file events are captured from those CPUs.
 
 ## Known limitations / next steps
 
-- `ACCEPT` is inferred from the `inet_sock_set_state` transition
-  `SYN_RECV -> ESTABLISHED`. That transition can run in softirq context, so the
-  pid/comm can be the packet-processing context (`napi/...`, `ksoftirqd`) or
-  even the connecting client instead of the accepting server. The ports and
-  addresses are correct; only the attribution is unreliable. The next fix is a
-  syscall-based accept event and/or a listener-port map.
-- `WRITE` currently means "opened with write intent" (`O_WRONLY`, `O_RDWR`,
-  `O_CREAT` or `O_TRUNC`), not "bytes were successfully written". A `touch`
-  therefore appears as `WRITE`; read-only opens are not reported.
+- Actual write capture currently covers `write(2)`. `writev`, `pwrite64`,
+  `sendfile`, `copy_file_range` and mmap-based writes are not yet covered.
+  Write syscalls are aggregated into 5-second top-32 summaries; the SQLite
+  layer will retain per-process/path totals.
 - No SQLite history yet; the query API serves an in-memory ring buffer.
 - No journald export, DNS enrichment, anomaly rules, freeze/enforcement or
   Quickshell UI yet (Milestones 1–9 in `INITIAL_PLAN.md`).

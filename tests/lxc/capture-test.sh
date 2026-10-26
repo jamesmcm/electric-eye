@@ -72,9 +72,24 @@ if ! grep -q "streaming events:" "$LOG"; then
 fi
 
 MARKER="/tmp/electric-eye-lxc-$$"
+PORT="${EE_TEST_PORT:-$((20000 + ($$ % 20000)))}"
 echo "==> running workload on guest CPU $CPU"
-sudo lxc-attach -n "$NAME" -- taskset -c "$CPU" sh -c \
-  "echo payload > '$MARKER'; mv '$MARKER' '$MARKER.renamed'; rm '$MARKER.renamed'"
+sudo lxc-attach -n "$NAME" -- taskset -c "$CPU" sh -c "
+set -e
+echo payload > '$MARKER'
+touch '$MARKER.touch'
+mv '$MARKER' '$MARKER.renamed'
+rm '$MARKER.renamed' '$MARKER.touch'
+"
+sudo lxc-attach -n "$NAME" -- sh -c "
+python3 -m http.server '$PORT' --bind 127.0.0.1 >/tmp/ee-lxc-http.log 2>&1 &
+srv=\$!
+sleep 0.7
+taskset -c '$CPU' curl -s --max-time 2 http://127.0.0.1:'$PORT'/ >/dev/null
+sleep 0.5
+kill \$srv 2>/dev/null || true
+wait \$srv 2>/dev/null || true
+"
 
 for _ in $(seq 1 50); do
   if grep -q "$MARKER" "$LOG"; then
@@ -83,13 +98,30 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
+# Actual write events are aggregated into a 5-second window.
+for _ in $(seq 1 60); do
+  if grep "$MARKER" "$LOG" | grep -q '"event":"file_write"'; then
+    break
+  fi
+  sleep 0.2
+done
+
 fail=0
-for expected in "file_write" "file_rename" "file_unlink" "$MARKER"; do
+for expected in '"event":"file_open"' '"event":"file_write"' \
+  '"event":"file_rename"' '"event":"file_unlink"' "$MARKER"; do
   if ! grep -q "$expected" "$LOG"; then
     echo "missing expected output: $expected" >&2
     fail=1
   fi
 done
+
+if ! grep -q '"event":"accept"' "$LOG"; then
+  echo "missing ACCEPT event" >&2
+  fail=1
+elif ! grep '"event":"accept"' "$LOG" | grep -q '"comm":"python3"'; then
+  echo "ACCEPT attribution did not identify the python server" >&2
+  fail=1
+fi
 
 echo "==> checking query API"
 if ! sudo ./target/release/electric-eye --socket "$SOCKET" status \

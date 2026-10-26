@@ -75,10 +75,19 @@ pub struct NetEvent {
     pub addr: [u8; 16],
     pub local_port: u16,
     pub remote_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Set for ACCEPT events: the accepted file descriptor, used when the
+    /// socket disappeared before userspace could resolve its endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fd: Option<u32>,
 }
 
 impl NetEvent {
     pub fn addr_string(&self) -> String {
+        if let Some(hostname) = &self.hostname {
+            return hostname.clone();
+        }
         match self.family {
             AF_INET => format!(
                 "{}.{}.{}.{}",
@@ -113,11 +122,20 @@ pub struct FileEvent {
     pub comm: String,
     pub path: String,
     pub kind: FileKind,
+    /// Present for actual write syscalls; None for open/create/truncate/unlink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Number of write syscalls collapsed into this event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileKind {
+    Open,
+    Create,
+    Truncate,
     Write,
     Unlink,
 }
@@ -125,6 +143,9 @@ pub enum FileKind {
 impl FileKind {
     pub fn label(&self) -> &'static str {
         match self {
+            FileKind::Open => "OPEN",
+            FileKind::Create => "CREATE",
+            FileKind::Truncate => "TRUNC",
             FileKind::Write => "WRITE",
             FileKind::Unlink => "UNLINK",
         }
@@ -140,7 +161,15 @@ impl fmt::Display for FileEvent {
             self.comm,
             self.path,
             width = LABEL_WIDTH
-        )
+        )?;
+        if let Some(bytes) = self.bytes {
+            if let Some(count) = self.count.filter(|count| *count > 1) {
+                write!(f, " ({count} writes, {})", humanize_bytes(bytes))?;
+            } else {
+                write!(f, " ({})", humanize_bytes(bytes))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -222,6 +251,7 @@ pub enum ObservedEvent {
     Connect(NetEvent),
     Accept(NetEvent),
     Listen(NetEvent),
+    FileOpen(FileEvent),
     FileWrite(FileEvent),
     FileUnlink(FileEvent),
     FileRename(RenameEvent),
@@ -236,6 +266,7 @@ impl ObservedEvent {
             ObservedEvent::Connect(_) => "CONNECT",
             ObservedEvent::Accept(_) => "ACCEPT",
             ObservedEvent::Listen(_) => "LISTEN",
+            ObservedEvent::FileOpen(event) => event.kind.label(),
             ObservedEvent::FileWrite(event) => event.kind.label(),
             ObservedEvent::FileUnlink(event) => event.kind.label(),
             ObservedEvent::FileRename(_) => "RENAME",
@@ -250,13 +281,17 @@ impl fmt::Display for ObservedEvent {
             ObservedEvent::Exec(event) => return write!(f, "{}", event),
             ObservedEvent::Exit(event) => return write!(f, "{}", event),
             ObservedEvent::Connect(event) => format!("{} -> {}", event.comm, event.endpoint()),
-            ObservedEvent::Accept(event) => format!(
-                "{} -> {} (local :{})",
-                event.comm,
-                event.remote_endpoint(),
-                event.local_port
-            ),
+            ObservedEvent::Accept(event) => match (event.family, event.fd) {
+                (0, Some(fd)) => format!("{} -> fd {fd}", event.comm),
+                _ => format!(
+                    "{} -> {} (local :{})",
+                    event.comm,
+                    event.remote_endpoint(),
+                    event.local_port
+                ),
+            },
             ObservedEvent::Listen(event) => format!("{} -> {}", event.comm, event.endpoint()),
+            ObservedEvent::FileOpen(event) => return write!(f, "{}", event),
             ObservedEvent::FileWrite(event) => return write!(f, "{}", event),
             ObservedEvent::FileUnlink(event) => return write!(f, "{}", event),
             ObservedEvent::FileRename(event) => return write!(f, "{}", event),
@@ -286,6 +321,8 @@ mod tests {
             addr: [140, 82, 121, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             local_port,
             remote_port,
+            hostname: None,
+            fd: None,
         }
     }
 
@@ -308,6 +345,49 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_accept_falls_back_to_fd() {
+        let mut net = net_event(0, 0);
+        net.family = 0;
+        net.addr = [0; 16];
+        net.fd = Some(7);
+        let event = ObservedEvent::Accept(net).to_string();
+        assert_eq!(event, "ACCEPT    curl -> fd 7");
+    }
+
+    #[test]
+    fn file_event_kinds_render_distinctly() {
+        let make = |kind, bytes, count| FileEvent {
+            pid: 1,
+            uid: 1000,
+            comm: "test".into(),
+            path: "/tmp/x".into(),
+            kind,
+            bytes,
+            count,
+        };
+        assert_eq!(
+            make(FileKind::Open, None, None).to_string(),
+            "OPEN      test -> /tmp/x"
+        );
+        assert_eq!(
+            make(FileKind::Create, None, None).to_string(),
+            "CREATE    test -> /tmp/x"
+        );
+        assert_eq!(
+            make(FileKind::Truncate, None, None).to_string(),
+            "TRUNC     test -> /tmp/x"
+        );
+        assert_eq!(
+            make(FileKind::Write, Some(2048), Some(1)).to_string(),
+            "WRITE     test -> /tmp/x (2.0 KiB)"
+        );
+        assert_eq!(
+            make(FileKind::Write, Some(2048), Some(3)).to_string(),
+            "WRITE     test -> /tmp/x (3 writes, 2.0 KiB)"
+        );
+    }
+
+    #[test]
     fn exit_includes_pid() {
         let event = ObservedEvent::Exit(ExitEvent {
             pid: 42,
@@ -319,6 +399,22 @@ mod tests {
     }
 
     #[test]
+    fn open_is_tagged_separately_from_write() {
+        let event = FileEvent {
+            pid: 1,
+            uid: 0,
+            comm: "touch".into(),
+            path: "/tmp/x".into(),
+            kind: FileKind::Create,
+            bytes: None,
+            count: None,
+        };
+        let value = serde_json::to_value(ObservedEvent::FileOpen(event)).unwrap();
+        assert_eq!(value["event"], "file_open");
+        assert_eq!(value["kind"], "create");
+    }
+
+    #[test]
     fn observed_events_serialize_with_a_tag() {
         let value = serde_json::to_value(ObservedEvent::FileUnlink(FileEvent {
             pid: 1,
@@ -326,6 +422,8 @@ mod tests {
             comm: "rm".into(),
             path: "/tmp/x".into(),
             kind: FileKind::Unlink,
+            bytes: None,
+            count: None,
         }))
         .unwrap();
         assert_eq!(value["event"], "file_unlink");
