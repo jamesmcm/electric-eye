@@ -119,6 +119,15 @@ file events are captured from those CPUs.
 
 ## Known limitations / next steps
 
+- `ACCEPT` is inferred from the `inet_sock_set_state` transition
+  `SYN_RECV -> ESTABLISHED`. That transition can run in softirq context, so the
+  pid/comm can be the packet-processing context (`napi/...`, `ksoftirqd`) or
+  even the connecting client instead of the accepting server. The ports and
+  addresses are correct; only the attribution is unreliable. The next fix is a
+  syscall-based accept event and/or a listener-port map.
+- `WRITE` currently means "opened with write intent" (`O_WRONLY`, `O_RDWR`,
+  `O_CREAT` or `O_TRUNC`), not "bytes were successfully written". A `touch`
+  therefore appears as `WRITE`; read-only opens are not reported.
 - No SQLite history yet; the query API serves an in-memory ring buffer.
 - No journald export, DNS enrichment, anomaly rules, freeze/enforcement or
   Quickshell UI yet (Milestones 1–9 in `INITIAL_PLAN.md`).

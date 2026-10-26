@@ -120,17 +120,29 @@ fn is_noise_path(path: &str) -> bool {
         .any(|prefix| path.starts_with(prefix))
 }
 
-fn print_banner() {
-    println!("electric-eyed starting");
-    println!("kernel: {}", probe::kernel_release());
-    println!(
-        "BTF: {}",
-        if probe::btf_available() {
-            "available"
-        } else {
-            "unavailable"
-        }
+fn print_banner(json: bool) {
+    startup_line(json, "electric-eyed starting");
+    startup_line(json, format!("kernel: {}", probe::kernel_release()));
+    startup_line(
+        json,
+        format!(
+            "BTF: {}",
+            if probe::btf_available() {
+                "available"
+            } else {
+                "unavailable"
+            }
+        ),
     );
+}
+
+/// Diagnostics go to stderr in JSON mode so stdout stays valid JSON Lines.
+fn startup_line(json: bool, line: impl std::fmt::Display) {
+    if json {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
 }
 
 struct Session {
@@ -423,13 +435,16 @@ fn run() -> ExitCode {
         }
     };
 
-    print_banner();
+    print_banner(options.json);
     if options.stdout {
         log::debug!("stdout mode requested");
     }
 
     if options.no_bpf {
-        println!("--no-bpf requested, exiting after startup checks");
+        startup_line(
+            options.json,
+            "--no-bpf requested, exiting after startup checks",
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -449,7 +464,7 @@ fn run() -> ExitCode {
     } else {
         match api::bind_socket(&socket_path) {
             Ok(socket) => {
-                println!("socket: {}", socket_path.display());
+                startup_line(options.json, format!("socket: {}", socket_path.display()));
                 Some(socket)
             }
             Err(err) => {
@@ -481,8 +496,11 @@ fn run() -> ExitCode {
         log::warn!("probe skipped: {warning}");
         eprintln!("note: probe skipped - {warning}");
     }
-    println!("attached probes: {}", report.attached.join(", "));
-    println!("streaming events:");
+    startup_line(
+        options.json,
+        format!("attached probes: {}", report.attached.join(", ")),
+    );
+    startup_line(options.json, "streaming events:");
 
     let state = Arc::new(Mutex::new(api::SharedState::new()));
     state
