@@ -10,6 +10,8 @@ use electric_eye_core::ObservedEvent;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::store::StoreClient;
+
 pub const DEFAULT_SOCKET: &str = "/run/electric-eye/electric-eye.sock";
 const ACTIVITY_LIMIT: usize = 2048;
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -40,6 +42,7 @@ pub struct SharedState {
     events_total: u64,
     activity: VecDeque<ActivityEntry>,
     apps: HashMap<String, AppStat>,
+    store: Option<StoreClient>,
 }
 
 impl SharedState {
@@ -51,7 +54,16 @@ impl SharedState {
             events_total: 0,
             activity: VecDeque::new(),
             apps: HashMap::new(),
+            store: None,
         }
+    }
+
+    pub fn set_store(&mut self, store: Option<StoreClient>) {
+        self.store = store;
+    }
+
+    pub fn store_client(&self) -> Option<StoreClient> {
+        self.store.clone()
     }
 
     pub fn set_probes(&mut self, attached: Vec<String>, skipped: Vec<String>) {
@@ -78,7 +90,7 @@ impl SharedState {
     }
 
     pub fn status_value(&self) -> Value {
-        json!({
+        let mut value = json!({
             "daemon": "electric-eyed",
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
@@ -88,7 +100,13 @@ impl SharedState {
             "skipped_probes": self.skipped,
             "events_total": self.events_total,
             "activity_buffered": self.activity.len(),
-        })
+        });
+        value["store"] = self
+            .store
+            .as_ref()
+            .map(StoreClient::status_value)
+            .unwrap_or(Value::Null);
+        value
     }
 
     pub fn activity_value(&self, limit: usize) -> Value {
@@ -212,11 +230,65 @@ fn handle_client(stream: UnixStream, state: &Arc<Mutex<SharedState>>) -> io::Res
         .unwrap_or(100)
         .clamp(1, ACTIVITY_LIMIT as u64) as usize;
 
+    let store = state.lock().unwrap().store_client();
+    let query = |result: anyhow::Result<Value>| {
+        result.unwrap_or_else(|err| json!({ "error": format!("{err:#}") }))
+    };
+    let no_store = || json!({ "error": "persistence disabled (--no-db or database unavailable)" });
+
     let response = match op {
         "status" => state.lock().unwrap().status_value(),
-        "activity" => state.lock().unwrap().activity_value(limit),
+        "activity" => {
+            let mut value = state.lock().unwrap().activity_value(limit);
+            if let Some(store) = &store
+                && let Ok(persisted) = store.recent_activities(20)
+            {
+                value["persisted_activities"] = persisted["activities"].clone();
+            }
+            value
+        }
         "apps" => state.lock().unwrap().apps_value(),
-        "incidents" => json!({ "incidents": [] }),
+        "incidents" => match &store {
+            Some(store) => query(store.incidents(limit)),
+            None => json!({ "incidents": [] }),
+        },
+        "file" => {
+            let path = request["path"].as_str().unwrap_or_default();
+            if path.is_empty() {
+                json!({ "error": "file requires a path" })
+            } else {
+                match &store {
+                    Some(store) => query(store.file_activities(path, limit)),
+                    None => no_store(),
+                }
+            }
+        }
+        "app" => {
+            let app = request["app"].as_str().unwrap_or_default();
+            if app.is_empty() {
+                json!({ "error": "app requires an application name" })
+            } else {
+                match &store {
+                    Some(store) => query(store.app_activities(app, limit)),
+                    None => no_store(),
+                }
+            }
+        }
+        "network" => match &store {
+            Some(store) => query(store.network_activities(limit)),
+            None => no_store(),
+        },
+        "why" => {
+            let path = request["path"].as_str().unwrap_or_default();
+            if path.is_empty() {
+                json!({ "error": "why requires a path" })
+            } else {
+                match &store {
+                    Some(store) => query(store.why(path, limit)),
+                    None => no_store(),
+                }
+            }
+        }
         "" => json!({ "error": "missing op" }),
         other => json!({ "error": format!("unknown op {other}") }),
     };

@@ -21,7 +21,9 @@ attribution plus a small local query API.
 - per-process TCP/UDP sent/received byte totals (top-N every 5 seconds)
 - systemd unit and Nix store-path suffixes on human output
 - JSON Lines output (`--json`) and a read-only Unix socket API
-- `electric-eye status|activity|apps|incidents`
+- SQLite persistence with a background writer, 5-minute raw retention,
+  5-minute activity rollups, 30-day activity retention and an incidents table
+- `electric-eye status|activity|apps|app|file|network|why|incidents`
 
 Kernel events are collected with Aya. Tracepoint offsets are discovered from
 the live kernel's tracefs at startup, so the object is not tied to a specific
@@ -56,9 +58,16 @@ Useful daemon flags:
 --json                 emit one JSON object per line
 --socket <path>        override /run/electric-eye/electric-eye.sock
 --no-socket            do not start the query API
+--db <path>            SQLite database path
+--no-db                disable persistence
 --ebpf-object <path>   override the built BPF object
 --no-bpf               startup diagnostics only
 ```
+
+The service stores data in `/var/lib/electric-eye/electric-eye.db` via
+systemd's `StateDirectory`. Raw events are retained for 5 minutes, rolled into
+5-minute activity buckets, and activities are retained for 30 days. Incidents
+are stored separately for future anomaly rules.
 
 ## Arch Linux package
 
@@ -126,8 +135,7 @@ file events are captured from those CPUs.
 - Actual write capture currently covers `write(2)`. `writev`, `pwrite64`,
   `sendfile`, `copy_file_range` and mmap-based writes are not yet covered.
   Write syscalls are aggregated into 5-second top-32 summaries; the SQLite
-  layer will retain per-process/path totals.
-- No SQLite history yet; the query API serves an in-memory ring buffer.
+  layer retains per-process/path totals after the 5-minute raw window.
 - No journald export, DNS enrichment, anomaly rules, freeze/enforcement or
   Quickshell UI yet (Milestones 1–9 in `INITIAL_PLAN.md`).
 - Process ancestry for very short-lived processes can fall back to `(exited)`

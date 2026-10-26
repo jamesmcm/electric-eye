@@ -3,6 +3,7 @@ mod collector;
 mod enrich;
 mod format;
 mod probe;
+mod store;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -57,7 +58,9 @@ struct Options {
     json: bool,
     no_bpf: bool,
     no_socket: bool,
+    no_db: bool,
     socket: Option<PathBuf>,
+    db: Option<PathBuf>,
     object_override: Option<PathBuf>,
 }
 
@@ -68,7 +71,9 @@ impl Options {
             json: false,
             no_bpf: false,
             no_socket: false,
+            no_db: false,
             socket: None,
+            db: None,
             object_override: None,
         };
         let mut iter = args.iter();
@@ -78,11 +83,18 @@ impl Options {
                 "--json" => options.json = true,
                 "--no-bpf" => options.no_bpf = true,
                 "--no-socket" => options.no_socket = true,
+                "--no-db" => options.no_db = true,
                 "--socket" => {
                     let Some(value) = iter.next() else {
                         return Err("--socket requires a path".into());
                     };
                     options.socket = Some(PathBuf::from(value));
+                }
+                "--db" => {
+                    let Some(value) = iter.next() else {
+                        return Err("--db requires a path".into());
+                    };
+                    options.db = Some(PathBuf::from(value));
                 }
                 "--ebpf-object" => {
                     let Some(value) = iter.next() else {
@@ -121,6 +133,29 @@ fn socket_path(override_path: Option<&Path>) -> PathBuf {
         return PathBuf::from(env_path);
     }
     PathBuf::from(api::DEFAULT_SOCKET)
+}
+
+fn database_path(override_path: Option<&Path>, disabled: bool) -> Option<PathBuf> {
+    if disabled {
+        return None;
+    }
+    if let Some(path) = override_path {
+        return Some(path.to_path_buf());
+    }
+    if let Some(env_path) = std::env::var_os("ELECTRIC_EYE_DB") {
+        return Some(PathBuf::from(env_path));
+    }
+    if let Some(state_dir) = std::env::var_os("STATE_DIRECTORY") {
+        let first = std::env::split_paths(&state_dir).next();
+        if let Some(dir) = first {
+            return Some(dir.join("electric-eye.db"));
+        }
+    }
+    let system_state = Path::new("/var/lib/electric-eye");
+    if system_state.is_dir() {
+        return Some(system_state.join("electric-eye.db"));
+    }
+    Some(PathBuf::from("electric-eye.db"))
 }
 
 fn is_noise_path(path: &str) -> bool {
@@ -176,6 +211,7 @@ struct Session {
     traffic_window: HashMap<u32, (u64, u64)>,
     write_window: HashMap<(u32, String), WriteStat>,
     own_pid: u32,
+    store: Option<store::StoreClient>,
     json: bool,
     state: Arc<Mutex<api::SharedState>>,
 }
@@ -274,6 +310,9 @@ impl Session {
                 suffix.push_str(&format!("  parent={parent}"));
             }
             println!("{observed}{suffix}");
+        }
+        if let Some(store) = &self.store {
+            store.record(&entry);
         }
         self.state.lock().unwrap().record(entry);
     }
@@ -575,7 +614,8 @@ fn run() -> ExitCode {
             eprintln!();
             eprintln!(
                 "USAGE: sudo electric-eyed [--stdout] [--json] [--no-bpf] \
-                 [--no-socket] [--socket <path>] [--ebpf-object <path>]"
+                 [--no-socket] [--no-db] [--socket <path>] [--db <path>] \
+                 [--ebpf-object <path>]"
             );
             eprintln!();
             eprintln!("error: {message}");
@@ -631,6 +671,20 @@ fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let store = match database_path(options.db.as_deref(), options.no_db) {
+        Some(path) => match store::Store::open(&path) {
+            Ok(store) => {
+                startup_line(options.json, format!("database: {}", path.display()));
+                Some(store)
+            }
+            Err(err) => {
+                eprintln!("warning: SQLite persistence disabled: {err:#}");
+                None
+            }
+        },
+        None => None,
+    };
+
     let (mut collector, report) = match Collector::load(&object) {
         Ok(result) => result,
         Err(err) => {
@@ -651,10 +705,12 @@ fn run() -> ExitCode {
     startup_line(options.json, "streaming events:");
 
     let state = Arc::new(Mutex::new(api::SharedState::new()));
-    state
-        .lock()
-        .unwrap()
-        .set_probes(report.attached.clone(), report.skipped.clone());
+    let store_client = store.as_ref().map(|store| store.client());
+    {
+        let mut state = state.lock().unwrap();
+        state.set_probes(report.attached.clone(), report.skipped.clone());
+        state.set_store(store_client.clone());
+    }
 
     let mut session = Session {
         registry: ProvenanceRegistry::new(),
@@ -666,6 +722,7 @@ fn run() -> ExitCode {
         traffic_window: HashMap::new(),
         write_window: HashMap::new(),
         own_pid: std::process::id(),
+        store: store_client,
         json: options.json,
         state: Arc::clone(&state),
     };
@@ -694,6 +751,9 @@ fn run() -> ExitCode {
         }
     }
     session.flush_write_window();
+    if let Some(store) = store {
+        store.shutdown();
+    }
     ExitCode::SUCCESS
 }
 

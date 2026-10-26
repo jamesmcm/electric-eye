@@ -12,6 +12,7 @@ NAME="${EE_LXC_NAME:-ee-capture-test}"
 CPU="${EE_TEST_CPU:-5}"
 LOG="$(mktemp /tmp/electric-eye-lxc.XXXXXX)"
 SOCKET="$(mktemp -u /tmp/electric-eye-lxc.XXXXXX.sock)"
+DB="$(mktemp -u /tmp/electric-eye-lxc.XXXXXX.db)"
 DAEMON_PID=""
 CREATED=0
 
@@ -21,6 +22,7 @@ cleanup() {
     wait "$DAEMON_PID" 2>/dev/null || true
   fi
   rm -f "$LOG" "$SOCKET"
+  sudo rm -f "$DB" "$DB-shm" "$DB-wal"
 }
 trap cleanup EXIT
 
@@ -50,7 +52,7 @@ cargo build --release -p electric-eyed -p electric-eye-cli >/dev/null
 
 echo "==> starting daemon (socket $SOCKET)"
 sudo stdbuf -oL -eL ./target/release/electric-eyed \
-  --json --socket "$SOCKET" >"$LOG" 2>&1 &
+  --json --socket "$SOCKET" --db "$DB" >"$LOG" 2>&1 &
 DAEMON_PID=$!
 
 for _ in $(seq 1 50); do

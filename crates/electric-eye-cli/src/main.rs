@@ -6,12 +6,16 @@ use std::process::ExitCode;
 const SOCKET_PATH: &str = "/run/electric-eye/electric-eye.sock";
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Status,
     Activity,
     Apps,
     Incidents,
+    File(String),
+    App(String),
+    Network,
+    Why(String),
 }
 
 impl Command {
@@ -21,17 +25,26 @@ impl Command {
             Some("activity") => Some(Command::Activity),
             Some("apps") => Some(Command::Apps),
             Some("incidents") => Some(Command::Incidents),
+            Some("file") => args.get(1).map(|path| Command::File(path.clone())),
+            Some("app") => args.get(1).map(|app| Command::App(app.clone())),
+            Some("network") => Some(Command::Network),
+            Some("why") => args.get(1).map(|path| Command::Why(path.clone())),
             _ => None,
         }
     }
 
-    pub fn request(self) -> &'static str {
-        match self {
-            Command::Status => r#"{"op":"status"}"#,
-            Command::Activity => r#"{"op":"activity","limit":100}"#,
-            Command::Apps => r#"{"op":"apps"}"#,
-            Command::Incidents => r#"{"op":"incidents"}"#,
-        }
+    pub fn request(&self) -> String {
+        let value = match self {
+            Command::Status => serde_json::json!({ "op": "status" }),
+            Command::Activity => serde_json::json!({ "op": "activity", "limit": 100 }),
+            Command::Apps => serde_json::json!({ "op": "apps" }),
+            Command::Incidents => serde_json::json!({ "op": "incidents" }),
+            Command::File(path) => serde_json::json!({ "op": "file", "path": path }),
+            Command::App(app) => serde_json::json!({ "op": "app", "app": app }),
+            Command::Network => serde_json::json!({ "op": "network" }),
+            Command::Why(path) => serde_json::json!({ "op": "why", "path": path }),
+        };
+        value.to_string()
     }
 }
 
@@ -60,7 +73,7 @@ fn connect(path: &PathBuf) -> std::io::Result<UnixStream> {
     Ok(stream)
 }
 
-fn run(command: Command, socket: &PathBuf) -> anyhow::Result<i32> {
+fn run(command: &Command, socket: &PathBuf) -> anyhow::Result<i32> {
     match connect(socket) {
         Ok(mut stream) => {
             stream.write_all(command.request().as_bytes())?;
@@ -106,17 +119,21 @@ fn main() -> ExitCode {
         eprintln!();
         eprintln!("COMMANDS:");
         for cmd in [
-            "status      show daemon status",
-            "activity    show recent activity",
-            "apps        list known applications",
-            "incidents   list recorded incidents",
+            "status               show daemon status",
+            "activity             show recent activity",
+            "apps                 list known applications",
+            "app <name>           show recent activity for an application",
+            "file <path>          show activity for a file",
+            "network              show recent network activity",
+            "why <path>           show who touched a file",
+            "incidents            list recorded incidents",
         ] {
             eprintln!("  {cmd}");
         }
         return ExitCode::from(2);
     };
 
-    match run(command, &socket) {
+    match run(&command, &socket) {
         Ok(code) => ExitCode::from(code as u8),
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -148,9 +165,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_path_and_app_commands() {
+        assert_eq!(
+            Command::parse(&args(&["file", "/tmp/x"])),
+            Some(Command::File("/tmp/x".into()))
+        );
+        assert_eq!(
+            Command::parse(&args(&["app", "firefox"])),
+            Some(Command::App("firefox".into()))
+        );
+        assert_eq!(
+            Command::parse(&args(&["why", "/tmp/x"])),
+            Some(Command::Why("/tmp/x".into()))
+        );
+        assert_eq!(Command::parse(&args(&["network"])), Some(Command::Network));
+    }
+
+    #[test]
     fn rejects_unknown_commands() {
         assert_eq!(Command::parse(&args(&[])), None);
         assert_eq!(Command::parse(&args(&["frobnicate"])), None);
+        assert_eq!(Command::parse(&args(&["file"])), None);
     }
 
     #[test]
