@@ -2,3 +2,7 @@
 /result*
 /.jj
 /.direnv
+/packaging/arch/*.tar.gz
+/packaging/arch/src
+/packaging/arch/pkg
+*.pkg.tar.zst

@@ -19,8 +19,11 @@ build() {
   # The eBPF crate is a separate workspace built for bpfel-unknown-none. It is
   # pinned to the nightly whose bundled LLVM matches bpf-linker; see
   # docs/TOOLCHAIN.md before changing either pin.
+  rustup toolchain install stable --profile minimal
+  rustup default stable
   rustup toolchain install nightly-2026-01-20 --profile minimal --component rust-src
   cargo xtask build-ebpf
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/build"
   cargo build --release --locked -p electric-eyed -p electric-eye-cli
 }
 

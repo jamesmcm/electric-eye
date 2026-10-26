@@ -1,9 +1,9 @@
 [Unit]
 Description=Electric Eye system activity monitor
 Documentation=https://github.com/jamesmcm/electric-eye
-After=systemd-sysusers.service
-ConditionPathExists=/sys/kernel/tracing/events
-ConditionPathExists=/sys/kernel/btf/vmlinux
+After=systemd-sysusers.service sys-kernel-tracing.mount sys-kernel-debug.mount
+ConditionPathExists=|/sys/kernel/tracing/events
+ConditionPathExists=|/sys/kernel/debug/tracing/events
 
 [Service]
 Type=simple
@@ -44,7 +44,6 @@ IPAddressDeny=any
 DevicePolicy=closed
 DeviceAllow=/dev/null rw
 DeviceAllow=/dev/urandom r
-ReadOnlyPaths=/sys/kernel/tracing /sys/kernel/debug/tracing /sys/kernel/btf
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes

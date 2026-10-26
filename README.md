@@ -71,8 +71,15 @@ electric-eye status
 ```
 
 The service runs as the unprivileged `electric-eye` system user with only
-`CAP_BPF`, `CAP_PERFMON`, `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`. The
-hardening posture is checked with:
+`CAP_BPF`, `CAP_PERFMON`, `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`. Add
+yourself to the `electric-eye` group to use the read-only CLI:
+
+```bash
+sudo usermod -aG electric-eye "$USER"
+# log out and back in, or use: newgrp electric-eye
+```
+
+The hardening posture is checked with:
 
 ```bash
 systemd-analyze security electric-eye.service

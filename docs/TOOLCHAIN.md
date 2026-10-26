@@ -69,6 +69,16 @@ stable Rust. Bumping it can silently change the shell's LLVM major — after
 `nix flake update`, re-run the pairing check above before building the
 eBPF crate.
 
+## Arch Linux packaging
+
+The Arch `extra/bpf-linker` package (0.11.0-2) is built against the distro's
+current LLVM (23.1.x at the time of writing). That is fine with the pinned
+nightly because the reader is **newer** than the producer (nightly
+2026-01-20 bundles LLVM 21.1.8). The PKGBUILD installs a stable Rust toolchain
+for the userspace/xtask crates and the pinned nightly for the eBPF object.
+Nixpkgs' LLVM 23.1.0-rc1 is the case that needs `--features llvm-21`, because
+the rc lacks `LLVMParseIRInContext2`.
+
 ## Known failure signatures
 
 | Symptom                                                             | Cause                                        |
