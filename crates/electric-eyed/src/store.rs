@@ -177,18 +177,23 @@ impl StoreClient {
              FROM activities WHERE app = ?1 ORDER BY bucket_ms DESC, count DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![app, limit as i64], activity_row)?;
-        Ok(json!({ "app": app, "activities": collect(rows)? }))
+        let activities = collect(rows)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT ts_ms, kind, comm, subject, path, from_path, to_path,
+                    addr, local_port, remote_port, bytes, count
+             FROM events WHERE comm = ?1 ORDER BY ts_ms DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![app, limit as i64], raw_row)?;
+        Ok(json!({
+            "app": app,
+            "activities": activities,
+            "events": collect(rows)?,
+        }))
     }
 
     pub fn file_activities(&self, path: &str, limit: usize) -> Result<Value> {
-        let conn = self.read_connection()?;
-        let limit = limit.clamp(1, MAX_QUERY_LIMIT);
-        let mut stmt = conn.prepare(
-            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix
-             FROM activities WHERE subject = ?1 ORDER BY bucket_ms DESC, count DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![path, limit as i64], activity_row)?;
-        Ok(json!({ "path": path, "activities": collect(rows)? }))
+        self.why(path, limit)
     }
 
     pub fn network_activities(&self, limit: usize) -> Result<Value> {
@@ -200,7 +205,18 @@ impl StoreClient {
              ORDER BY bucket_ms DESC, bytes DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], activity_row)?;
-        Ok(json!({ "activities": collect(rows)? }))
+        let activities = collect(rows)?;
+
+        let mut stmt = conn.prepare(
+            "SELECT ts_ms, kind, comm, subject, path, from_path, to_path,
+                    addr, local_port, remote_port, bytes, count
+             FROM events WHERE kind LIKE 'net.%' ORDER BY ts_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], raw_row)?;
+        Ok(json!({
+            "activities": activities,
+            "events": collect(rows)?,
+        }))
     }
 
     pub fn why(&self, path: &str, limit: usize) -> Result<Value> {
