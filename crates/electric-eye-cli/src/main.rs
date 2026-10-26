@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 const SOCKET_PATH: &str = "/run/electric-eye/electric-eye.sock";
@@ -27,52 +28,81 @@ impl Command {
     pub fn request(self) -> &'static str {
         match self {
             Command::Status => r#"{"op":"status"}"#,
-            Command::Activity => r#"{"op":"activity"}"#,
+            Command::Activity => r#"{"op":"activity","limit":100}"#,
             Command::Apps => r#"{"op":"apps"}"#,
             Command::Incidents => r#"{"op":"incidents"}"#,
         }
     }
 }
 
-fn connect() -> std::io::Result<UnixStream> {
-    let stream = UnixStream::connect(SOCKET_PATH)?;
+fn socket_path(args: &mut Vec<String>) -> PathBuf {
+    let mut path = std::env::var_os("ELECTRIC_EYE_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(SOCKET_PATH));
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--socket" {
+            if index + 1 < args.len() {
+                path = PathBuf::from(args.remove(index + 1));
+            }
+            args.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    path
+}
+
+fn connect(path: &PathBuf) -> std::io::Result<UnixStream> {
+    let stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
     Ok(stream)
 }
 
-fn run(command: Command) -> anyhow::Result<i32> {
-    match connect() {
+fn run(command: Command, socket: &PathBuf) -> anyhow::Result<i32> {
+    match connect(socket) {
         Ok(mut stream) => {
             stream.write_all(command.request().as_bytes())?;
             stream.write_all(b"\n")?;
             let mut response = String::new();
             stream.read_to_string(&mut response)?;
-            println!("{}", response.trim_end());
+            match serde_json::from_str::<serde_json::Value>(response.trim()) {
+                Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+                Err(_) => println!("{}", response.trim_end()),
+            }
             Ok(0)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             eprintln!("electric-eyed is not running");
-            eprintln!("expected daemon socket at {SOCKET_PATH}");
+            eprintln!("expected daemon socket at {}", socket.display());
             eprintln!(
                 "start it with: sudo electric-eyed --stdout (or the electric-eye.service unit)"
             );
             Ok(1)
         }
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+            eprintln!(
+                "electric-eyed socket exists but nothing is listening at {}",
+                socket.display()
+            );
+            Ok(1)
+        }
         Err(err) => {
-            eprintln!("failed to reach {SOCKET_PATH}: {err}");
+            eprintln!("failed to reach {}: {err}", socket.display());
             Ok(1)
         }
     }
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let socket = socket_path(&mut args);
 
     let Some(command) = Command::parse(&args) else {
         eprintln!("electric-eye - query the electric-eyed monitor");
         eprintln!();
-        eprintln!("USAGE: electric-eye <COMMAND>");
+        eprintln!("USAGE: electric-eye [--socket <path>] <COMMAND>");
         eprintln!();
         eprintln!("COMMANDS:");
         for cmd in [
@@ -86,7 +116,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    match run(command) {
+    match run(command, &socket) {
         Ok(code) => ExitCode::from(code as u8),
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -121,5 +151,12 @@ mod tests {
     fn rejects_unknown_commands() {
         assert_eq!(Command::parse(&args(&[])), None);
         assert_eq!(Command::parse(&args(&["frobnicate"])), None);
+    }
+
+    #[test]
+    fn extracts_socket_override() {
+        let mut items = args(&["--socket", "/tmp/ee.sock", "status"]);
+        assert_eq!(socket_path(&mut items), PathBuf::from("/tmp/ee.sock"));
+        assert_eq!(items, args(&["status"]));
     }
 }

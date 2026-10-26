@@ -1,3 +1,6 @@
+use std::ffi::CString;
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -10,11 +13,12 @@ use crate::probe;
 
 pub const EVENT_MAP: &str = "EVENTS";
 pub const PROGRAM_EXEC: &str = "electric_eye_exec";
+pub const PROGRAM_EXIT: &str = "electric_eye_exit";
 
 const RAW_EXEC_LEN: usize = 32;
 const RAW_NET_LEN: usize = 56;
-const RAW_PATH_LEN: usize = 288;
-const RAW_RENAME_LEN: usize = 544;
+const RAW_PATH_LEN: usize = 544;
+const RAW_RENAME_LEN: usize = 1056;
 
 const UNRESOLVED_OFFSET: u32 = u32::MAX;
 
@@ -24,6 +28,14 @@ pub const KIND_LISTEN: u32 = 2;
 pub const KIND_FILE_WRITE: u32 = 3;
 pub const KIND_FILE_UNLINK: u32 = 4;
 pub const KIND_FILE_RENAME: u32 = 5;
+pub const KIND_EXIT: u32 = 6;
+pub const KIND_ACCEPT: u32 = 7;
+
+const PERF_TYPE_TRACEPOINT: u32 = 2;
+const PERF_SAMPLE_RAW: u64 = 1 << 10;
+const PERF_FLAG_FD_CLOEXEC: u32 = 8;
+const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
+const PERF_EVENT_IOC_SET_BPF: libc::c_ulong = 0x4004_2408;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -43,13 +55,23 @@ pub struct SockOffsets {
 unsafe impl Pod for SockOffsets {}
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct SyscallOffsets {
     pub openat_filename: u32,
     pub openat_flags: u32,
+    pub openat2_filename: u32,
+    pub openat2_how: u32,
+    pub open_filename: u32,
+    pub open_flags: u32,
     pub unlinkat_pathname: u32,
+    pub unlink_pathname: u32,
+    pub rmdir_pathname: u32,
     pub rename_oldname: u32,
     pub rename_newname: u32,
+    pub renameat_oldname: u32,
+    pub renameat_newname: u32,
+    pub renameat2_oldname: u32,
+    pub renameat2_newname: u32,
 }
 
 unsafe impl Pod for SyscallOffsets {}
@@ -62,6 +84,59 @@ pub struct NetTotals {
 }
 
 unsafe impl Pod for NetTotals {}
+
+/// A subset of `struct perf_event_attr` up to `config2` (the newest field we
+/// use). The kernel accepts an attribute size smaller than its own struct for
+/// backwards compatibility, which keeps this layout valid on older kernels.
+#[repr(C)]
+struct PerfEventAttr {
+    type_: u32,
+    size: u32,
+    config: u64,
+    sample_period: u64,
+    sample_type: u64,
+    read_format: u64,
+    flags: u64,
+    wakeup_events: u32,
+    bp_type: u32,
+    config1: u64,
+    config2: u64,
+}
+
+impl PerfEventAttr {
+    fn tracepoint(event_id: u64) -> Self {
+        Self {
+            type_: PERF_TYPE_TRACEPOINT,
+            size: std::mem::size_of::<Self>() as u32,
+            config: event_id,
+            sample_period: 0,
+            sample_type: PERF_SAMPLE_RAW,
+            read_format: 0,
+            // disabled=1; enabled explicitly after BPF is attached.
+            flags: 1,
+            wakeup_events: 1,
+            bp_type: 0,
+            config1: 0,
+            config2: 0,
+        }
+    }
+
+    fn kprobe(pmu_type: u32, retprobe_bit: Option<u32>, name: &CString, offset: u64) -> Self {
+        Self {
+            type_: pmu_type,
+            size: std::mem::size_of::<Self>() as u32,
+            config: retprobe_bit.map(|bit| 1_u64 << bit).unwrap_or(0),
+            sample_period: 0,
+            sample_type: PERF_SAMPLE_RAW,
+            read_format: 0,
+            flags: 1,
+            wakeup_events: 1,
+            bp_type: 0,
+            config1: name.as_ptr() as u64,
+            config2: offset,
+        }
+    }
+}
 
 fn cstr(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
@@ -106,7 +181,7 @@ pub struct RawPathEvent {
     pub pid: u32,
     pub uid: u32,
     pub comm: [u8; 16],
-    pub path: [u8; 256],
+    pub path: [u8; 512],
 }
 
 impl RawPathEvent {
@@ -125,8 +200,8 @@ pub struct RawRenameEvent {
     pub pid: u32,
     pub uid: u32,
     pub comm: [u8; 16],
-    pub old_path: [u8; 256],
-    pub new_path: [u8; 256],
+    pub old_path: [u8; 512],
+    pub new_path: [u8; 512],
 }
 
 impl RawRenameEvent {
@@ -146,7 +221,9 @@ impl RawRenameEvent {
 #[derive(Debug, Clone)]
 pub enum RawEvent {
     Exec(RawExecEvent),
+    Exit(RawExecEvent),
     Connect(RawNetEvent),
+    Accept(RawNetEvent),
     Listen(RawNetEvent),
     FileWrite(RawPathEvent),
     FileUnlink(RawPathEvent),
@@ -164,18 +241,23 @@ fn read_array<const N: usize>(data: &[u8], at: usize) -> Option<[u8; N]> {
 pub fn decode(data: &[u8]) -> Option<RawEvent> {
     let kind = read_u32(data, 0)?;
     match kind {
-        KIND_EXEC => {
+        KIND_EXEC | KIND_EXIT => {
             if data.len() < RAW_EXEC_LEN {
                 return None;
             }
-            Some(RawEvent::Exec(RawExecEvent {
+            let event = RawExecEvent {
                 pid: read_u32(data, 4)?,
                 ppid: read_u32(data, 8)?,
                 uid: read_u32(data, 12)?,
                 comm: read_array(data, 16)?,
-            }))
+            };
+            Some(if kind == KIND_EXEC {
+                RawEvent::Exec(event)
+            } else {
+                RawEvent::Exit(event)
+            })
         }
-        KIND_CONNECT | KIND_LISTEN => {
+        KIND_CONNECT | KIND_ACCEPT | KIND_LISTEN => {
             if data.len() < RAW_NET_LEN {
                 return None;
             }
@@ -189,10 +271,10 @@ pub fn decode(data: &[u8]) -> Option<RawEvent> {
                 addr: read_array(data, 24)?,
                 comm: read_array(data, 40)?,
             };
-            Some(if kind == KIND_CONNECT {
-                RawEvent::Connect(event)
-            } else {
-                RawEvent::Listen(event)
+            Some(match kind {
+                KIND_CONNECT => RawEvent::Connect(event),
+                KIND_ACCEPT => RawEvent::Accept(event),
+                _ => RawEvent::Listen(event),
             })
         }
         KIND_FILE_WRITE | KIND_FILE_UNLINK => {
@@ -222,7 +304,7 @@ pub fn decode(data: &[u8]) -> Option<RawEvent> {
                 uid: read_u32(data, 8)?,
                 comm: read_array(data, 16)?,
                 old_path: read_array(data, 32)?,
-                new_path: read_array(data, 288)?,
+                new_path: read_array(data, 544)?,
             })))
         }
         _ => None,
@@ -249,6 +331,9 @@ pub struct Collector {
     _bpf: Ebpf,
     ring: RingBuf<MapData>,
     net_totals: Option<HashMap<MapData, u32, NetTotals>>,
+    /// Perf event descriptors keep every per-CPU attachment alive. Closing
+    /// them detaches the programs; no debugfs bookkeeping is required.
+    _perf_links: Vec<OwnedFd>,
 }
 
 impl Collector {
@@ -266,6 +351,7 @@ impl Collector {
         let mut bpf = Ebpf::load_file(object_path)
             .with_context(|| format!("failed to load eBPF object {}", object_path.display()))?;
         let mut report = AttachReport::default();
+        let mut perf_links = Vec::new();
 
         let sock_ok = fill_sock_offsets(&mut bpf, &mut report);
         let syscall_plan = fill_syscall_offsets(&mut bpf, &mut report);
@@ -281,16 +367,27 @@ impl Collector {
         attach_tracepoint(
             &mut bpf,
             &mut report,
+            &mut perf_links,
             PROGRAM_EXEC,
             "sched",
             "sched_process_exec",
             true,
+        )?;
+        attach_tracepoint(
+            &mut bpf,
+            &mut report,
+            &mut perf_links,
+            PROGRAM_EXIT,
+            "sched",
+            "sched_process_exit",
+            false,
         )?;
 
         if sock_ok {
             attach_tracepoint(
                 &mut bpf,
                 &mut report,
+                &mut perf_links,
                 "electric_eye_sock_state",
                 "sock",
                 "inet_sock_set_state",
@@ -300,35 +397,73 @@ impl Collector {
             report.skip("electric_eye_sock_state", "tracepoint layout unresolved");
         }
 
-        if syscall_plan.openat {
-            attach_tracepoint(
-                &mut bpf,
-                &mut report,
+        for (enabled, program, category, event) in [
+            (
+                syscall_plan.openat,
                 "electric_eye_openat",
                 "syscalls",
                 "sys_enter_openat",
-                false,
-            )?;
-        }
-        if syscall_plan.unlinkat {
-            attach_tracepoint(
-                &mut bpf,
-                &mut report,
+            ),
+            (
+                syscall_plan.openat2,
+                "electric_eye_openat2",
+                "syscalls",
+                "sys_enter_openat2",
+            ),
+            (
+                syscall_plan.open,
+                "electric_eye_open",
+                "syscalls",
+                "sys_enter_open",
+            ),
+            (
+                syscall_plan.unlinkat,
                 "electric_eye_unlinkat",
                 "syscalls",
                 "sys_enter_unlinkat",
-                false,
-            )?;
-        }
-        if syscall_plan.renameat2 {
-            attach_tracepoint(
-                &mut bpf,
-                &mut report,
+            ),
+            (
+                syscall_plan.unlink,
+                "electric_eye_unlink",
+                "syscalls",
+                "sys_enter_unlink",
+            ),
+            (
+                syscall_plan.rmdir,
+                "electric_eye_rmdir",
+                "syscalls",
+                "sys_enter_rmdir",
+            ),
+            (
+                syscall_plan.rename,
+                "electric_eye_rename",
+                "syscalls",
+                "sys_enter_rename",
+            ),
+            (
+                syscall_plan.renameat,
+                "electric_eye_renameat",
+                "syscalls",
+                "sys_enter_renameat",
+            ),
+            (
+                syscall_plan.renameat2,
                 "electric_eye_renameat2",
                 "syscalls",
                 "sys_enter_renameat2",
-                false,
-            )?;
+            ),
+        ] {
+            if enabled {
+                attach_tracepoint(
+                    &mut bpf,
+                    &mut report,
+                    &mut perf_links,
+                    program,
+                    category,
+                    event,
+                    false,
+                )?;
+            }
         }
 
         if let Some(ksyms) = &ksyms {
@@ -339,7 +474,7 @@ impl Collector {
                 ("udp_recvmsg", "electric_eye_udp_recv"),
             ] {
                 if ksyms.contains(symbol) {
-                    match attach_kretprobe(&mut bpf, program, symbol) {
+                    match attach_kretprobe(&mut bpf, &mut perf_links, program, symbol) {
                         Ok(()) => report.attach(program),
                         Err(err) => report.skip(program, &format!("{err:#}")),
                     }
@@ -364,6 +499,7 @@ impl Collector {
                 _bpf: bpf,
                 ring,
                 net_totals,
+                _perf_links: perf_links,
             },
             report,
         ))
@@ -402,19 +538,24 @@ impl Collector {
 fn attach_tracepoint(
     bpf: &mut Ebpf,
     report: &mut AttachReport,
+    perf_links: &mut Vec<OwnedFd>,
     program: &str,
     category: &str,
     event: &str,
     required: bool,
 ) -> Result<()> {
     let result = (|| -> Result<()> {
+        let id = crate::format::event_id(category, event)
+            .with_context(|| format!("tracepoint {category}/{event} unavailable"))?;
         let tp: &mut TracePoint = bpf
             .program_mut(program)
             .with_context(|| format!("program {program} missing from the object"))?
             .try_into()?;
         tp.load()?;
-        tp.attach(category, event)
+        let prog_fd = tp.fd()?.as_fd().as_raw_fd();
+        let fds = perf_attach(prog_fd, &PerfEventAttr::tracepoint(id))
             .with_context(|| format!("failed to attach {category}/{event}"))?;
+        perf_links.extend(fds);
         Ok(())
     })();
     match result {
@@ -430,15 +571,87 @@ fn attach_tracepoint(
     }
 }
 
-fn attach_kretprobe(bpf: &mut Ebpf, program: &str, symbol: &str) -> Result<()> {
+fn attach_kretprobe(
+    bpf: &mut Ebpf,
+    perf_links: &mut Vec<OwnedFd>,
+    program: &str,
+    symbol: &str,
+) -> Result<()> {
+    let pmu_type = read_trimmed("/sys/bus/event_source/devices/kprobe/type")
+        .context("kprobe PMU type unavailable")?
+        .parse::<u32>()
+        .context("invalid kprobe PMU type")?;
+    let retprobe_bit = match read_trimmed("/sys/bus/event_source/devices/kprobe/format/retprobe") {
+        Ok(text) => Some(
+            text.split_once(':')
+                .context("invalid retprobe format")?
+                .1
+                .parse::<u32>()
+                .context("invalid retprobe bit")?,
+        ),
+        Err(err) => {
+            log::warn!("kprobe retprobe format unavailable ({err}); using entry probes");
+            None
+        }
+    };
+
+    let name = CString::new(symbol).context("kprobe symbol contains a NUL byte")?;
     let kp: &mut KProbe = bpf
         .program_mut(program)
         .with_context(|| format!("program {program} missing from the object"))?
         .try_into()?;
     kp.load()?;
-    kp.attach(symbol, 0)
-        .with_context(|| format!("failed to attach kretprobe:{symbol}"))?;
+    let prog_fd = kp.fd()?.as_fd().as_raw_fd();
+    let fds = perf_attach(
+        prog_fd,
+        &PerfEventAttr::kprobe(pmu_type, retprobe_bit, &name, 0),
+    )
+    .with_context(|| format!("failed to attach kretprobe:{symbol}"))?;
+    perf_links.extend(fds);
     Ok(())
+}
+
+fn read_trimmed(path: &str) -> io::Result<String> {
+    Ok(std::fs::read_to_string(path)?.trim().to_string())
+}
+
+fn perf_attach(prog_fd: RawFd, attr: &PerfEventAttr) -> io::Result<Vec<OwnedFd>> {
+    // A tracepoint's BPF program array is shared by every CPU: opening one
+    // perf event enables the tracepoint system-wide and the program runs on
+    // all CPUs. Attaching the same program once per CPU is rejected with
+    // EEXIST by the kernel, so keep a single anchor event.
+    let cpu = probe::online_cpus()?.into_iter().next().unwrap_or(0);
+    let fd = perf_event_open(attr, cpu)
+        .map_err(|err| io::Error::new(err.kind(), format!("cpu {cpu}: {err}")))?;
+    perf_ioctl(&fd, PERF_EVENT_IOC_SET_BPF, prog_fd as libc::c_ulong)?;
+    perf_ioctl(&fd, PERF_EVENT_IOC_ENABLE, 0)?;
+    Ok(vec![fd])
+}
+
+fn perf_event_open(attr: &PerfEventAttr, cpu: u32) -> io::Result<OwnedFd> {
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_perf_event_open,
+            attr as *const PerfEventAttr,
+            -1_i32,
+            cpu as i32,
+            -1_i32,
+            PERF_FLAG_FD_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+fn perf_ioctl(fd: &OwnedFd, request: libc::c_ulong, arg: libc::c_ulong) -> io::Result<()> {
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), request, arg) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn fill_sock_offsets(bpf: &mut Ebpf, report: &mut AttachReport) -> bool {
@@ -485,45 +698,93 @@ fn fill_syscall_offsets(bpf: &mut Ebpf, report: &mut AttachReport) -> SyscallPla
     let mut offsets = SyscallOffsets {
         openat_filename: UNRESOLVED_OFFSET,
         openat_flags: UNRESOLVED_OFFSET,
+        openat2_filename: UNRESOLVED_OFFSET,
+        openat2_how: UNRESOLVED_OFFSET,
+        open_filename: UNRESOLVED_OFFSET,
+        open_flags: UNRESOLVED_OFFSET,
         unlinkat_pathname: UNRESOLVED_OFFSET,
+        unlink_pathname: UNRESOLVED_OFFSET,
+        rmdir_pathname: UNRESOLVED_OFFSET,
         rename_oldname: UNRESOLVED_OFFSET,
         rename_newname: UNRESOLVED_OFFSET,
+        renameat_oldname: UNRESOLVED_OFFSET,
+        renameat_newname: UNRESOLVED_OFFSET,
+        renameat2_oldname: UNRESOLVED_OFFSET,
+        renameat2_newname: UNRESOLVED_OFFSET,
     };
 
-    match TraceFormat::load("syscalls", "sys_enter_openat") {
-        Ok(fmt) => match (fmt.offset("filename"), fmt.offset("flags")) {
-            (Some(f), Some(fl)) => {
-                offsets.openat_filename = f as u32;
-                offsets.openat_flags = fl as u32;
-                plan.openat = true;
-            }
-            _ => report.skip("electric_eye_openat", "required fields absent"),
-        },
-        Err(err) => report.skip("electric_eye_openat", &format!("{err}")),
-    }
-
-    match TraceFormat::load("syscalls", "sys_enter_unlinkat") {
-        Ok(fmt) => match fmt.offset("pathname") {
-            Some(off) => {
-                offsets.unlinkat_pathname = off as u32;
-                plan.unlinkat = true;
-            }
-            None => report.skip("electric_eye_unlinkat", "pathname field absent"),
-        },
-        Err(err) => report.skip("electric_eye_unlinkat", &format!("{err}")),
-    }
-
-    match TraceFormat::load("syscalls", "sys_enter_renameat2") {
-        Ok(fmt) => match (fmt.offset("oldname"), fmt.offset("newname")) {
-            (Some(old), Some(new)) => {
-                offsets.rename_oldname = old as u32;
-                offsets.rename_newname = new as u32;
-                plan.renameat2 = true;
-            }
-            _ => report.skip("electric_eye_renameat2", "required fields absent"),
-        },
-        Err(err) => report.skip("electric_eye_renameat2", &format!("{err}")),
-    }
+    plan.openat = resolve_syscall(
+        "sys_enter_openat",
+        &mut [
+            ("filename", &mut offsets.openat_filename),
+            ("flags", &mut offsets.openat_flags),
+        ],
+        report,
+        "electric_eye_openat",
+    );
+    plan.openat2 = resolve_syscall(
+        "sys_enter_openat2",
+        &mut [
+            ("filename", &mut offsets.openat2_filename),
+            ("how", &mut offsets.openat2_how),
+        ],
+        report,
+        "electric_eye_openat2",
+    );
+    plan.open = resolve_syscall(
+        "sys_enter_open",
+        &mut [
+            ("filename", &mut offsets.open_filename),
+            ("flags", &mut offsets.open_flags),
+        ],
+        report,
+        "electric_eye_open",
+    );
+    plan.unlinkat = resolve_syscall(
+        "sys_enter_unlinkat",
+        &mut [("pathname", &mut offsets.unlinkat_pathname)],
+        report,
+        "electric_eye_unlinkat",
+    );
+    plan.unlink = resolve_syscall(
+        "sys_enter_unlink",
+        &mut [("pathname", &mut offsets.unlink_pathname)],
+        report,
+        "electric_eye_unlink",
+    );
+    plan.rmdir = resolve_syscall(
+        "sys_enter_rmdir",
+        &mut [("pathname", &mut offsets.rmdir_pathname)],
+        report,
+        "electric_eye_rmdir",
+    );
+    plan.rename = resolve_syscall(
+        "sys_enter_rename",
+        &mut [
+            ("oldname", &mut offsets.rename_oldname),
+            ("newname", &mut offsets.rename_newname),
+        ],
+        report,
+        "electric_eye_rename",
+    );
+    plan.renameat = resolve_syscall(
+        "sys_enter_renameat",
+        &mut [
+            ("oldname", &mut offsets.renameat_oldname),
+            ("newname", &mut offsets.renameat_newname),
+        ],
+        report,
+        "electric_eye_renameat",
+    );
+    plan.renameat2 = resolve_syscall(
+        "sys_enter_renameat2",
+        &mut [
+            ("oldname", &mut offsets.renameat2_oldname),
+            ("newname", &mut offsets.renameat2_newname),
+        ],
+        report,
+        "electric_eye_renameat2",
+    );
 
     if plan.any() {
         let publish = (|| -> Result<()> {
@@ -545,15 +806,108 @@ fn fill_syscall_offsets(bpf: &mut Ebpf, report: &mut AttachReport) -> SyscallPla
     plan
 }
 
+fn resolve_syscall(
+    event: &str,
+    fields: &mut [(&str, &mut u32)],
+    report: &mut AttachReport,
+    program: &str,
+) -> bool {
+    let fmt = match TraceFormat::load("syscalls", event) {
+        Ok(fmt) => fmt,
+        Err(err) => {
+            report.skip(program, &format!("{event}: {err}"));
+            return false;
+        }
+    };
+    for (field, slot) in fields {
+        match fmt.offset(field) {
+            Some(offset) => **slot = offset as u32,
+            None => {
+                report.skip(program, &format!("{event} is missing field {field}"));
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SyscallPlan {
     openat: bool,
+    openat2: bool,
+    open: bool,
     unlinkat: bool,
+    unlink: bool,
+    rmdir: bool,
+    rename: bool,
+    renameat: bool,
     renameat2: bool,
 }
 
 impl SyscallPlan {
     fn any(&self) -> bool {
-        self.openat || self.unlinkat || self.renameat2
+        self.openat
+            || self.openat2
+            || self.open
+            || self.unlinkat
+            || self.unlink
+            || self.rmdir
+            || self.rename
+            || self.renameat
+            || self.renameat2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_exec_event() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&KIND_EXEC.to_le_bytes());
+        data.extend_from_slice(&42_u32.to_le_bytes());
+        data.extend_from_slice(&7_u32.to_le_bytes());
+        data.extend_from_slice(&1000_u32.to_le_bytes());
+        let mut comm = [0_u8; 16];
+        comm[..4].copy_from_slice(b"bash");
+        data.extend_from_slice(&comm);
+        match decode(&data) {
+            Some(RawEvent::Exec(event)) => {
+                assert_eq!(event.pid, 42);
+                assert_eq!(event.ppid, 7);
+                assert_eq!(event.comm_str(), "bash");
+            }
+            other => panic!("unexpected decode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_accept_event() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&KIND_ACCEPT.to_le_bytes());
+        data.extend_from_slice(&42_u32.to_le_bytes());
+        data.extend_from_slice(&1000_u32.to_le_bytes());
+        data.extend_from_slice(&2_u32.to_le_bytes());
+        data.extend_from_slice(&8000_u32.to_le_bytes());
+        data.extend_from_slice(&51000_u32.to_le_bytes());
+        data.extend_from_slice(&[127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        data.extend_from_slice(&[0_u8; 16]);
+        match decode(&data) {
+            Some(RawEvent::Accept(event)) => {
+                assert_eq!(event.sport, 8000);
+                assert_eq!(event.dport, 51000);
+            }
+            other => panic!("unexpected decode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_event() {
+        assert!(decode(&[0, 0, 0]).is_none());
+        let mut data = Vec::new();
+        data.extend_from_slice(&KIND_FILE_RENAME.to_le_bytes());
+        data.extend_from_slice(&[0; 64]);
+        assert!(decode(&data).is_none());
     }
 }

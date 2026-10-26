@@ -75,6 +75,26 @@ impl TraceFormat {
     }
 }
 
+/// Reads the numeric tracepoint id used by `perf_event_open`.
+pub fn event_id(category: &str, event: &str) -> std::io::Result<u64> {
+    let mut last_err = None;
+    for root in TRACEFS_CANDIDATES {
+        let path = format!("{root}/events/{category}/{event}/id");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                return text.trim().parse::<u64>().map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid tracepoint id at {path}: {err}"),
+                    )
+                });
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("tracefs not found")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

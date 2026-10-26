@@ -13,6 +13,8 @@ anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 aya = "0.14"
 electric-eye-core = { path = "../electric-eye-core" }
 electric-eye-nix = { path = "../electric-eye-nix" }

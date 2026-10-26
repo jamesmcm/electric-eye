@@ -17,8 +17,23 @@ build-ebpf:
 build: build-ebpf
     cargo build
 
+release: build-ebpf
+    cargo build --release --locked -p electric-eyed -p electric-eye-cli
+
 run-daemon: build
     sudo ./target/debug/electric-eyed --stdout
+
+test-lxc:
+    ./tests/lxc/capture-test.sh
+
+dist:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    install -d packaging/arch
+    git archive --format=tar.gz --prefix="electric-eye-$ver/" \
+        -o "packaging/arch/electric-eye-$ver.tar.gz" HEAD
+    sha256sum "packaging/arch/electric-eye-$ver.tar.gz"
 
 test:
     cargo fmt --all -- --check

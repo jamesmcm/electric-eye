@@ -1,0 +1,47 @@
+# Maintainer: James McMurray <jamesmcm03@gmail.com>
+pkgname=electric-eye
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Explain what applications are doing with eBPF-based Linux activity monitoring"
+arch=('x86_64')
+url="https://github.com/jamesmcm/electric-eye"
+license=('MIT')
+depends=('gcc-libs')
+makedepends=('rustup' 'clang' 'llvm' 'lld' 'bpf-linker' 'pkgconf' 'systemd')
+install=electric-eye.install
+options=('!strip')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+
+  # The eBPF crate is a separate workspace built for bpfel-unknown-none. It is
+  # pinned to the nightly whose bundled LLVM matches bpf-linker; see
+  # docs/TOOLCHAIN.md before changing either pin.
+  rustup toolchain install nightly-2026-01-20 --profile minimal --component rust-src
+  cargo xtask build-ebpf
+  cargo build --release --locked -p electric-eyed -p electric-eye-cli
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  cargo test --workspace --locked
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  install -Dm755 target/release/electric-eyed "$pkgdir/usr/bin/electric-eyed"
+  install -Dm755 target/release/electric-eye "$pkgdir/usr/bin/electric-eye"
+  install -Dm644 target/bpfel-unknown-none/release/electric-eye-ebpf \
+    "$pkgdir/usr/lib/electric-eye/electric-eye-ebpf"
+  install -Dm644 packaging/systemd/electric-eye.service \
+    "$pkgdir/usr/lib/systemd/system/electric-eye.service"
+  install -Dm644 packaging/sysusers/electric-eye.conf \
+    "$pkgdir/usr/lib/sysusers.d/electric-eye.conf"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/electric-eye/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
+
+# vim: set ft=sh:

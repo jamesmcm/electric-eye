@@ -1,8 +1,8 @@
 pub mod event;
 
 pub use event::{
-    ExecEvent, FileEvent, FileKind, NetEvent, ObservedEvent, RenameEvent, TrafficSummary,
-    humanize_bytes,
+    ExecEvent, ExitEvent, FileEvent, FileKind, NetEvent, ObservedEvent, RenameEvent,
+    TrafficSummary, humanize_bytes,
 };
 
 pub const LABEL_WIDTH: usize = 10;
@@ -19,6 +19,7 @@ mod tests {
             uid: 1000,
             comm: "ls".into(),
             exe: PathBuf::from("/usr/bin/ls"),
+            start_ticks: 1234,
         }
     }
 
