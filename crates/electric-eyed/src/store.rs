@@ -21,7 +21,6 @@ const BATCH_SIZE: usize = 128;
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_QUERY_LIMIT: usize = 1000;
 
-#[allow(dead_code)]
 enum StoreMsg {
     Event(Box<StoreEvent>),
     Incident(IncidentRow),
@@ -131,7 +130,6 @@ impl StoreClient {
         }
     }
 
-    #[allow(dead_code)]
     pub fn record_incident(&self, incident: IncidentRow) {
         if self.tx.try_send(StoreMsg::Incident(incident)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);

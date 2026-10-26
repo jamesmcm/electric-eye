@@ -45,6 +45,11 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
+if ! sudo lxc-attach -n "$NAME" -- python3 --version >/dev/null 2>&1; then
+  echo "==> installing python3 in the test container"
+  sudo lxc-attach -n "$NAME" -- pacman -Sy --noconfirm python >/dev/null
+fi
+
 cd "$ROOT"
 echo "==> building userspace and eBPF object"
 cargo xtask build-ebpf >/dev/null
@@ -74,6 +79,7 @@ if ! grep -q "streaming events:" "$LOG"; then
 fi
 
 MARKER="/tmp/electric-eye-lxc-$$"
+WRITE_MARKER="$MARKER.write"
 PORT="${EE_TEST_PORT:-$((20000 + ($$ % 20000)))}"
 echo "==> running workload on guest CPU $CPU"
 sudo lxc-attach -n "$NAME" -- taskset -c "$CPU" sh -c "
@@ -83,13 +89,31 @@ touch '$MARKER.touch'
 mv '$MARKER' '$MARKER.renamed'
 rm '$MARKER.renamed' '$MARKER.touch'
 "
+sudo lxc-attach -n "$NAME" -- taskset -c "$CPU" python3 -c '
+import sys, time
+f = open(sys.argv[1], "wb")
+for _ in range(4):
+    f.write(b"x" * 4096)
+    f.flush()
+    time.sleep(0.2)
+time.sleep(1)
+f.close()
+' "$WRITE_MARKER"
 sudo lxc-attach -n "$NAME" -- sh -c "
-python3 -m http.server '$PORT' --bind 127.0.0.1 >/tmp/ee-lxc-http.log 2>&1 &
+python3 -c '
+import socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((\"127.0.0.1\", $PORT))
+s.listen(1)
+c, _ = s.accept()
+time.sleep(2)
+c.close()
+s.close()
+' &
 srv=\$!
 sleep 0.7
-taskset -c '$CPU' curl -s --max-time 2 http://127.0.0.1:'$PORT'/ >/dev/null
-sleep 0.5
-kill \$srv 2>/dev/null || true
+taskset -c '$CPU' curl -s --max-time 1 http://127.0.0.1:'$PORT'/ >/dev/null || true
 wait \$srv 2>/dev/null || true
 "
 
@@ -102,7 +126,7 @@ done
 
 # Actual write events are aggregated into a 5-second window.
 for _ in $(seq 1 60); do
-  if grep "$MARKER" "$LOG" | grep -q '"event":"file_write"'; then
+  if grep "$WRITE_MARKER" "$LOG" | grep -q '"event":"file_write"'; then
     break
   fi
   sleep 0.2
@@ -122,6 +146,16 @@ if ! grep -q '"event":"accept"' "$LOG"; then
   fail=1
 elif ! grep '"event":"accept"' "$LOG" | grep -q '"comm":"python3"'; then
   echo "ACCEPT attribution did not identify the python server" >&2
+  fail=1
+fi
+
+echo "==> triggering a sensitive-path incident inside the container"
+sudo lxc-attach -n "$NAME" -- sh -c \
+  'mkdir -p /root/.ssh; echo test > /root/.ssh/electric-eye-lxc-test; rm /root/.ssh/electric-eye-lxc-test'
+sleep 1
+if ! sudo ./target/release/electric-eye --socket "$SOCKET" incidents \
+  | grep -q 'Sensitive path access'; then
+  echo "sensitive-path rule did not fire" >&2
   fail=1
 fi
 

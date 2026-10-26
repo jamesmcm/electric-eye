@@ -42,6 +42,7 @@ pub struct SharedState {
     events_total: u64,
     activity: VecDeque<ActivityEntry>,
     apps: HashMap<String, AppStat>,
+    incidents: VecDeque<Value>,
     store: Option<StoreClient>,
 }
 
@@ -54,8 +55,20 @@ impl SharedState {
             events_total: 0,
             activity: VecDeque::new(),
             apps: HashMap::new(),
+            incidents: VecDeque::new(),
             store: None,
         }
+    }
+
+    pub fn record_incident(&mut self, incident: Value) {
+        self.incidents.push_back(incident);
+        while self.incidents.len() > 200 {
+            self.incidents.pop_front();
+        }
+    }
+
+    pub fn recent_incidents(&self, limit: usize) -> Vec<Value> {
+        self.incidents.iter().rev().take(limit).cloned().collect()
     }
 
     pub fn set_store(&mut self, store: Option<StoreClient>) {
@@ -248,10 +261,17 @@ fn handle_client(stream: UnixStream, state: &Arc<Mutex<SharedState>>) -> io::Res
             value
         }
         "apps" => state.lock().unwrap().apps_value(),
-        "incidents" => match &store {
-            Some(store) => query(store.incidents(limit)),
-            None => json!({ "incidents": [] }),
-        },
+        "incidents" => {
+            let recent = state.lock().unwrap().recent_incidents(limit);
+            match &store {
+                Some(store) => {
+                    let mut value = query(store.incidents(limit));
+                    value["recent"] = json!(recent);
+                    value
+                }
+                None => json!({ "incidents": recent }),
+            }
+        }
         "file" => {
             let path = request["path"].as_str().unwrap_or_default();
             if path.is_empty() {

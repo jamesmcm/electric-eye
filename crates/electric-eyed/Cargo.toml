@@ -16,6 +16,7 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
+dns-lookup.workspace = true
 aya = "0.14"
 electric-eye-core = { path = "../electric-eye-core" }
 electric-eye-nix = { path = "../electric-eye-nix" }

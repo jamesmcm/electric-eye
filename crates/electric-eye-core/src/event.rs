@@ -85,9 +85,6 @@ pub struct NetEvent {
 
 impl NetEvent {
     pub fn addr_string(&self) -> String {
-        if let Some(hostname) = &self.hostname {
-            return hostname.clone();
-        }
         match self.family {
             AF_INET => format!(
                 "{}.{}.{}.{}",
@@ -98,12 +95,19 @@ impl NetEvent {
         }
     }
 
+    fn with_hostname(&self, endpoint: String) -> String {
+        match &self.hostname {
+            Some(hostname) if !hostname.is_empty() => format!("{endpoint} ({hostname})"),
+            _ => endpoint,
+        }
+    }
+
     pub fn local_endpoint(&self) -> String {
-        format!("{}:{}", self.addr_string(), self.local_port)
+        self.with_hostname(format!("{}:{}", self.addr_string(), self.local_port))
     }
 
     pub fn remote_endpoint(&self) -> String {
-        format!("{}:{}", self.addr_string(), self.remote_port)
+        self.with_hostname(format!("{}:{}", self.addr_string(), self.remote_port))
     }
 
     pub fn endpoint(&self) -> String {
@@ -283,6 +287,9 @@ impl fmt::Display for ObservedEvent {
             ObservedEvent::Connect(event) => format!("{} -> {}", event.comm, event.endpoint()),
             ObservedEvent::Accept(event) => match (event.family, event.fd) {
                 (0, Some(fd)) => format!("{} -> fd {fd}", event.comm),
+                _ if event.local_port == 0 => {
+                    format!("{} -> {}", event.comm, event.remote_endpoint())
+                }
                 _ => format!(
                     "{} -> {} (local :{})",
                     event.comm,

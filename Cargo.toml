@@ -21,6 +21,7 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+dns-lookup = "2"
 
 [profile.release]
 lto = true

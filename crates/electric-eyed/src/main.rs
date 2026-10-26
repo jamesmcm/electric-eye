@@ -1,8 +1,11 @@
 mod api;
 mod collector;
+mod dns;
 mod enrich;
 mod format;
+mod journald;
 mod probe;
+mod rules;
 mod store;
 
 use std::collections::HashMap;
@@ -210,6 +213,8 @@ struct Session {
     fd_paths: HashMap<(u32, u32), String>,
     traffic_window: HashMap<u32, (u64, u64)>,
     write_window: HashMap<(u32, String), WriteStat>,
+    dns: dns::DnsCache,
+    anomalies: rules::AnomalyEngine,
     own_pid: u32,
     store: Option<store::StoreClient>,
     json: bool,
@@ -314,12 +319,58 @@ impl Session {
         if let Some(store) = &self.store {
             store.record(&entry);
         }
+        let incidents = self.anomalies.observe(&entry);
         self.state.lock().unwrap().record(entry);
+        for incident in incidents {
+            self.emit_incident(incident);
+        }
+    }
+
+    fn emit_incident(&mut self, mut incident: rules::Incident) {
+        let journal = journald::nearby(incident.unit.as_deref(), incident.ts_ms, 60, 20);
+        if let Some(details) = incident.details.as_object_mut() {
+            details.insert("journal".into(), serde_json::json!(&journal));
+        }
+        let mut value = serde_json::to_value(&incident).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(object) = value.as_object_mut() {
+            object.insert("event".into(), serde_json::json!("incident"));
+        }
+        if self.json {
+            match serde_json::to_string(&value) {
+                Ok(line) => println!("{line}"),
+                Err(err) => log::warn!("failed to serialize incident: {err}"),
+            }
+        } else {
+            let path = incident
+                .path
+                .as_deref()
+                .map(|path| format!("  {path}"))
+                .unwrap_or_default();
+            println!(
+                "INCIDENT  [{}] {}  ({} pid {}){}",
+                incident.severity.as_str(),
+                incident.title,
+                incident.comm,
+                incident.pid,
+                path
+            );
+        }
+        if let Some(store) = &self.store {
+            store.record_incident(store::IncidentRow {
+                ts_ms: incident.ts_ms as i64,
+                severity: incident.severity.as_str().to_string(),
+                title: incident.title.clone(),
+                details: serde_json::to_string(&incident.details)
+                    .unwrap_or_else(|_| "{}".to_string()),
+            });
+        }
+        journald::send_incident(&incident, &journal);
+        self.state.lock().unwrap().record_incident(value);
     }
 
     fn net_event(&mut self, event: &collector::RawNetEvent) -> NetEvent {
         self.remember_comm(event.pid, &event.comm_str());
-        NetEvent {
+        let mut net = NetEvent {
             pid: event.pid,
             uid: event.uid,
             comm: event.comm_str(),
@@ -329,10 +380,21 @@ impl Session {
             remote_port: event.dport as u16,
             hostname: None,
             fd: None,
+        };
+        self.apply_dns(&mut net);
+        net
+    }
+
+    fn apply_dns(&mut self, net: &mut NetEvent) {
+        if net.family == 0 {
+            return;
+        }
+        if let Some(ip) = dns::ip_from_addr(net.family, net.addr) {
+            net.hostname = self.dns.lookup(ip);
         }
     }
 
-    fn accept_event(&mut self, event: &collector::RawAcceptEvent) -> NetEvent {
+    fn accept_event(&mut self, event: &collector::RawAcceptEvent) -> Option<NetEvent> {
         self.remember_comm(event.pid, &event.comm_str());
         let comm = event.comm_str();
         let endpoint = enrich::accepted_socket(event.pid, event.fd);
@@ -340,7 +402,7 @@ impl Session {
             .or_else(|| endpoint.as_ref().map(|endpoint| endpoint.local_port))
             .unwrap_or(0);
         if event.family != 0 {
-            return NetEvent {
+            let mut net = NetEvent {
                 pid: event.pid,
                 uid: event.uid,
                 comm,
@@ -351,31 +413,23 @@ impl Session {
                 hostname: None,
                 fd: Some(event.fd),
             };
+            self.apply_dns(&mut net);
+            return Some(net);
         }
-        match endpoint {
-            Some(endpoint) => NetEvent {
-                pid: event.pid,
-                uid: event.uid,
-                comm,
-                family: endpoint.family,
-                addr: endpoint.remote_addr,
-                local_port: endpoint.local_port,
-                remote_port: endpoint.remote_port,
-                hostname: None,
-                fd: Some(event.fd),
-            },
-            None => NetEvent {
-                pid: event.pid,
-                uid: event.uid,
-                comm,
-                family: 0,
-                addr: [0; 16],
-                local_port: 0,
-                remote_port: 0,
-                hostname: None,
-                fd: Some(event.fd),
-            },
-        }
+        let endpoint = endpoint?;
+        let mut net = NetEvent {
+            pid: event.pid,
+            uid: event.uid,
+            comm,
+            family: endpoint.family,
+            addr: endpoint.remote_addr,
+            local_port: endpoint.local_port,
+            remote_port: endpoint.remote_port,
+            hostname: None,
+            fd: Some(event.fd),
+        };
+        self.apply_dns(&mut net);
+        Some(net)
     }
 
     fn emit_file(&mut self, event: FileEvent) {
@@ -434,7 +488,14 @@ impl Session {
                 self.emit(ObservedEvent::Connect(net), event.pid, exe);
             }
             RawEvent::Accept(event) => {
-                let net = self.accept_event(&event);
+                let Some(net) = self.accept_event(&event) else {
+                    log::debug!(
+                        "accept for {} fd {} had no usable peer/local endpoint",
+                        event.comm_str(),
+                        event.fd
+                    );
+                    return;
+                };
                 let exe = enrich::resolve_exe(event.pid);
                 self.emit(ObservedEvent::Accept(net), event.pid, exe);
             }
@@ -671,8 +732,9 @@ fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let store = match database_path(options.db.as_deref(), options.no_db) {
-        Some(path) => match store::Store::open(&path) {
+    let database = database_path(options.db.as_deref(), options.no_db);
+    let store = match database.as_deref() {
+        Some(path) => match store::Store::open(path) {
             Ok(store) => {
                 startup_line(options.json, format!("database: {}", path.display()));
                 Some(store)
@@ -693,6 +755,11 @@ fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    journald::startup(
+        &probe::kernel_release(),
+        database.as_deref().and_then(|path| path.to_str()),
+    );
 
     for warning in &report.skipped {
         log::warn!("probe skipped: {warning}");
@@ -721,6 +788,8 @@ fn run() -> ExitCode {
         fd_paths: HashMap::new(),
         traffic_window: HashMap::new(),
         write_window: HashMap::new(),
+        dns: dns::DnsCache::new(),
+        anomalies: rules::AnomalyEngine::new(),
         own_pid: std::process::id(),
         store: store_client,
         json: options.json,
@@ -738,6 +807,7 @@ fn run() -> ExitCode {
                 log::warn!("event drain failed: {err:#}");
                 0
             });
+        session.dns.poll();
         if last_traffic.elapsed() >= TRAFFIC_WINDOW {
             last_traffic = Instant::now();
             session.print_traffic_window(&mut collector);

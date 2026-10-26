@@ -23,6 +23,13 @@ attribution plus a small local query API.
 - JSON Lines output (`--json`) and a read-only Unix socket API
 - SQLite persistence with a background writer, 5-minute raw retention,
   5-minute activity rollups, 30-day activity retention and an incidents table
+- structured journald export for startup/incidents plus bounded nearby-journal
+  context on incidents
+- asynchronous reverse-DNS/hosts enrichment for connect/accept/listen events
+- deterministic rules: sensitive-path writes (SSH, GnuPG, cloud, browser and
+  password-manager stores), persistence paths, `/nix/store` writes,
+  executable-from-suspicious-location, credential sweep, bulk mutation and
+  sensitive-access-then-egress
 - `electric-eye status|activity|apps|app|file|network|why|incidents`
 
 Kernel events are collected with Aya. Tracepoint offsets are discovered from
@@ -98,11 +105,11 @@ The hardening posture is checked with:
 systemd-analyze security electric-eye.service
 ```
 
-`packaging/systemd/electric-eye.service` currently scores **1.5 (OK)** in
-offline analysis on systemd 262 and **3.7 (OK)** when inspected from a running
+`packaging/systemd/electric-eye.service` currently scores **2.5 (OK)** in
+offline analysis on systemd 262 and **4.1 (OK)** when inspected from a running
 Arch LXC container. The remaining exposure is inherent to a kernel observer
 (BPF load, perf events, ptrace read access for `/proc/<pid>/exe`, tracefs read,
-and the local Unix socket).
+outbound DNS for reverse lookups, and the local Unix socket).
 
 ## Layout
 
@@ -136,8 +143,13 @@ file events are captured from those CPUs.
   `sendfile`, `copy_file_range` and mmap-based writes are not yet covered.
   Write syscalls are aggregated into 5-second top-32 summaries; the SQLite
   layer retains per-process/path totals after the 5-minute raw window.
-- No journald export, DNS enrichment, anomaly rules, freeze/enforcement or
-  Quickshell UI yet (Milestones 1–9 in `INITIAL_PLAN.md`).
+- Sensitive-path rules currently see writable opens, actual writes, unlinks
+  and renames, not read-only opens. Read-based credential-access and
+  baseline-style novelty rules need a filtered read-open capture mode.
+- Rules are deterministic and not yet baseline-aware; `nix-daemon` writes to
+  `/nix/store` are exempted, but package activation and legitimate bulk
+  operations can still produce incidents.
+- No Quickshell UI, freeze/enforcement or NixOS packaging yet.
 - Process ancestry for very short-lived processes can fall back to `(exited)`
   when `/proc/<pid>` disappears before enrichment.
 - NixOS packaging and NixOS VM tests are deferred until the Arch release is
