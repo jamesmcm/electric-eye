@@ -57,7 +57,8 @@ electric-eye apps
 ```
 
 Without Nix, install `rustup`, `clang`, `llvm`, `lld`, `bpf-linker` (built with
-LLVM 21) and `just`. See `docs/TOOLCHAIN.md` for the producer/reader LLVM rule.
+LLVM 21), `sqlite` and `just`. See `docs/TOOLCHAIN.md` for the producer/reader
+LLVM rule.
 
 Useful daemon flags:
 
