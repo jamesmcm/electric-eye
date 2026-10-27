@@ -31,9 +31,24 @@ enum StoreMsg {
 #[derive(Debug, Clone)]
 pub struct IncidentRow {
     pub ts_ms: i64,
+    pub id: String,
+    pub json: String,
     pub severity: String,
     pub title: String,
     pub details: String,
+}
+
+impl IncidentRow {
+    pub fn from_incident(incident: &crate::rules::Incident) -> Self {
+        Self {
+            ts_ms: incident.ts_ms as i64,
+            id: incident.id.clone(),
+            json: serde_json::to_string(incident).unwrap_or_default(),
+            severity: incident.severity.as_str().into(),
+            title: incident.title.clone(),
+            details: incident.details.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,9 +179,9 @@ impl StoreClient {
         let conn = self.read_connection()?;
         let mut paths = Vec::new();
         let mut stmt = conn.prepare(
-            "SELECT COALESCE(exe, nix, comm), subject FROM events WHERE kind LIKE 'file.%'
+            "SELECT COALESCE(exe, nix, comm), subject FROM events WHERE kind LIKE 'file.%' AND kind NOT LIKE '%.attempt'
              UNION
-             SELECT COALESCE(exe, nix, app), subject FROM activities WHERE kind LIKE 'file.%'",
+             SELECT COALESCE(exe, nix, app), subject FROM activities WHERE kind LIKE 'file.%' AND kind NOT LIKE '%.attempt'",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -196,7 +211,7 @@ impl StoreClient {
         let conn = self.read_connection()?;
         let limit = limit.clamp(1, MAX_QUERY_LIMIT);
         let mut stmt = conn.prepare(
-            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix
+            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe
              FROM activities ORDER BY bucket_ms DESC, count DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], activity_row)?;
@@ -207,7 +222,7 @@ impl StoreClient {
         let conn = self.read_connection()?;
         let limit = limit.clamp(1, MAX_QUERY_LIMIT);
         let mut stmt = conn.prepare(
-            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix
+            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe
              FROM activities WHERE app = ?1 ORDER BY bucket_ms DESC, count DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![app, limit as i64], activity_row)?;
@@ -215,7 +230,7 @@ impl StoreClient {
 
         let mut stmt = conn.prepare(
             "SELECT ts_ms, kind, comm, subject, path, from_path, to_path,
-                    addr, local_port, remote_port, bytes, count
+                    addr, local_port, remote_port, bytes, count, json
              FROM events WHERE comm = ?1 ORDER BY ts_ms DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![app, limit as i64], raw_row)?;
@@ -234,7 +249,7 @@ impl StoreClient {
         let conn = self.read_connection()?;
         let limit = limit.clamp(1, MAX_QUERY_LIMIT);
         let mut stmt = conn.prepare(
-            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix
+            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe
              FROM activities WHERE kind LIKE 'net.%'
              ORDER BY bucket_ms DESC, bytes DESC LIMIT ?1",
         )?;
@@ -243,7 +258,7 @@ impl StoreClient {
 
         let mut stmt = conn.prepare(
             "SELECT ts_ms, kind, comm, subject, path, from_path, to_path,
-                    addr, local_port, remote_port, bytes, count
+                    addr, local_port, remote_port, bytes, count, json
              FROM events WHERE kind LIKE 'net.%' ORDER BY ts_ms DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], raw_row)?;
@@ -257,15 +272,15 @@ impl StoreClient {
         let conn = self.read_connection()?;
         let limit = limit.clamp(1, MAX_QUERY_LIMIT);
         let mut stmt = conn.prepare(
-            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix
-             FROM activities WHERE subject = ?1 ORDER BY bucket_ms DESC LIMIT ?2",
+            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe
+             FROM activities WHERE (subject = ?1 OR from_path = ?1 OR to_path = ?1) ORDER BY bucket_ms DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![path, limit as i64], activity_row)?;
         let activities = collect(rows)?;
 
         let mut stmt = conn.prepare(
             "SELECT ts_ms, kind, comm, subject, path, from_path, to_path,
-                    addr, local_port, remote_port, bytes, count
+                    addr, local_port, remote_port, bytes, count, json
              FROM events
              WHERE path = ?1 OR from_path = ?1 OR to_path = ?1
              ORDER BY ts_ms DESC LIMIT ?2",
@@ -282,16 +297,17 @@ impl StoreClient {
         let conn = self.read_connection()?;
         let limit = limit.clamp(1, MAX_QUERY_LIMIT);
         let mut stmt = conn.prepare(
-            "SELECT ts_ms, severity, title, details
+            "SELECT ts_ms, severity, title, details, incident_id, json, id
              FROM incidents ORDER BY ts_ms DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
-            let details: String = row.get(3)?;
+            let full:Option<String>=row.get(5)?;
+            if let Some(full)=full && let Ok(value)=serde_json::from_str::<Value>(&full) {return Ok(value);}
+            let details:String=row.get(3)?;
             Ok(json!({
-                "ts_ms": row.get::<_, i64>(0)?,
-                "severity": row.get::<_, String>(1)?,
-                "title": row.get::<_, String>(2)?,
-                "details": serde_json::from_str::<Value>(&details).unwrap_or(Value::String(details)),
+                "id":row.get::<_,Option<String>>(4)?.unwrap_or_else(||format!("legacy-{}",row.get::<_,i64>(6).unwrap_or(0))),
+                "ts_ms":row.get::<_,i64>(0)?,"severity":row.get::<_,String>(1)?,"title":row.get::<_,String>(2)?,
+                "details":serde_json::from_str::<Value>(&details).unwrap_or(Value::String(details)),
             }))
         })?;
         Ok(json!({ "incidents": collect(rows)? }))
@@ -318,11 +334,22 @@ fn activity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "bytes": row.get::<_, i64>(5)?,
         "unit": row.get::<_, Option<String>>(6)?,
         "nix": row.get::<_, Option<String>>(7)?,
+        "from_path": row.get::<_, Option<String>>(8)?,
+        "to_path": row.get::<_, Option<String>>(9)?,
+        "exe": row.get::<_, Option<String>>(10)?,
     }))
 }
 
 fn raw_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let entry: String = row.get(12)?;
+    let entry = serde_json::from_str::<Value>(&entry).unwrap_or(Value::Null);
     Ok(json!({
+        "entry":entry,
+        "process":entry["process"],
+        "exe":entry["exe"],
+        "pid":entry["event"]["pid"],
+        "uid":entry["event"]["uid"],
+        "unit":entry["unit"],
         "ts_ms": row.get::<_, i64>(0)?,
         "kind": row.get::<_, String>(1)?,
         "comm": row.get::<_, String>(2)?,
@@ -430,6 +457,11 @@ impl StoreEvent {
                 row.count = Some(1);
                 row.subject = summary.comm.clone();
             }
+        }
+        if entry.syscall_result.is_some_and(|result| result < 0) {
+            row.kind.push_str(".attempt");
+            row.bytes = None;
+            row.count = None;
         }
         Some(row)
     }
@@ -554,7 +586,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             bytes INTEGER NOT NULL,
             unit TEXT,
             nix TEXT,
-            exe TEXT
+            exe TEXT,
+            from_path TEXT,
+            to_path TEXT
         );
         CREATE INDEX IF NOT EXISTS activities_bucket ON activities(bucket_ms);
         CREATE INDEX IF NOT EXISTS activities_app ON activities(app, bucket_ms);
@@ -565,12 +599,32 @@ fn init_schema(conn: &Connection) -> Result<()> {
             ts_ms INTEGER NOT NULL,
             severity TEXT NOT NULL,
             title TEXT NOT NULL,
-            details TEXT NOT NULL
+            details TEXT NOT NULL,
+            incident_id TEXT,
+            json TEXT
         );
         CREATE INDEX IF NOT EXISTS incidents_ts ON incidents(ts_ms);",
     )?;
     let _ = conn.execute("ALTER TABLE events ADD COLUMN exe TEXT", []);
     let _ = conn.execute("ALTER TABLE activities ADD COLUMN exe TEXT", []);
+    for column in ["from_path", "to_path"] {
+        ensure_column(conn, "activities", column, "TEXT")?;
+    }
+    ensure_column(conn, "incidents", "incident_id", "TEXT")?;
+    ensure_column(conn, "incidents", "json", "TEXT")?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS incidents_identity ON incidents(incident_id);",
+    )?;
+    Ok(())
+}
+fn ensure_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == column) {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"), [])?;
+    }
     Ok(())
 }
 
@@ -676,13 +730,16 @@ fn flush_events(conn: &mut Connection, batch: &mut Vec<StoreEvent>) -> Result<()
 
 fn insert_incident(conn: &Connection, incident: &IncidentRow) -> Result<()> {
     conn.execute(
-        "INSERT INTO incidents (ts_ms, severity, title, details)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO incidents (ts_ms, severity, title, details, incident_id, json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(incident_id) DO UPDATE SET details=excluded.details, json=excluded.json",
         params![
             incident.ts_ms,
             incident.severity,
             incident.title,
-            incident.details
+            incident.details,
+            incident.id,
+            incident.json
         ],
     )?;
     Ok(())
@@ -694,11 +751,11 @@ fn maintain(conn: &mut Connection) -> Result<()> {
     let activity_cutoff = now - ACTIVITY_RETENTION_MS;
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO activities (bucket_ms, kind, app, subject, count, bytes, unit, nix, exe)
+        "INSERT INTO activities (bucket_ms, kind, app, subject, count, bytes, unit, nix, exe, from_path, to_path)
          SELECT (ts_ms / ?1) * ?1, kind, comm, subject, SUM(COALESCE(count, 1)),
-                COALESCE(SUM(bytes), 0), MAX(unit), MAX(nix), exe
+                COALESCE(SUM(bytes), 0), MAX(unit), MAX(nix), exe, from_path, to_path
          FROM events WHERE ts_ms < ?2
-         GROUP BY (ts_ms / ?1) * ?1, kind, comm, subject, exe",
+         GROUP BY (ts_ms / ?1) * ?1, kind, comm, subject, exe, from_path, to_path",
         params![ACTIVITY_BUCKET_MS, raw_cutoff],
     )?;
     tx.execute("DELETE FROM events WHERE ts_ms < ?1", params![raw_cutoff])?;
@@ -728,6 +785,9 @@ mod tests {
     fn entry(_comm: &str, event: ObservedEvent) -> ActivityEntry {
         ActivityEntry {
             ts_ms: now_ms() as u64,
+            syscall_result: None,
+            process: None,
+            path_resolution: None,
             event,
             unit: Some("test.service".into()),
             nix: None,
@@ -833,5 +893,112 @@ mod tests {
         let row = StoreEvent::from_entry(&entry).unwrap();
         assert_eq!(row.kind, "proc.exec");
         assert_eq!(row.subject, "/usr/bin/ls");
+    }
+}
+
+#[cfg(test)]
+mod persistence_regressions {
+    use super::*;
+    use electric_eye_core::{FileEvent, RenameEvent};
+    #[test]
+    fn rename_source_and_destination_survive_compaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("test.db");
+        let store = Store::open(&path).unwrap();
+        let client = store.client();
+        store.shutdown();
+        let mut conn = Connection::open(&path).unwrap();
+        let entry = ActivityEntry {
+            ts_ms: (now_ms() - RAW_RETENTION_MS - 1000) as u64,
+            syscall_result: None,
+            process: None,
+            path_resolution: Some("kernel".into()),
+            event: ObservedEvent::FileRename(RenameEvent {
+                pid: 7,
+                uid: 1000,
+                comm: "test-app".into(),
+                from_path: "/home/review/before".into(),
+                to_path: "/home/review/after".into(),
+            }),
+            unit: None,
+            nix: None,
+            parent: None,
+            exe: Some("/opt/test-app".into()),
+        };
+        flush_events(
+            &mut conn,
+            &mut vec![StoreEvent::from_entry(&entry).unwrap()],
+        )
+        .unwrap();
+        maintain(&mut conn).unwrap();
+        for name in ["before", "after"] {
+            let result = client.why(&format!("/home/review/{name}"), 10).unwrap();
+            assert!(result["events"].as_array().unwrap().is_empty());
+            assert_eq!(result["activities"].as_array().unwrap().len(), 1);
+            assert_eq!(result["activities"][0]["from_path"], "/home/review/before");
+            assert_eq!(result["activities"][0]["exe"], "/opt/test-app");
+        }
+    }
+    #[test]
+    fn complete_incident_survives_restart_and_enrichment_updates_same_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("test.db");
+        let mut engine = crate::rules::AnomalyEngine::new();
+        let entry = ActivityEntry {
+            ts_ms: now_ms() as u64,
+            syscall_result: None,
+            process: Some(crate::api::ProcessIdentity {
+                pid: 7,
+                start_ns: 123,
+                boot_id: "boot".into(),
+            }),
+            path_resolution: Some("kernel".into()),
+            event: ObservedEvent::FileRead(FileEvent {
+                pid: 7,
+                uid: 1000,
+                comm: "test-app".into(),
+                path: "/root/.ssh/key".into(),
+                kind: FileKind::Read,
+                bytes: None,
+                count: None,
+            }),
+            unit: Some("test.service".into()),
+            nix: None,
+            parent: None,
+            exe: Some("/opt/test-app".into()),
+        };
+        let mut incident = engine.observe(&entry).remove(0);
+        let id = incident.id.clone();
+        let store = Store::open(&path).unwrap();
+        let client = store.client();
+        client.record_incident(IncidentRow::from_incident(&incident));
+        incident.details["journal"] = json!(["preceding context"]);
+        client.record_incident(IncidentRow::from_incident(&incident));
+        store.shutdown();
+        let restarted = Store::open(&path).unwrap();
+        let result = restarted.client().incidents(10).unwrap();
+        let incidents = result["incidents"].as_array().unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0]["id"], id);
+        assert_eq!(incidents[0]["pid"], 7);
+        assert_eq!(incidents[0]["comm"], "test-app");
+        assert_eq!(incidents[0]["path"], "/root/.ssh/key");
+        assert_eq!(incidents[0]["exe"], "/opt/test-app");
+        assert_eq!(incidents[0]["process"]["start_ns"], 123);
+        assert_eq!(incidents[0]["details"]["journal"][0], "preceding context");
+        restarted.shutdown();
+    }
+    #[test]
+    fn legacy_incident_schema_migrates_without_losing_existing_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("test.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE incidents(id INTEGER PRIMARY KEY,ts_ms INTEGER NOT NULL,severity TEXT NOT NULL,title TEXT NOT NULL,details TEXT NOT NULL);INSERT INTO incidents VALUES(1,1,'high','legacy','{}');").unwrap();
+        drop(conn);
+        let store = Store::open(&path).unwrap();
+        let result = store.client().incidents(10).unwrap();
+        assert_eq!(result["incidents"][0]["id"], "legacy-1");
+        assert_eq!(result["incidents"][0]["title"], "legacy");
+        store.shutdown();
     }
 }

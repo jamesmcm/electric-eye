@@ -1,4 +1,5 @@
 mod api;
+mod btf;
 mod collector;
 mod dns;
 mod enrich;
@@ -7,6 +8,8 @@ mod journald;
 mod probe;
 mod rules;
 mod store;
+#[path = "../../electric-eye-core/src/wire.rs"]
+mod wire;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,7 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use collector::{Collector, RawEvent};
+use api::{ActivityEntry, ProcessIdentity};
+use collector::Collector;
 use electric_eye_core::{
     ExecEvent, ExitEvent, FileEvent, FileKind, NetEvent, ObservedEvent, RenameEvent, TrafficSummary,
 };
@@ -26,14 +30,17 @@ const INSTALLED_OBJECT: &str = "/usr/lib/electric-eye/electric-eye-ebpf";
 const TRAFFIC_WINDOW: Duration = Duration::from_secs(5);
 const TRAFFIC_TOP: usize = 8;
 const WRITE_TOP: usize = 32;
-const PID_CACHE_LIMIT: usize = 8192;
 const WRITE_WINDOW_LIMIT: usize = 4096;
 
 struct WriteStat {
-    uid: u32,
-    comm: String,
+    entry: ActivityEntry,
     count: u64,
     bytes: u64,
+}
+struct TrafficStat {
+    entry: ActivityEntry,
+    sent: u64,
+    recv: u64,
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -204,507 +211,376 @@ fn startup_line(json: bool, line: impl std::fmt::Display) {
     }
 }
 
+#[derive(Hash, PartialEq, Eq)]
+struct WriteKey {
+    process: ProcessIdentity,
+    exe: Option<String>,
+    path: String,
+    kind: FileKind,
+}
+#[derive(Hash, PartialEq, Eq)]
+struct TrafficKey {
+    process: ProcessIdentity,
+    exe: Option<String>,
+}
 struct Session {
     registry: ProvenanceRegistry,
-    comm_by_pid: HashMap<u32, String>,
-    cwd_by_pid: HashMap<u32, PathBuf>,
-    exe_by_pid: HashMap<u32, String>,
-    ppid_by_pid: HashMap<u32, u32>,
-    start_by_pid: HashMap<u32, u64>,
-    fd_paths: HashMap<(u32, u32), String>,
-    traffic_window: HashMap<u32, (u64, u64)>,
-    write_window: HashMap<(u32, String, FileKind), WriteStat>,
+    write_window: HashMap<WriteKey, WriteStat>,
+    traffic_window: HashMap<TrafficKey, TrafficStat>,
     dns: dns::DnsCache,
     anomalies: rules::AnomalyEngine,
-    own_pid: u32,
     store: Option<store::StoreClient>,
+    incidents: Option<journald::IncidentWorker>,
     json: bool,
     state: Arc<Mutex<api::SharedState>>,
+    boot_id: String,
+    boot_wall_ms: u64,
 }
-
 impl Session {
-    fn remember_comm(&mut self, pid: u32, comm: &str) {
-        if self.comm_by_pid.len() >= PID_CACHE_LIMIT {
-            self.comm_by_pid.clear();
-        }
-        self.comm_by_pid.insert(pid, comm.to_string());
-    }
-
-    fn exe_for(&mut self, pid: u32) -> Option<PathBuf> {
-        if let Some(path) = self.exe_by_pid.get(&pid) {
-            return Some(PathBuf::from(path));
-        }
-        let path = enrich::resolve_exe(pid)?;
-        if self.exe_by_pid.len() >= PID_CACHE_LIMIT {
-            self.exe_by_pid.clear();
-        }
-        self.exe_by_pid.insert(pid, path.display().to_string());
-        Some(path)
-    }
-
-    fn comm_for(&mut self, pid: u32) -> String {
-        if let Some(comm) = self.comm_by_pid.get(&pid) {
-            return comm.clone();
-        }
-        match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-            Ok(comm) => {
-                let comm = comm.trim().to_string();
-                self.remember_comm(pid, &comm);
-                comm
-            }
-            Err(_) => format!("pid {pid}"),
-        }
-    }
-
-    fn parent_for(&mut self, pid: u32) -> Option<String> {
-        let ppid = match self.ppid_by_pid.get(&pid) {
-            Some(ppid) => *ppid,
-            None => {
-                let stat = enrich::process_stat(pid)?;
-                self.ppid_by_pid.insert(pid, stat.ppid);
-                stat.ppid
-            }
+    fn entry(&mut self, raw: &wire::Record, event: ObservedEvent) -> ActivityEntry {
+        let exe = collector::cstr(&raw.exe);
+        let exe = (!exe.is_empty()).then_some(exe);
+        // /proc enrichment is optional and is used only if its generation
+        // matches the identity captured in the kernel. Executable identity
+        // itself always comes from the event, including short-lived tasks.
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        let same_process = enrich::process_stat(raw.pid)
+            .is_some_and(|s| s.start_ticks == raw.start_ns / (1_000_000_000 / ticks));
+        let unit = if same_process {
+            enrich::systemd_unit(raw.pid)
+        } else {
+            None
         };
-        if ppid == 0 || ppid == pid {
-            return None;
-        }
-        Some(self.comm_for(ppid))
-    }
-
-    fn resolve_path(&mut self, pid: u32, path: &str) -> String {
-        if path.starts_with('/') || path.is_empty() {
-            return path.to_string();
-        }
-        let cwd = match self.cwd_by_pid.get(&pid) {
-            Some(cwd) => cwd.clone(),
-            None => {
-                let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
-                    return path.to_string();
-                };
-                self.cwd_by_pid.insert(pid, cwd.clone());
-                cwd
-            }
-        };
-        cwd.join(path).display().to_string()
-    }
-
-    fn context_for(
-        &mut self,
-        pid: u32,
-        exe: Option<PathBuf>,
-    ) -> (Option<String>, Option<String>, Option<String>) {
-        let unit = enrich::systemd_unit(pid);
         let nix = exe
             .as_deref()
-            .and_then(|exe| self.registry.identify(exe).ok().flatten())
-            .map(|provenance| provenance.to_string());
-        let parent = self.parent_for(pid);
-        (unit, nix, parent)
-    }
-
-    fn emit(&mut self, observed: ObservedEvent, pid: u32, exe: Option<PathBuf>) {
-        let exe_string = exe.as_ref().map(|path| path.display().to_string());
-        let (unit, nix, parent) = self.context_for(pid, exe);
-        let entry = api::ActivityEntry {
-            ts_ms: api::now_ms(),
-            event: observed.clone(),
+            .and_then(|path| self.registry.identify(Path::new(path)).ok().flatten())
+            .map(|p| p.to_string());
+        ActivityEntry {
+            ts_ms: self.boot_wall_ms.saturating_add(raw.ts_ns / 1_000_000),
+            syscall_result: matches!(
+                raw.kind,
+                wire::OPEN | wire::READ | wire::WRITE | wire::MMAP | wire::UNLINK | wire::RENAME
+            )
+            .then_some(raw.result),
+            process: Some(ProcessIdentity {
+                pid: raw.pid,
+                start_ns: raw.start_ns,
+                boot_id: self.boot_id.clone(),
+            }),
+            path_resolution: matches!(
+                raw.kind,
+                wire::OPEN | wire::READ | wire::WRITE | wire::MMAP | wire::UNLINK | wire::RENAME
+            )
+            .then(|| {
+                match (
+                    raw.path_resolution,
+                    raw.kind == wire::RENAME && raw.path2_resolution != wire::PATH_KERNEL,
+                ) {
+                    (wire::PATH_KERNEL, false) => "kernel",
+                    (wire::PATH_UNRESOLVED, _) => "unresolved",
+                    _ if raw.kind == wire::RENAME
+                        && raw.path2_resolution == wire::PATH_UNRESOLVED =>
+                    {
+                        "unresolved"
+                    }
+                    _ => "lexical",
+                }
+                .into()
+            }),
+            event,
             unit,
             nix,
-            parent,
-            exe: exe_string,
-        };
-        if self.json {
-            match serde_json::to_string(&entry) {
-                Ok(line) => println!("{line}"),
-                Err(err) => log::warn!("failed to serialize event: {err}"),
+            parent: {
+                let name = collector::cstr(&raw.parent_comm);
+                (!name.is_empty()).then_some(name)
+            },
+            exe,
+        }
+    }
+    fn analyze(&mut self, entry: &ActivityEntry) {
+        for incident in self.anomalies.observe(entry) {
+            self.emit_incident(incident);
+        }
+    }
+    fn emit(&mut self, entry: ActivityEntry, display: bool, analyze: bool) {
+        if display {
+            if self.json {
+                if let Ok(line) = serde_json::to_string(&entry) {
+                    println!("{line}");
+                }
+            } else {
+                let mut suffix = String::new();
+                if let Some(unit) = &entry.unit {
+                    suffix.push_str(&format!("  [{unit}]"));
+                }
+                if let Some(nix) = &entry.nix {
+                    suffix.push_str(&format!("  (nix: {nix})"));
+                }
+                if entry.path_resolution.as_deref() == Some("unresolved") {
+                    suffix.push_str("  [path unresolved]");
+                }
+                if let Some(result) = entry.syscall_result
+                    && result < 0
+                {
+                    suffix.push_str(&format!("  [failed errno={}]", -result));
+                }
+                println!("{}{suffix}", entry.event);
             }
-        } else {
-            let mut suffix = String::new();
-            if let Some(unit) = &entry.unit {
-                suffix.push_str(&format!("  [{unit}]"));
-            }
-            if let Some(nix) = &entry.nix {
-                suffix.push_str(&format!("  (nix: {nix})"));
-            }
-            if let Some(parent) = &entry.parent {
-                suffix.push_str(&format!("  parent={parent}"));
-            }
-            println!("{observed}{suffix}");
         }
         if let Some(store) = &self.store {
             store.record(&entry);
         }
-        let incidents = self.anomalies.observe(&entry);
+        if analyze {
+            self.analyze(&entry);
+        }
         self.state.lock().unwrap().record(entry);
-        for incident in incidents {
-            self.emit_incident(incident);
-        }
     }
-
-    fn emit_incident(&mut self, mut incident: rules::Incident) {
-        let journal = journald::nearby(incident.unit.as_deref(), incident.ts_ms, 60, 20);
-        if let Some(details) = incident.details.as_object_mut() {
-            details.insert("journal".into(), serde_json::json!(&journal));
+    fn emit_incident(&mut self, incident: rules::Incident) {
+        // Persist the complete base record before optional, asynchronous context.
+        if let Some(store) = &self.store {
+            store.record_incident(store::IncidentRow::from_incident(&incident));
         }
-        let mut value = serde_json::to_value(&incident).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(object) = value.as_object_mut() {
-            object.insert("event".into(), serde_json::json!("incident"));
-        }
+        let mut value = serde_json::to_value(&incident).unwrap_or_default();
+        value["event"] = serde_json::json!("incident");
         if self.json {
-            match serde_json::to_string(&value) {
-                Ok(line) => println!("{line}"),
-                Err(err) => log::warn!("failed to serialize incident: {err}"),
-            }
+            println!("{value}");
         } else {
-            let path = incident
-                .path
-                .as_deref()
-                .map(|path| format!("  {path}"))
-                .unwrap_or_default();
             println!(
-                "INCIDENT  [{}] {}  ({} pid {}){}",
+                "INCIDENT  [{}] {}  ({} pid {}) {}",
                 incident.severity.as_str(),
                 incident.title,
                 incident.comm,
                 incident.pid,
-                path
+                incident.path.as_deref().unwrap_or_default()
             );
         }
-        if let Some(store) = &self.store {
-            store.record_incident(store::IncidentRow {
-                ts_ms: incident.ts_ms as i64,
-                severity: incident.severity.as_str().to_string(),
-                title: incident.title.clone(),
-                details: serde_json::to_string(&incident.details)
-                    .unwrap_or_else(|_| "{}".to_string()),
-            });
-        }
-        journald::send_incident(&incident, &journal);
         self.state.lock().unwrap().record_incident(value);
+        if let Some(worker) = &self.incidents {
+            worker.enqueue(incident);
+        }
     }
-
-    fn net_event(&mut self, event: &collector::RawNetEvent) -> NetEvent {
-        self.remember_comm(event.pid, &event.comm_str());
-        let mut net = NetEvent {
-            pid: event.pid,
-            uid: event.uid,
-            comm: event.comm_str(),
-            family: event.family,
-            addr: event.addr,
-            local_port: event.sport as u16,
-            remote_port: event.dport as u16,
-            hostname: None,
-            fd: None,
+    fn handle(&mut self, raw: wire::Record) {
+        let comm = collector::cstr(&raw.comm);
+        let file_kind = match raw.kind {
+            wire::READ => FileKind::Read,
+            wire::WRITE => FileKind::Write,
+            wire::MMAP => FileKind::Mmap,
+            wire::UNLINK => FileKind::Unlink,
+            _ => classify_open(raw.flags),
         };
-        self.apply_dns(&mut net);
-        net
-    }
-
-    fn apply_dns(&mut self, net: &mut NetEvent) {
-        if net.family == 0 {
-            return;
-        }
-        if let Some(ip) = dns::ip_from_addr(net.family, net.addr) {
-            net.hostname = self.dns.lookup(ip);
-        }
-    }
-
-    fn accept_event(&mut self, event: &collector::RawAcceptEvent) -> Option<NetEvent> {
-        self.remember_comm(event.pid, &event.comm_str());
-        let comm = event.comm_str();
-        let endpoint = enrich::accepted_socket(event.pid, event.fd);
-        let local_port = enrich::listener_port(event.pid, event.listen_fd)
-            .or_else(|| endpoint.as_ref().map(|endpoint| endpoint.local_port))
-            .unwrap_or(0);
-        if event.family != 0 {
-            let mut net = NetEvent {
-                pid: event.pid,
-                uid: event.uid,
+        let event = match raw.kind {
+            wire::EXEC => ObservedEvent::Exec(ExecEvent {
+                pid: raw.pid,
+                ppid: raw.ppid,
+                uid: raw.uid,
                 comm,
-                family: event.family,
-                addr: event.addr,
-                local_port,
-                remote_port: event.port as u16,
-                hostname: None,
-                fd: Some(event.fd),
-            };
-            self.apply_dns(&mut net);
-            return Some(net);
-        }
-        let endpoint = endpoint?;
-        let mut net = NetEvent {
-            pid: event.pid,
-            uid: event.uid,
-            comm,
-            family: endpoint.family,
-            addr: endpoint.remote_addr,
-            local_port: endpoint.local_port,
-            remote_port: endpoint.remote_port,
-            hostname: None,
-            fd: Some(event.fd),
-        };
-        self.apply_dns(&mut net);
-        Some(net)
-    }
-
-    fn emit_file(&mut self, event: FileEvent) {
-        let pid = event.pid;
-        let exe = self.exe_for(pid);
-        let observed = match event.kind {
-            FileKind::Read => ObservedEvent::FileRead(event),
-            FileKind::Unlink => ObservedEvent::FileUnlink(event),
-            FileKind::Write | FileKind::Mmap => ObservedEvent::FileWrite(event),
-            FileKind::Open | FileKind::Create | FileKind::Truncate => {
-                ObservedEvent::FileOpen(event)
-            }
-        };
-        self.emit(observed, pid, exe);
-    }
-
-    fn handle(&mut self, event: RawEvent) {
-        match event {
-            RawEvent::Exec(event) => {
-                self.remember_comm(event.pid, &event.comm_str());
-                let exe = enrich::resolve_exe(event.pid)
-                    .or_else(|| enrich::argv0(event.pid).map(PathBuf::from))
-                    .unwrap_or_else(|| "(exited)".into());
-                let stat = enrich::process_stat(event.pid);
-                let ppid = stat.map(|s| s.ppid).unwrap_or(event.ppid);
-                let start_ticks = stat.map(|s| s.start_ticks).unwrap_or(0);
-                self.ppid_by_pid.insert(event.pid, ppid);
-                self.start_by_pid.insert(event.pid, start_ticks);
-                if exe.as_path() != Path::new("(exited)") {
-                    self.exe_by_pid.insert(event.pid, exe.display().to_string());
+                exe: PathBuf::from(collector::cstr(&raw.exe)),
+                start_ticks: raw.start_ns
+                    / (1_000_000_000 / (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64)),
+            }),
+            wire::EXIT => ObservedEvent::Exit(ExitEvent {
+                pid: raw.pid,
+                uid: raw.uid,
+                comm,
+            }),
+            wire::OPEN | wire::READ | wire::WRITE | wire::MMAP | wire::UNLINK => {
+                let mut path = collector::cstr(&raw.path);
+                if path.is_empty() {
+                    path = format!("unresolved:pid={}:fd={}", raw.pid, raw.fd);
                 }
-                let observed = ObservedEvent::Exec(ExecEvent {
-                    pid: event.pid,
-                    ppid,
-                    uid: event.uid,
-                    comm: event.comm_str(),
-                    exe: exe.clone(),
-                    start_ticks,
-                });
-                self.emit(observed, event.pid, Some(exe));
-            }
-            RawEvent::Exit(event) => {
-                self.remember_comm(event.pid, &event.comm_str());
-                let exe = self.exe_for(event.pid);
-                let observed = ObservedEvent::Exit(ExitEvent {
-                    pid: event.pid,
-                    uid: event.uid,
-                    comm: event.comm_str(),
-                });
-                self.emit(observed, event.pid, exe);
-                self.comm_by_pid.remove(&event.pid);
-                self.cwd_by_pid.remove(&event.pid);
-                self.exe_by_pid.remove(&event.pid);
-                self.ppid_by_pid.remove(&event.pid);
-                self.start_by_pid.remove(&event.pid);
-                self.fd_paths.retain(|(pid, _), _| *pid != event.pid);
-            }
-            RawEvent::Connect(event) => {
-                let net = self.net_event(&event);
-                let exe = self.exe_for(event.pid);
-                self.emit(ObservedEvent::Connect(net), event.pid, exe);
-            }
-            RawEvent::Accept(event) => {
-                let Some(net) = self.accept_event(&event) else {
-                    log::debug!(
-                        "accept for {} fd {} had no usable peer/local endpoint",
-                        event.comm_str(),
-                        event.fd
-                    );
-                    return;
-                };
-                let exe = self.exe_for(event.pid);
-                self.emit(ObservedEvent::Accept(net), event.pid, exe);
-            }
-            RawEvent::FdDup(event) => {
-                self.remember_comm(event.pid, &event.comm_str());
-                if let Some(path) = self.fd_paths.get(&(event.pid, event.oldfd)).cloned() {
-                    self.fd_paths.insert((event.pid, event.newfd), path);
+                if raw.path_resolution == wire::PATH_KERNEL {
+                    path = normalize_path(&path);
                 }
-            }
-            RawEvent::FdClose(event) => {
-                self.remember_comm(event.pid, &event.comm_str());
-                self.fd_paths.remove(&(event.pid, event.oldfd));
-            }
-            RawEvent::Listen(event) => {
-                let net = self.net_event(&event);
-                let exe = self.exe_for(event.pid);
-                self.emit(ObservedEvent::Listen(net), event.pid, exe);
-            }
-            RawEvent::FileRead(event) => {
-                self.remember_comm(event.pid, &event.comm_str());
-                let path = self.resolve_path(event.pid, &event.path_str());
                 if is_noise_path(&path) {
                     return;
                 }
-                self.emit_file(FileEvent {
-                    pid: event.pid,
-                    uid: event.uid,
-                    comm: event.comm_str(),
+                let file = FileEvent {
+                    pid: raw.pid,
+                    uid: raw.uid,
+                    comm,
                     path,
-                    kind: FileKind::Read,
-                    bytes: None,
-                    count: None,
-                });
-            }
-            RawEvent::FileOpen(event) => {
-                self.remember_comm(event.pid, &event.comm_str());
-                let path = self.resolve_path(event.pid, &event.path_str());
-                if is_noise_path(&path) {
-                    return;
-                }
-                if self.fd_paths.len() >= PID_CACHE_LIMIT {
-                    self.fd_paths.clear();
-                }
-                self.fd_paths.insert((event.pid, event.fd), path.clone());
-                self.emit_file(FileEvent {
-                    pid: event.pid,
-                    uid: event.uid,
-                    comm: event.comm_str(),
-                    path,
-                    kind: classify_open(event.flags),
-                    bytes: None,
-                    count: None,
-                });
-            }
-            RawEvent::FileWrite(event) => {
-                if event.pid == self.own_pid {
-                    return;
-                }
-                self.remember_comm(event.pid, &event.comm_str());
-                let path = self
-                    .fd_paths
-                    .get(&(event.pid, event.fd))
-                    .cloned()
-                    .or_else(|| {
-                        enrich::resolve_fd_path(event.pid, event.fd)
-                            .map(|p| p.display().to_string())
-                    });
-                let Some(path) = path else {
-                    return;
+                    kind: file_kind,
+                    bytes: (raw.result >= 0 && matches!(raw.kind, wire::WRITE | wire::MMAP))
+                        .then_some(raw.count),
+                    count: (raw.result >= 0 && matches!(raw.kind, wire::WRITE | wire::MMAP))
+                        .then_some(1),
                 };
-                if is_noise_path(&path) {
-                    return;
+                match raw.kind {
+                    wire::READ => ObservedEvent::FileRead(file),
+                    wire::WRITE | wire::MMAP => ObservedEvent::FileWrite(file),
+                    wire::UNLINK => ObservedEvent::FileUnlink(file),
+                    _ => ObservedEvent::FileOpen(file),
                 }
-                let kind = if event.kind == collector::KIND_FILE_MMAP {
-                    FileKind::Mmap
+            }
+            wire::RENAME => ObservedEvent::FileRename(RenameEvent {
+                pid: raw.pid,
+                uid: raw.uid,
+                comm,
+                from_path: resolved_name(&raw.path, raw.path_resolution),
+                to_path: resolved_name(&raw.path2, raw.path2_resolution),
+            }),
+            wire::CONNECT | wire::LISTEN | wire::ACCEPT => {
+                let mut net = NetEvent {
+                    pid: raw.pid,
+                    uid: raw.uid,
+                    comm,
+                    family: raw.family,
+                    addr: raw.addr,
+                    local_port: raw.local_port as u16,
+                    remote_port: raw.remote_port as u16,
+                    hostname: None,
+                    fd: (raw.kind == wire::ACCEPT).then_some(raw.fd),
+                };
+                if raw.kind == wire::ACCEPT {
+                    let endpoint = if raw.family == 0 || raw.local_port == 0 {
+                        enrich::accepted_socket(raw.pid, raw.fd)
+                    } else {
+                        None
+                    };
+                    if net.local_port == 0 {
+                        net.local_port = enrich::listener_port(raw.pid, raw.flags)
+                            .or_else(|| endpoint.as_ref().map(|e| e.local_port))
+                            .unwrap_or(0);
+                    }
+                    if net.family == 0 {
+                        if let Some(e) = endpoint {
+                            net.family = e.family;
+                            net.addr = e.remote_addr;
+                            net.remote_port = e.remote_port;
+                        } else {
+                            return;
+                        }
+                    }
+                }
+                if let Some(ip) = dns::ip_from_addr(net.family, net.addr) {
+                    net.hostname = self.dns.lookup(ip);
+                }
+                match raw.kind {
+                    wire::CONNECT => ObservedEvent::Connect(net),
+                    wire::LISTEN => ObservedEvent::Listen(net),
+                    _ => ObservedEvent::Accept(net),
+                }
+            }
+            wire::SENT | wire::RECEIVED => ObservedEvent::Traffic(TrafficSummary {
+                pid: raw.pid,
+                comm,
+                sent: if raw.kind == wire::SENT { raw.count } else { 0 },
+                recv: if raw.kind == wire::RECEIVED {
+                    raw.count
                 } else {
-                    FileKind::Write
-                };
-                if self.write_window.len() >= WRITE_WINDOW_LIMIT
-                    && !self
-                        .write_window
-                        .contains_key(&(event.pid, path.clone(), kind))
-                {
-                    return;
-                }
-                let stat = self
-                    .write_window
-                    .entry((event.pid, path, kind))
-                    .or_insert_with(|| WriteStat {
-                        uid: event.uid,
-                        comm: event.comm_str(),
-                        count: 0,
-                        bytes: 0,
-                    });
-                stat.count += 1;
-                stat.bytes += event.count;
-            }
-            RawEvent::FileUnlink(event) => {
-                self.remember_comm(event.pid, &event.comm_str());
-                let path = self.resolve_path(event.pid, &event.path_str());
-                if !is_noise_path(&path) {
-                    self.emit_file(FileEvent {
-                        pid: event.pid,
-                        uid: event.uid,
-                        comm: event.comm_str(),
-                        path,
-                        kind: FileKind::Unlink,
-                        bytes: None,
-                        count: None,
-                    });
-                }
-            }
-            RawEvent::FileRename(event) => {
-                self.remember_comm(event.pid, &event.comm_str());
-                let exe = self.exe_for(event.pid);
-                let observed = ObservedEvent::FileRename(RenameEvent {
-                    pid: event.pid,
-                    uid: event.uid,
-                    comm: event.comm_str(),
-                    from_path: self.resolve_path(event.pid, &event.old_path_str()),
-                    to_path: self.resolve_path(event.pid, &event.new_path_str()),
-                });
-                self.emit(observed, event.pid, exe);
-            }
-        }
-    }
-
-    fn flush_write_window(&mut self) {
-        if self.write_window.is_empty() {
-            return;
-        }
-        let mut writes: Vec<((u32, String, FileKind), WriteStat)> =
-            self.write_window.drain().collect();
-        writes.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.bytes));
-        let total = writes.len();
-        for ((pid, path, kind), stat) in writes.into_iter().take(WRITE_TOP) {
-            self.emit_file(FileEvent {
-                pid,
-                uid: stat.uid,
-                comm: stat.comm,
-                path,
-                kind,
-                bytes: Some(stat.bytes),
-                count: Some(stat.count),
-            });
-        }
-        if total > WRITE_TOP {
-            log::debug!("write window contained {total} paths; reported top {WRITE_TOP}");
-        }
-    }
-
-    fn print_traffic_window(&mut self, collector: &mut Collector) {
-        let Ok(totals) = collector.drain_net_totals() else {
-            return;
+                    0
+                },
+            }),
+            _ => return,
         };
-        for (pid, sent, recv) in totals {
-            let entry = self.traffic_window.entry(pid).or_insert((0, 0));
-            entry.0 += sent;
-            entry.1 += recv;
-        }
-
-        let raw: Vec<(u32, u64, u64)> = self
-            .traffic_window
-            .iter()
-            .map(|(pid, (sent, recv))| (*pid, *sent, *recv))
-            .collect();
-        self.traffic_window.clear();
-
-        let mut summaries: Vec<TrafficSummary> = raw
-            .into_iter()
-            .map(|(pid, sent, recv)| TrafficSummary {
-                pid,
-                comm: self.comm_for(pid),
-                sent,
-                recv,
-            })
-            .filter(|summary| summary.total() > 0)
-            .collect();
-
-        if summaries.is_empty() {
+        let entry = self.entry(&raw, event);
+        if raw.result < 0 {
+            self.emit(entry, true, false);
             return;
         }
-        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.total()));
-        for summary in summaries.into_iter().take(TRAFFIC_TOP) {
-            let pid = summary.pid;
-            let exe = self.exe_for(pid);
-            self.emit(ObservedEvent::Traffic(summary), pid, exe);
+        if matches!(raw.kind, wire::WRITE | wire::MMAP) {
+            // Detection uses the original event time, before display aggregation.
+            self.analyze(&entry);
+            if self.write_window.len() >= WRITE_WINDOW_LIMIT {
+                self.flush_write_window();
+            }
+            let ObservedEvent::FileWrite(file) = &entry.event else {
+                unreachable!()
+            };
+            let key = WriteKey {
+                process: entry.process.clone().unwrap(),
+                exe: entry.exe.clone(),
+                path: file.path.clone(),
+                kind: file.kind,
+            };
+            let stat = self.write_window.entry(key).or_insert_with(|| WriteStat {
+                entry,
+                count: 0,
+                bytes: 0,
+            });
+            stat.count += 1;
+            stat.bytes = stat.bytes.saturating_add(raw.count);
+        } else if matches!(raw.kind, wire::SENT | wire::RECEIVED) {
+            if self.traffic_window.len() >= WRITE_WINDOW_LIMIT {
+                self.flush_traffic_window();
+            }
+            let key = TrafficKey {
+                process: entry.process.clone().unwrap(),
+                exe: entry.exe.clone(),
+            };
+            let stat = self
+                .traffic_window
+                .entry(key)
+                .or_insert_with(|| TrafficStat {
+                    entry,
+                    sent: 0,
+                    recv: 0,
+                });
+            if raw.kind == wire::SENT {
+                stat.sent = stat.sent.saturating_add(raw.count);
+            } else {
+                stat.recv = stat.recv.saturating_add(raw.count);
+            }
+        } else {
+            self.emit(entry, true, true);
         }
     }
+    fn flush_write_window(&mut self) {
+        let mut writes: Vec<_> = self.write_window.drain().map(|(_, v)| v).collect();
+        writes.sort_by_key(|s| std::cmp::Reverse(s.bytes));
+        for (rank, mut stat) in writes.into_iter().enumerate() {
+            if let ObservedEvent::FileWrite(file) = &mut stat.entry.event {
+                file.bytes = Some(stat.bytes);
+                file.count = Some(stat.count);
+            }
+            self.emit(stat.entry, rank < WRITE_TOP, false);
+        }
+    }
+    fn flush_traffic_window(&mut self) {
+        let mut totals: Vec<_> = self.traffic_window.drain().map(|(_, v)| v).collect();
+        totals.sort_by_key(|s| std::cmp::Reverse(s.sent.saturating_add(s.recv)));
+        for (rank, mut stat) in totals.into_iter().enumerate() {
+            if let ObservedEvent::Traffic(summary) = &mut stat.entry.event {
+                summary.sent = stat.sent;
+                summary.recv = stat.recv;
+            }
+            self.emit(stat.entry, rank < TRAFFIC_TOP, false);
+        }
+    }
+}
+fn resolved_name(bytes: &[u8], resolution: u32) -> String {
+    let name = collector::cstr(bytes);
+    if resolution == wire::PATH_KERNEL {
+        normalize_path(&name)
+    } else {
+        name
+    }
+}
+fn normalize_path(path: &str) -> String {
+    if !path.starts_with('/') {
+        return path.into();
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+fn boot_wall_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts);
+    }
+    api::now_ms().saturating_sub(ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000)
 }
 
 fn run() -> ExitCode {
@@ -835,22 +711,39 @@ fn run() -> ExitCode {
         .unwrap_or_default();
     let allowlist = rules::Allowlist::load_default();
 
+    let api_server = match socket {
+        Some(socket) => match api::ApiServer::start(socket, Arc::clone(&state)) {
+            Ok(server) => Some(server),
+            Err(err) => {
+                eprintln!("error starting API: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let incident_worker =
+        match journald::IncidentWorker::start(Arc::clone(&state), store_client.clone()) {
+            Ok(worker) => Some(worker),
+            Err(err) => {
+                eprintln!("error starting incident worker: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
     let mut session = Session {
         registry: ProvenanceRegistry::new(),
-        comm_by_pid: HashMap::new(),
-        cwd_by_pid: HashMap::new(),
-        exe_by_pid: HashMap::new(),
-        ppid_by_pid: HashMap::new(),
-        start_by_pid: HashMap::new(),
-        fd_paths: HashMap::new(),
-        traffic_window: HashMap::new(),
         write_window: HashMap::new(),
+        traffic_window: HashMap::new(),
         dns: dns::DnsCache::new(),
         anomalies: rules::AnomalyEngine::with_context(baseline, allowlist),
-        own_pid: std::process::id(),
         store: store_client,
+        incidents: incident_worker,
         json: options.json,
         state: Arc::clone(&state),
+        boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap_or_default()
+            .trim()
+            .into(),
+        boot_wall_ms: boot_wall_ms(),
     };
     let mut last_traffic = Instant::now();
 
@@ -867,17 +760,21 @@ fn run() -> ExitCode {
         session.dns.poll();
         if last_traffic.elapsed() >= TRAFFIC_WINDOW {
             last_traffic = Instant::now();
-            session.print_traffic_window(&mut collector);
+            session.flush_traffic_window();
+            state
+                .lock()
+                .unwrap()
+                .set_capture_loss(collector.loss_counts());
             session.flush_write_window();
-        }
-        if let Some(socket) = &socket {
-            api::serve_pending(socket, &state);
         }
         if drained == 0 {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
     session.flush_write_window();
+    session.flush_traffic_window();
+    drop(api_server);
+    session.incidents.take();
     if let Some(store) = store {
         store.shutdown();
     }
@@ -942,6 +839,190 @@ mod tests {
         assert_eq!(
             socket_path(parsed.socket.as_deref()),
             PathBuf::from("/tmp/explicit.sock")
+        );
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    fn session(store: Option<store::StoreClient>) -> Session {
+        Session {
+            registry: ProvenanceRegistry::new(),
+            write_window: HashMap::new(),
+            traffic_window: HashMap::new(),
+            dns: dns::DnsCache::new(),
+            anomalies: rules::AnomalyEngine::new(),
+            store,
+            incidents: None,
+            json: true,
+            state: Arc::new(Mutex::new(api::SharedState::new())),
+            boot_id: "test-boot".into(),
+            boot_wall_ms: 1_000_000,
+        }
+    }
+    fn record(kind: u32, pid: u32, start: u64, path: &str) -> wire::Record {
+        let mut r = wire::Record::ZERO;
+        r.kind = kind;
+        r.pid = pid;
+        r.uid = 1000;
+        r.start_ns = start;
+        r.ts_ns = 1_000_000_000;
+        r.count = 1;
+        r.path_resolution = wire::PATH_KERNEL;
+        r.comm[..8].copy_from_slice(b"test-app");
+        r.exe[..13].copy_from_slice(b"/opt/test-app");
+        r.path[..path.len()].copy_from_slice(path.as_bytes());
+        r
+    }
+    #[test]
+    fn all_writes_reach_history_and_sqlite_beyond_display_top() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store::Store::open(&temp.path().join("test.db")).unwrap();
+        let client = store.client();
+        let mut s = session(Some(client.clone()));
+        for i in 0..40 {
+            s.handle(record(
+                wire::WRITE,
+                4_000_000_000,
+                1,
+                &format!("/home/review/Documents/file-{i}"),
+            ));
+        }
+        s.flush_write_window();
+        assert_eq!(
+            s.state.lock().unwrap().activity_value(100)["activity"]
+                .as_array()
+                .unwrap()
+                .len(),
+            40
+        );
+        store.shutdown();
+        for i in 0..40 {
+            assert_eq!(
+                client
+                    .why(&format!("/home/review/Documents/file-{i}"), 10)
+                    .unwrap()["events"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn all_traffic_reaches_history_and_deltas_add() {
+        let mut s = session(None);
+        for pid in 4_000_000_000..4_000_000_020 {
+            for _ in 0..3 {
+                s.handle(record(wire::SENT, pid, 1, ""));
+            }
+        }
+        s.flush_traffic_window();
+        let v = s.state.lock().unwrap().activity_value(100);
+        assert_eq!(v["activity"].as_array().unwrap().len(), 20);
+        assert!(
+            v["activity"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["event"]["sent"] == 3)
+        );
+    }
+    #[test]
+    fn exit_and_pid_reuse_do_not_change_pending_write_actor() {
+        let mut s = session(None);
+        let old = record(wire::WRITE, 4_000_000_000, 1, "/home/review/file");
+        s.handle(old);
+        s.handle(record(wire::EXIT, old.pid, 1, ""));
+        let mut new = record(wire::WRITE, old.pid, 2, "/home/review/file");
+        new.exe.fill(0);
+        new.exe[..12].copy_from_slice(b"/opt/new-app");
+        s.handle(new);
+        s.flush_write_window();
+        let v = s.state.lock().unwrap().activity_value(10);
+        let writes: Vec<_> = v["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event"]["event"] == "file_write")
+            .collect();
+        assert_eq!(writes.len(), 2);
+        assert!(
+            writes
+                .iter()
+                .any(|e| e["process"]["start_ns"] == 1 && e["exe"] == "/opt/test-app")
+        );
+        assert!(
+            writes
+                .iter()
+                .any(|e| e["process"]["start_ns"] == 2 && e["exe"] == "/opt/new-app")
+        );
+    }
+    #[test]
+    fn same_process_exec_generations_do_not_merge_writes() {
+        let mut s = session(None);
+        let old = record(wire::WRITE, 4_000_000_000, 1, "/home/review/file");
+        s.handle(old);
+        let mut new = old;
+        new.exe[5] = b'n';
+        s.handle(new);
+        s.flush_write_window();
+        assert_eq!(
+            s.state.lock().unwrap().activity_value(10)["activity"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+    #[test]
+    fn unresolved_path_is_visible_without_becoming_a_sensitive_incident() {
+        let mut s = session(None);
+        let mut r = record(wire::WRITE, 4_000_000_000, 1, "/root/.ssh/key");
+        r.path_resolution = wire::PATH_UNRESOLVED;
+        s.handle(r);
+        s.flush_write_window();
+        let state = s.state.lock().unwrap();
+        assert!(state.recent_incidents(10).is_empty());
+        assert_eq!(
+            state.activity_value(10)["activity"][0]["path_resolution"],
+            "unresolved"
+        );
+    }
+    #[test]
+    fn lexical_paths_do_not_assume_symlink_parent_components() {
+        let mut s = session(None);
+        let mut r = record(wire::WRITE, 4_000_000_000, 1, "/home/review/link/../secret");
+        r.path_resolution = wire::PATH_LEXICAL;
+        s.handle(r);
+        s.flush_write_window();
+        assert_eq!(
+            s.state.lock().unwrap().activity_value(10)["activity"][0]["event"]["path"],
+            "/home/review/link/../secret"
+        );
+    }
+    #[test]
+    fn failed_writes_remain_attempts_without_bytes_or_baseline_learning() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store::Store::open(&temp.path().join("test.db")).unwrap();
+        let client = store.client();
+        let mut s = session(Some(client.clone()));
+        let mut r = record(wire::WRITE, 4_000_000_000, 1, "/root/.ssh/test-key");
+        r.result = -libc::EACCES as i64;
+        s.handle(r);
+        assert!(s.write_window.is_empty());
+        assert!(s.state.lock().unwrap().recent_incidents(10).is_empty());
+        store.shutdown();
+        let rows = client.why("/root/.ssh/test-key", 10).unwrap();
+        assert_eq!(rows["events"][0]["kind"], "file.write.attempt");
+        assert!(rows["events"][0]["bytes"].is_null());
+        assert_eq!(rows["events"][0]["entry"]["syscall_result"], -libc::EACCES);
+        assert!(
+            !client
+                .baseline()
+                .unwrap()
+                .knows_path("/opt/test-app", "/root/.ssh/test-key")
         );
     }
 }

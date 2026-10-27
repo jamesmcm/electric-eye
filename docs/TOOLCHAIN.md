@@ -69,6 +69,15 @@ stable Rust. Bumping it can silently change the shell's LLVM major — after
 `nix flake update`, re-run the pairing check above before building the
 eBPF crate.
 
+## BTF callback metadata
+
+The BPF release profile enables debug information, and `xtask build-ebpf` passes
+`-C link-arg=--btf`. Keep both: the bounded `bpf_loop` path walker requires BTF
+function records for its callback. Without them, loading fails with
+`missing btf func_info`. Runtime requirements are Linux 5.17+, kernel BTF, and
+raw syscall tracepoints. Struct/member offsets are resolved from the running
+kernel's BTF, including anonymous struct/union members.
+
 ## Arch Linux packaging
 
 The Arch `extra/bpf-linker` package (0.11.0-2) is built against the distro's

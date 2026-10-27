@@ -1,1103 +1,740 @@
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
-
+#[path = "../../electric-eye-core/src/wire.rs"]
+mod wire;
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
+        bpf_get_current_pid_tgid, bpf_get_current_task, bpf_get_current_uid_gid,
+        bpf_get_ns_current_pid_tgid, bpf_ktime_get_boot_ns, bpf_loop, bpf_probe_read_kernel,
+        bpf_probe_read_kernel_buf, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
-    macros::{kretprobe, map, tracepoint},
-    maps::{HashMap, RingBuf, lpm_trie::Key},
-    programs::{RetProbeContext, TracePointContext},
+    macros::{kprobe, kretprobe, map, tracepoint},
+    maps::{
+        lpm_trie::{Key, LpmTrie},
+        HashMap, PerCpuArray, RingBuf,
+    },
+    programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
-
-pub const KIND_EXEC: u32 = 0;
-pub const KIND_CONNECT: u32 = 1;
-pub const KIND_LISTEN: u32 = 2;
-pub const KIND_FILE_OPEN: u32 = 3;
-pub const KIND_FILE_UNLINK: u32 = 4;
-pub const KIND_FILE_RENAME: u32 = 5;
-pub const KIND_EXIT: u32 = 6;
-pub const KIND_ACCEPT: u32 = 7;
-pub const KIND_FILE_WRITE: u32 = 8;
-pub const KIND_FD_DUP: u32 = 9;
-pub const KIND_FD_CLOSE: u32 = 10;
-pub const KIND_FILE_MMAP: u32 = 11;
-pub const KIND_FILE_READ: u32 = 12;
-
-const AF_INET: u16 = 2;
-const AF_INET6: u16 = 10;
-const IPPROTO_TCP: u16 = 6;
-
-const TCP_SYN_SENT: i32 = 2;
-const TCP_LISTEN: i32 = 10;
-
-const O_ACCMODE: i32 = 0o3;
-const O_RDONLY: i32 = 0o0;
-const O_CREAT: i32 = 0o100;
-const O_TRUNC: i32 = 0o1000;
-
-const PATH_LEN: usize = 512;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SockOffsets {
-    pub oldstate: u32,
-    pub newstate: u32,
-    pub sport: u32,
-    pub dport: u32,
-    pub family: u32,
-    pub protocol: u32,
-    pub saddr4: u32,
-    pub daddr4: u32,
-    pub saddr6: u32,
-    pub daddr6: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SyscallOffsets {
-    pub openat_filename: u32,
-    pub openat_flags: u32,
-    pub openat_ret: u32,
-    pub openat2_filename: u32,
-    pub openat2_how: u32,
-    pub openat2_ret: u32,
-    pub open_filename: u32,
-    pub open_flags: u32,
-    pub open_ret: u32,
-    pub unlinkat_pathname: u32,
-    pub unlink_pathname: u32,
-    pub rmdir_pathname: u32,
-    pub rename_oldname: u32,
-    pub rename_newname: u32,
-    pub renameat_oldname: u32,
-    pub renameat_newname: u32,
-    pub renameat2_oldname: u32,
-    pub renameat2_newname: u32,
-    pub write_fd: u32,
-    pub write_count: u32,
-    pub accept_ret: u32,
-    pub accept4_ret: u32,
-    pub accept_fd: u32,
-    pub accept_sockaddr: u32,
-    pub accept_addrlen: u32,
-    pub accept4_fd: u32,
-    pub accept4_sockaddr: u32,
-    pub accept4_addrlen: u32,
-    pub dup2_oldfd: u32,
-    pub dup2_newfd: u32,
-    pub dup3_oldfd: u32,
-    pub dup3_newfd: u32,
-    pub close_fd: u32,
-    pub writev_fd: u32,
-    pub writev_vec: u32,
-    pub writev_vlen: u32,
-    pub pwrite64_fd: u32,
-    pub pwrite64_count: u32,
-    pub pwritev_fd: u32,
-    pub pwritev_vec: u32,
-    pub pwritev_vlen: u32,
-    pub sendfile_out_fd: u32,
-    pub sendfile_count: u32,
-    pub copy_out_fd: u32,
-    pub copy_len: u32,
-    pub mmap_len: u32,
-    pub mmap_prot: u32,
-    pub mmap_flags: u32,
-    pub mmap_fd: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PendingOpen {
-    pub path: u64,
-    pub flags: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PendingAccept {
-    pub peer: u64,
-    pub peer_len: u64,
-    pub listen_fd: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct NetTotals {
-    pub sent: u64,
-    pub recv: u64,
-}
-
-#[repr(C)]
-pub struct RawExecEvent {
-    pub kind: u32,
-    pub pid: u32,
-    pub ppid: u32,
-    pub uid: u32,
-    pub comm: [u8; 16],
-}
-
-#[repr(C)]
-pub struct RawNetEvent {
-    pub kind: u32,
-    pub pid: u32,
-    pub uid: u32,
-    pub family: u32,
-    pub sport: u32,
-    pub dport: u32,
-    pub addr: [u8; 16],
-    pub comm: [u8; 16],
-}
-
-#[repr(C)]
-pub struct RawPathEvent {
-    pub kind: u32,
-    pub pid: u32,
-    pub uid: u32,
-    pub flags: u32,
-    pub fd: u32,
-    pub comm: [u8; 16],
-    pub path: [u8; PATH_LEN],
-}
-
-#[repr(C)]
-pub struct RawWriteEvent {
-    pub kind: u32,
-    pub pid: u32,
-    pub uid: u32,
-    pub fd: u32,
-    pub count: u64,
-    pub comm: [u8; 16],
-}
-
-#[repr(C)]
-pub struct RawAcceptEvent {
-    pub kind: u32,
-    pub pid: u32,
-    pub uid: u32,
-    pub fd: u32,
-    pub listen_fd: u32,
-    pub family: u32,
-    pub port: u32,
-    pub addr: [u8; 16],
-    pub comm: [u8; 16],
-}
-
-#[repr(C)]
-pub struct RawFdEvent {
-    pub kind: u32,
-    pub pid: u32,
-    pub uid: u32,
-    pub oldfd: u32,
-    pub newfd: u32,
-    pub comm: [u8; 16],
-}
-
-#[repr(C)]
-pub struct RawRenameEvent {
-    pub kind: u32,
-    pub pid: u32,
-    pub uid: u32,
-    pub pad: u32,
-    pub comm: [u8; 16],
-    pub old_path: [u8; PATH_LEN],
-    pub new_path: [u8; PATH_LEN],
-}
+use wire::*;
 
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 21, 0);
-
+static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 24, 0);
+#[map]
+static KERNEL_OFFSETS: HashMap<u32, KernelOffsets> = HashMap::with_max_entries(1, 0);
 #[map]
 static SOCK_OFFSETS: HashMap<u32, SockOffsets> = HashMap::with_max_entries(1, 0);
-
 #[map]
-static SYSCALL_OFFSETS: HashMap<u32, SyscallOffsets> = HashMap::with_max_entries(1, 0);
-
+static SYSCALL_OPS: HashMap<u64, u32> = HashMap::with_max_entries(64, 0);
 #[map]
-static PENDING_OPEN: HashMap<u32, PendingOpen> = HashMap::with_max_entries(8192, 0);
-
+static PENDING: HashMap<u64, Record> = HashMap::with_max_entries(8192, 0);
 #[map]
-static PENDING_ACCEPT: HashMap<u32, PendingAccept> = HashMap::with_max_entries(4096, 0);
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PathKey {
-    pub bytes: [u8; 128],
-}
-
+static READ_PREFIXES: LpmTrie<[u8; 128], u8> = LpmTrie::with_max_entries(4096, 0);
 #[map]
-static READ_PREFIXES: aya_ebpf::maps::LpmTrie<PathKey, u8> = aya_ebpf::maps::LpmTrie::with_max_entries(4096, 0);
-
+static DROPPED: PerCpuArray<u64> = PerCpuArray::with_max_entries(DROP_COUNT, 0);
 #[map]
-static NET_BYTES: HashMap<u32, NetTotals> = HashMap::with_max_entries(16384, 0);
+static DIR_SCRATCH: PerCpuArray<[u8; PATH_LEN]> = PerCpuArray::with_max_entries(1, 0);
+#[map]
+static BUILD_SCRATCH: PerCpuArray<[u8; 1024]> = PerCpuArray::with_max_entries(1, 0);
+#[map]
+static PATH_SCRATCH: PerCpuArray<[u8; 1024]> = PerCpuArray::with_max_entries(1, 0);
 
-fn current_tgid() -> u32 {
-    (bpf_get_current_pid_tgid() >> 32) as u32
-}
-
-fn current_tid() -> u32 {
-    bpf_get_current_pid_tgid() as u32
-}
-
-fn current_ids() -> (u32, u32) {
-    (current_tgid(), bpf_get_current_uid_gid() as u32)
-}
-
-fn ctx_read<T>(ctx: &TracePointContext, offset: usize) -> Result<T, ()> {
-    unsafe { ctx.read_at::<T>(offset) }.map_err(|_| ())
-}
-
-fn current_comm() -> Result<[u8; 16], ()> {
-    bpf_get_current_comm().map_err(|_| ())
-}
-
-fn push_record<T: 'static>(record: T) -> bool {
-    match EVENTS.reserve::<T>(0) {
-        Some(mut slot) => {
-            slot.write(record);
-            slot.submit(0);
-            true
+fn dropped(reason: u32) {
+    if let Some(p) = DROPPED.get_ptr_mut(reason) {
+        unsafe {
+            *p += 1;
         }
-        None => false,
     }
 }
-
-fn read_user_path(ptr: u64, buf: &mut [u8; PATH_LEN]) -> Result<(), ()> {
-    if ptr == 0 {
+fn offsets() -> Result<KernelOffsets, ()> {
+    unsafe { KERNEL_OFFSETS.get(&0).copied().ok_or(()) }
+}
+fn read<T: Copy>(base: u64, offset: u32) -> Result<T, ()> {
+    if base == 0 {
         return Err(());
     }
-    unsafe { bpf_probe_read_user_str_bytes(ptr as *const u8, buf) }.map_err(|_| ())?;
-    Ok(())
+    unsafe { bpf_probe_read_kernel((base + offset as u64) as *const T).map_err(|_| ()) }
 }
-
-fn emit_path_record(p: *mut RawPathEvent, kind: u32, path_ptr: u64, flags: u32, fd: u32) -> bool {
-    let Ok(comm) = current_comm() else {
-        return false;
-    };
-    let (pid, uid) = current_ids();
-    unsafe {
-        (*p).kind = kind;
-        (*p).pid = pid;
-        (*p).uid = uid;
-        (*p).flags = flags;
-        (*p).fd = fd;
-        (*p).comm = comm;
+fn task() -> u64 {
+    unsafe { bpf_get_current_task() }
+}
+fn fd_file(fd: u32, o: &KernelOffsets) -> Result<u64, ()> {
+    let files: u64 = read(task(), o.task_files)?;
+    let fdt: u64 = read(files, o.files_fdt)?;
+    let max: u32 = read(fdt, o.fdt_max_fds)?;
+    if fd >= max || fd > 1_048_576 {
+        return Err(());
     }
-    read_user_path(path_ptr, unsafe { &mut (*p).path }).is_ok()
-}
-
-fn reserve_path_event(kind: u32, path_ptr: u64, flags: u32, fd: u32) {
-    let Some(mut slot) = EVENTS.reserve::<RawPathEvent>(0) else {
-        return;
-    };
-    let p = slot.as_mut_ptr();
-    if emit_path_record(p, kind, path_ptr, flags, fd) {
-        slot.submit(0);
+    let array: u64 = read(fdt, o.fdt_fd)?;
+    let file: u64 = read(array, fd * 8)?;
+    if file == 0 {
+        Err(())
     } else {
-        slot.discard(0);
+        Ok(file)
     }
 }
 
-fn reserve_rename_event(old_ptr: u64, new_ptr: u64) {
-    let Some(mut slot) = EVENTS.reserve::<RawRenameEvent>(0) else {
-        return;
-    };
-    let p = slot.as_mut_ptr();
-    let Ok(comm) = current_comm() else {
-        slot.discard(0);
-        return;
-    };
+struct Walk {
+    mnt: u64,
+    dentry: u64,
+    root_mnt: u64,
+    root_dentry: u64,
+    offsets: *const KernelOffsets,
+    pos: usize,
+    complete: bool,
+}
+unsafe extern "C" fn path_component(_index: u32, context: *mut core::ffi::c_void) -> i64 {
+    let walk = &mut *context.cast::<Walk>();
+    match component(walk) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(()) => 1,
+    }
+}
+fn component(w: &mut Walk) -> Result<bool, ()> {
+    let o = unsafe { &*w.offsets };
+    if w.mnt == w.root_mnt && w.dentry == w.root_dentry {
+        w.complete = true;
+        return Ok(true);
+    }
+    let mnt_root: u64 = read(w.mnt, o.vfsmount_root)?;
+    if w.dentry == mnt_root {
+        let mount = w.mnt.checked_sub(o.mount_mnt as u64).ok_or(())?;
+        let parent: u64 = read(mount, o.mount_parent)?;
+        if parent == mount {
+            return Err(());
+        }
+        w.dentry = read(mount, o.mount_mountpoint)?;
+        w.mnt = parent + o.mount_mnt as u64;
+        return Ok(false);
+    }
+    let parent: u64 = read(w.dentry, o.dentry_parent)?;
+    if parent == w.dentry {
+        return Err(());
+    }
+    let len: u32 = read(w.dentry, o.dentry_name + o.qstr_len)?;
+    let name: u64 = read(w.dentry, o.dentry_name + o.qstr_name)?;
+    let len = len as usize;
+    if len == 0 || len > 255 || w.pos > PATH_LEN - 1 || len + 1 > w.pos {
+        return Err(());
+    }
+    let pos = unsafe { core::ptr::read_volatile(&w.pos) }.wrapping_sub(len) & (PATH_LEN - 1);
+    // Spare scratch capacity gives the verifier independent bounds for the
+    // variable destination offset and name length.
+    let scratch = unsafe { &mut *PATH_SCRATCH.get_ptr_mut(0).ok_or(())? };
     unsafe {
-        (*p).kind = KIND_FILE_RENAME;
-        ((*p).pid, (*p).uid) = current_ids();
-        (*p).pad = 0;
-        (*p).comm = comm;
+        bpf_probe_read_kernel_buf(
+            name as *const u8,
+            core::slice::from_raw_parts_mut(scratch.as_mut_ptr().add(pos), len),
+        )
+        .map_err(|_| ())?;
     }
-    let old_ok = read_user_path(old_ptr, unsafe { &mut (*p).old_path }).is_ok();
-    let new_ok = read_user_path(new_ptr, unsafe { &mut (*p).new_path }).is_ok();
-    if old_ok && new_ok {
-        slot.submit(0);
-    } else {
-        slot.discard(0);
+    w.pos = pos - 1;
+    unsafe {
+        *scratch.get_unchecked_mut(w.pos & (PATH_LEN - 1)) = b'/';
     }
+    w.dentry = parent;
+    Ok(false)
 }
-
-fn writable_open(flags: i32) -> bool {
-    (flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)) != 0
-}
-
-fn sensitive_read(path_ptr: u64) -> bool {
-    if path_ptr == 0 {
-        return false;
-    }
-    let mut bytes = [0u8; 128];
-    if unsafe { bpf_probe_read_user_str_bytes(path_ptr as *const u8, &mut bytes) }.is_err() {
-        return false;
-    }
-    if bytes[0] != b'/' {
-        return false;
-    }
-    READ_PREFIXES
-        .get(&Key::new(1024, PathKey { bytes }))
-        .is_some()
-}
-
-fn push_write(kind: u32, fd: u64, count: u64) {
-    if count == 0 || fd > u32::MAX as u64 {
-        return;
-    }
-    let Ok(comm) = current_comm() else {
-        return;
+/// Walk resolved dentries across mount points in the caller's namespace.
+/// bpf_loop bounds work without multiplying verifier states by path depth.
+#[inline(never)]
+fn kernel_path(
+    mnt: u64,
+    dentry: u64,
+    out: &mut [u8; PATH_LEN],
+    o: &KernelOffsets,
+) -> Result<usize, ()> {
+    let fs: u64 = read(task(), o.task_fs)?;
+    let mut walk = Walk {
+        mnt,
+        dentry,
+        root_mnt: read(fs, o.fs_root + o.path_mnt)?,
+        root_dentry: read(fs, o.fs_root + o.path_dentry)?,
+        offsets: o,
+        pos: PATH_LEN - 1,
+        complete: false,
     };
-    let (pid, uid) = current_ids();
-    push_record(RawWriteEvent {
-        kind,
-        pid,
-        uid,
-        fd: fd as u32,
-        count,
-        comm,
-    });
+    let scratch = unsafe { &mut *PATH_SCRATCH.get_ptr_mut(0).ok_or(())? };
+    scratch[PATH_LEN - 1] = 0;
+    if unsafe {
+        bpf_loop(
+            80,
+            path_component as *mut core::ffi::c_void,
+            (&mut walk as *mut Walk).cast(),
+            0,
+        )
+    } < 0
+        || !walk.complete
+    {
+        return Err(());
+    }
+    if walk.pos == PATH_LEN - 1 {
+        walk.pos -= 1;
+        unsafe {
+            *scratch.get_unchecked_mut(walk.pos & (PATH_LEN - 1)) = b'/';
+        }
+    }
+    let pos = walk.pos & (PATH_LEN - 1);
+    unsafe {
+        bpf_probe_read_kernel_buf(
+            scratch.as_ptr().add(pos),
+            core::slice::from_raw_parts_mut(out.as_mut_ptr(), PATH_LEN - pos),
+        )
+        .map_err(|_| ())?;
+    }
+    Ok(PATH_LEN - pos - 1)
+}
+fn path_at(path: u64, out: &mut [u8; PATH_LEN], o: &KernelOffsets) -> Result<usize, ()> {
+    kernel_path(read(path, o.path_mnt)?, read(path, o.path_dentry)?, out, o)
+}
+fn file_path(file: u64, out: &mut [u8; PATH_LEN], o: &KernelOffsets) -> Result<usize, ()> {
+    path_at(file + o.file_path as u64, out, o)
+}
+fn identity(e: &mut Record, o: &KernelOffsets) -> Result<bool, ()> {
+    unsafe {
+        bpf_probe_read_kernel_buf(
+            (&Record::ZERO as *const Record).cast::<u8>(),
+            core::slice::from_raw_parts_mut(
+                (e as *mut Record).cast::<u8>(),
+                core::mem::size_of::<Record>(),
+            ),
+        )
+        .map_err(|_| ())?;
+    }
+    let ids = bpf_get_current_pid_tgid();
+    let mut ns = aya_ebpf::bindings::bpf_pidns_info { pid: 0, tgid: 0 };
+    if unsafe {
+        bpf_get_ns_current_pid_tgid(
+            o.own_ns_dev,
+            o.own_ns_ino,
+            &mut ns,
+            core::mem::size_of_val(&ns) as u32,
+        )
+    } != 0
+    {
+        return Ok(false);
+    }
+    e.pid = ns.tgid;
+    if e.pid == o.own_pid {
+        return Ok(false);
+    }
+    e.uid = bpf_get_current_uid_gid() as u32;
+    let leader: u64 = read(task(), o.task_group_leader)?;
+    e.start_ns = read(leader, o.task_start_boottime)?;
+    unsafe {
+        bpf_probe_read_kernel_buf((leader + o.task_comm as u64) as *const u8, &mut e.comm)
+            .map_err(|_| ())?;
+    }
+    let parent: u64 = read(leader, o.task_real_parent)?;
+    e.ppid = if ns.tgid == (ids >> 32) as u32 {
+        read(parent, o.task_tgid)?
+    } else {
+        0
+    };
+    let _ = unsafe {
+        bpf_probe_read_kernel_buf(
+            (parent + o.task_comm as u64) as *const u8,
+            &mut e.parent_comm,
+        )
+    };
+    e.ts_ns = unsafe { bpf_ktime_get_boot_ns() };
+    if let Ok(mm) = read::<u64>(task(), o.task_mm) {
+        if let Ok(exe) = read::<u64>(mm, o.mm_exe_file) {
+            let _ = file_path(exe, &mut e.exe, o);
+        }
+    }
+    Ok(true)
+}
+fn fill_identity(e: &mut Record, o: &KernelOffsets) -> bool {
+    match identity(e, o) {
+        Ok(captured) => captured,
+        Err(()) => {
+            dropped(DROP_IDENTITY);
+            false
+        }
+    }
 }
 
-fn iovec_bytes(vec: u64, vlen: u64) -> u64 {
-    if vec == 0 {
-        return 0;
+fn read_user_path(ptr: u64, out: &mut [u8; PATH_LEN]) -> Result<usize, ()> {
+    out.fill(0);
+    let bytes = unsafe { bpf_probe_read_user_str_bytes(ptr as *const u8, out).map_err(|_| ())? };
+    // A full buffer can be truncated; do not claim an exact path.
+    if bytes.len() >= PATH_LEN - 1 {
+        return Err(());
     }
-    let count = vlen.min(64);
-    let mut total = 0u64;
-    let mut index = 0u64;
-    while index < count {
-        let len: u64 =
-            match unsafe { bpf_probe_read_user((vec + index * 16 + 8) as *const u64) } {
-                Ok(value) => value,
-                Err(_) => break,
+    Ok(bytes.len())
+}
+#[inline(never)]
+fn syscall_path(ptr: u64, dirfd: i32, out: &mut [u8; PATH_LEN], o: &KernelOffsets) -> u32 {
+    let Ok(name_len) = read_user_path(ptr, out) else {
+        out.fill(0);
+        return PATH_UNRESOLVED;
+    };
+    if out[0] == b'/' {
+        return PATH_LEXICAL;
+    }
+    let Some(temp) = DIR_SCRATCH.get_ptr_mut(0) else {
+        return PATH_UNRESOLVED;
+    };
+    let temp = unsafe { &mut *temp };
+    let result = if dirfd == -100 {
+        read::<u64>(task(), o.task_fs).and_then(|fs| path_at(fs + o.fs_pwd as u64, temp, o))
+    } else if dirfd >= 0 {
+        fd_file(dirfd as u32, o).and_then(|file| file_path(file, temp, o))
+    } else {
+        Err(())
+    };
+    let Ok(mut base_len) = result else {
+        return PATH_UNRESOLVED;
+    };
+    if base_len + name_len + 2 >= PATH_LEN {
+        return PATH_UNRESOLVED;
+    }
+    if base_len == 1 {
+        base_len = 0;
+    }
+    let Some(build) = BUILD_SCRATCH.get_ptr_mut(0) else {
+        return PATH_UNRESOLVED;
+    };
+    let build = unsafe { &mut *build };
+    let result = (|| -> Result<(), ()> {
+        unsafe {
+            bpf_probe_read_kernel_buf([0u8; PATH_LEN].as_ptr(), &mut build[..PATH_LEN])
+                .map_err(|_| ())?;
+        }
+        if base_len > 0 {
+            unsafe {
+                bpf_probe_read_kernel_buf(
+                    temp.as_ptr(),
+                    core::slice::from_raw_parts_mut(build.as_mut_ptr(), base_len),
+                )
+                .map_err(|_| ())?;
+            }
+        }
+        let index = base_len & (PATH_LEN - 1);
+        unsafe {
+            *build.get_unchecked_mut(index) = b'/';
+        }
+        let name =
+            unsafe { core::slice::from_raw_parts_mut(build.as_mut_ptr().add(index + 1), PATH_LEN) };
+        let actual =
+            unsafe { bpf_probe_read_user_str_bytes(ptr as *const u8, name).map_err(|_| ())? }.len();
+        if index + actual + 2 >= PATH_LEN {
+            return Err(());
+        }
+        unsafe {
+            bpf_probe_read_kernel_buf(build.as_ptr(), out).map_err(|_| ())?;
+        }
+        Ok(())
+    })();
+    if result.is_ok() {
+        PATH_LEXICAL
+    } else {
+        PATH_UNRESOLVED
+    }
+}
+fn sensitive(path: &[u8; PATH_LEN]) -> bool {
+    let mut key = [0u8; 128];
+    key.copy_from_slice(&path[..128]);
+    READ_PREFIXES.get(&Key::new(1024, key)).is_some()
+}
+
+#[tracepoint(category = "raw_syscalls", name = "sys_enter")]
+fn electric_eye_sys_enter(ctx: TracePointContext) -> i32 {
+    let _ = enter(&ctx);
+    0
+}
+fn enter(ctx: &TracePointContext) -> Result<(), ()> {
+    let o = offsets()?;
+    let id: u64 = unsafe { ctx.read_at(o.enter_id as usize).map_err(|_| ())? };
+    let Some(op) = (unsafe { SYSCALL_OPS.get(&id).copied() }) else {
+        return Ok(());
+    };
+    let args: [u64; 6] = unsafe { ctx.read_at(o.enter_args as usize).map_err(|_| ())? };
+    let Some(mut slot) = EVENTS.reserve::<Record>(0) else {
+        dropped(DROP_RING);
+        return Ok(());
+    };
+    let e = unsafe { &mut *slot.as_mut_ptr() };
+    if !fill_identity(e, &o) {
+        slot.discard(0);
+        return Ok(());
+    }
+    match op {
+        OP_OPEN | OP_OPENAT | OP_OPENAT2 => {
+            e.kind = OPEN;
+            let (ptr, dirfd, flags) = if op == OP_OPEN {
+                (args[0], -100, args[1])
+            } else if op == OP_OPENAT {
+                (args[1], args[0] as i32, args[2])
+            } else {
+                (args[1], args[0] as i32, unsafe {
+                    bpf_probe_read_user(args[2] as *const u64).unwrap_or(0)
+                })
             };
-        total = total.saturating_add(len);
-        index += 1;
+            e.flags = flags as u32;
+            e.path_resolution = syscall_path(ptr, dirfd, &mut e.path, &o);
+        }
+        OP_WRITE | OP_SENDFILE | OP_COPY | OP_MMAP => {
+            e.kind = if op == OP_MMAP { MMAP } else { WRITE };
+            let fd = if op == OP_COPY {
+                args[2]
+            } else if op == OP_MMAP {
+                args[4]
+            } else {
+                args[0]
+            };
+            if op == OP_MMAP && (args[2] & 2 == 0 || args[3] & 1 == 0) {
+                slot.discard(0);
+                return Ok(());
+            }
+            if fd > i32::MAX as u64 {
+                slot.discard(0);
+                return Ok(());
+            }
+            e.fd = fd as u32;
+            let regular = fd_file(e.fd, &o)
+                .and_then(|f| read::<u64>(f, o.file_inode))
+                .and_then(|inode| read::<u16>(inode, o.inode_mode))
+                .is_ok_and(|mode| mode & 0o170000 == 0o100000);
+            if !regular {
+                slot.discard(0);
+                return Ok(());
+            }
+            e.count = if op == OP_MMAP { args[1] } else { 0 };
+            if fd_file(e.fd, &o)
+                .and_then(|f| file_path(f, &mut e.path, &o))
+                .is_ok()
+            {
+                e.path_resolution = PATH_KERNEL;
+            }
+        }
+        OP_UNLINK | OP_UNLINKAT => {
+            e.kind = UNLINK;
+            e.path_resolution = if op == OP_UNLINK {
+                syscall_path(args[0], -100, &mut e.path, &o)
+            } else {
+                syscall_path(args[1], args[0] as i32, &mut e.path, &o)
+            };
+        }
+        OP_RENAME | OP_RENAMEAT => {
+            e.kind = RENAME;
+            let (p1, d1, p2, d2) = if op == OP_RENAME {
+                (args[0], -100, args[1], -100)
+            } else {
+                (args[1], args[0] as i32, args[3], args[2] as i32)
+            };
+            e.path_resolution = syscall_path(p1, d1, &mut e.path, &o);
+            e.path2_resolution = syscall_path(p2, d2, &mut e.path2, &o);
+        }
+        OP_ACCEPT => {
+            e.kind = ACCEPT;
+            e.fd = args[0] as u32;
+            e.count = args[1];
+            e.flags = 0;
+        }
+        _ => {
+            slot.discard(0);
+            return Ok(());
+        }
     }
-    total
-}
-
-fn note_open(path: u64, flags: u32) {
-    if path == 0 {
-        return;
+    let key = bpf_get_current_pid_tgid();
+    if PENDING.insert(&key, e, 0).is_err() {
+        dropped(DROP_PENDING);
     }
-    let key = current_tid();
-    let _ = PENDING_OPEN.insert(&key, PendingOpen { path, flags }, 0);
-}
-
-fn finish_open(ctx: &TracePointContext, ret_offset: u32) -> Result<(), ()> {
-    let key = current_tid();
-    let Some(pending) = PENDING_OPEN.get_ptr(&key).map(|p| unsafe { *p }) else {
-        return Ok(());
-    };
-    let _ = PENDING_OPEN.remove(&key);
-    let ret: i64 = ctx_read(ctx, ret_offset as usize)?;
-    if ret < 0 || ret > u32::MAX as i64 {
-        return Ok(());
-    }
-    reserve_path_event(KIND_FILE_OPEN, pending.path, pending.flags, ret as u32);
+    slot.discard(0);
     Ok(())
 }
-
-enum OpenKind {
-    Openat,
-    Openat2,
-    Open,
+#[tracepoint(category = "raw_syscalls", name = "sys_exit")]
+fn electric_eye_sys_exit(ctx: TracePointContext) -> i32 {
+    let _ = finish(&ctx);
+    0
 }
-
-fn try_finish_open(ctx: &TracePointContext, kind: OpenKind) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let ret_offset = match kind {
-        OpenKind::Openat => offs.openat_ret,
-        OpenKind::Openat2 => offs.openat2_ret,
-        OpenKind::Open => offs.open_ret,
+fn finish(ctx: &TracePointContext) -> Result<(), ()> {
+    let key = bpf_get_current_pid_tgid();
+    let Some(p) = PENDING.get_ptr_mut(&key) else {
+        return Ok(());
     };
-    finish_open(ctx, ret_offset)
+    let result = finish_pending(ctx, unsafe { &mut *p });
+    let _ = PENDING.remove(&key);
+    result
+}
+fn finish_pending(ctx: &TracePointContext, e: &mut Record) -> Result<(), ()> {
+    let o = offsets()?;
+    let ret: i64 = unsafe { ctx.read_at(o.exit_ret as usize).map_err(|_| ())? };
+    e.result = ret;
+    if ret < 0 {
+        // Restart pseudo-errors are kernel control flow, not completed attempts.
+        if matches!(ret, -512 | -513 | -514 | -516) || e.kind == ACCEPT {
+            return Ok(());
+        }
+        if e.kind == OPEN && e.flags & 3 == 0 && e.flags & (0o100 | 0o1000) == 0 {
+            if !sensitive(&e.path) {
+                return Ok(());
+            }
+            e.kind = READ;
+        }
+        e.count = 0;
+        submit(e);
+        return Ok(());
+    }
+    if e.kind == OPEN {
+        e.fd = ret as u32;
+        if fd_file(e.fd, &o)
+            .and_then(|f| file_path(f, &mut e.path, &o))
+            .is_ok()
+        {
+            e.path_resolution = PATH_KERNEL;
+        }
+        if e.flags & 3 == 0 && e.flags & (0o100 | 0o1000) == 0 {
+            if e.path_resolution != PATH_KERNEL || !sensitive(&e.path) {
+                return Ok(());
+            }
+            e.kind = READ;
+        }
+    } else if e.kind == WRITE {
+        if ret == 0 {
+            return Ok(());
+        }
+        e.count = ret as u64;
+    } else if e.kind == ACCEPT {
+        let peer = e.count;
+        e.count = 0;
+        read_peer(peer, e);
+        // Local port can still be enriched from the listening fd; preserve it
+        // separately from the newly returned descriptor.
+        e.flags = e.fd;
+        e.fd = ret as u32;
+        let _ = socket_endpoint(e.fd, e, &o);
+    }
+    if e.path_resolution == PATH_UNRESOLVED
+        && matches!(e.kind, WRITE | MMAP | UNLINK | RENAME | OPEN | READ)
+    {
+        dropped(DROP_PATH);
+    }
+    submit(e);
+    Ok(())
+}
+fn submit(e: &Record) {
+    if let Some(mut slot) = EVENTS.reserve::<Record>(0) {
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                slot.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of::<Record>(),
+            )
+        };
+        if unsafe { bpf_probe_read_kernel_buf((e as *const Record).cast::<u8>(), dst) }.is_ok() {
+            slot.submit(0);
+        } else {
+            slot.discard(0);
+            dropped(DROP_RING);
+        }
+    } else {
+        dropped(DROP_RING);
+    }
+}
+fn socket_endpoint(fd: u32, e: &mut Record, o: &KernelOffsets) -> Result<(), ()> {
+    let file = fd_file(fd, o)?;
+    let inode: u64 = read(file, o.file_inode)?;
+    let mode: u16 = read(inode, o.inode_mode)?;
+    if mode & 0o170000 != 0o140000 {
+        return Err(());
+    }
+    let socket: u64 = read(file, o.file_private_data)?;
+    let sk: u64 = read(socket, o.socket_sk)?;
+    let common = sk + o.sock_common as u64;
+    let family: u16 = read(common, o.skc_family)?;
+    if family != 2 && family != 10 {
+        return Err(());
+    }
+    e.family = family as u32;
+    e.local_port = read::<u16>(common, o.skc_num)? as u32;
+    e.remote_port = u16::from_be(read::<u16>(common, o.skc_dport)?) as u32;
+    if family == 2 {
+        e.addr[..4].copy_from_slice(&read::<[u8; 4]>(common, o.skc_daddr)?);
+    } else {
+        e.addr = read(common, o.skc_v6_daddr)?;
+    }
+    Ok(())
+}
+fn read_peer(peer: u64, e: &mut Record) {
+    if peer == 0 {
+        return;
+    }
+    let family: u16 = unsafe { bpf_probe_read_user(peer as *const u16).unwrap_or(0) };
+    let port: u16 = unsafe { bpf_probe_read_user((peer + 2) as *const u16).unwrap_or(0) };
+    e.family = family as u32;
+    e.remote_port = u16::from_be(port) as u32;
+    if family == 2 {
+        let a: [u8; 4] =
+            unsafe { bpf_probe_read_user((peer + 4) as *const [u8; 4]).unwrap_or([0; 4]) };
+        e.addr[..4].copy_from_slice(&a);
+    } else if family == 10 {
+        e.addr = unsafe { bpf_probe_read_user((peer + 8) as *const [u8; 16]).unwrap_or([0; 16]) };
+    }
 }
 
+// These VFS permission hooks provide the resolved dentries, including symlink
+// traversal, while the syscall-exit hook still determines whether it succeeded.
+#[kprobe]
+fn electric_eye_path_unlink(ctx: ProbeContext) -> i32 {
+    let _ = mutation_path(&ctx, false);
+    0
+}
+#[kprobe]
+fn electric_eye_path_rename(ctx: ProbeContext) -> i32 {
+    let _ = mutation_path(&ctx, true);
+    0
+}
+fn mutation_path(ctx: &ProbeContext, rename: bool) -> Result<(), ()> {
+    let key = bpf_get_current_pid_tgid();
+    let Some(p) = PENDING.get_ptr_mut(&key) else {
+        return Ok(());
+    };
+    let e = unsafe { &mut *p };
+    let o = offsets()?;
+    if (rename && e.kind != RENAME) || (!rename && e.kind != UNLINK) {
+        return Ok(());
+    }
+    let dir: u64 = ctx.arg(0).ok_or(())?;
+    let dentry: u64 = ctx.arg(1).ok_or(())?;
+    if kernel_path(read(dir, o.path_mnt)?, dentry, &mut e.path, &o).is_ok() {
+        e.path_resolution = PATH_KERNEL;
+    }
+    if rename {
+        let dir: u64 = ctx.arg(2).ok_or(())?;
+        let dentry: u64 = ctx.arg(3).ok_or(())?;
+        if kernel_path(read(dir, o.path_mnt)?, dentry, &mut e.path2, &o).is_ok() {
+            e.path2_resolution = PATH_KERNEL;
+        }
+    }
+    Ok(())
+}
 #[tracepoint(category = "sched", name = "sched_process_exec")]
 fn electric_eye_exec(_ctx: TracePointContext) -> i32 {
-    match try_exec() {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
+    lifecycle(EXEC);
+    0
 }
-
-fn try_exec() -> Result<(), ()> {
-    let Ok(comm) = current_comm() else {
-        return Ok(());
-    };
-    let (pid, uid) = current_ids();
-
-    push_record(RawExecEvent {
-        kind: KIND_EXEC,
-        pid,
-        ppid: 0,
-        uid,
-        comm,
-    });
-    Ok(())
-}
-
 #[tracepoint(category = "sched", name = "sched_process_exit")]
 fn electric_eye_exit(_ctx: TracePointContext) -> i32 {
-    match try_exit() {
-        Ok(()) => 0,
-        Err(_) => 1,
+    let key = bpf_get_current_pid_tgid();
+    let _ = PENDING.remove(&key);
+    if key as u32 == (key >> 32) as u32 {
+        lifecycle(EXIT);
     }
+    0
 }
-
-fn try_exit() -> Result<(), ()> {
-    // sched_process_exit fires for every thread; only report thread-group
-    // leaders so userspace sees one EXIT per process.
-    if (bpf_get_current_pid_tgid() as u32) != current_tgid() {
-        return Ok(());
-    }
-    let Ok(comm) = current_comm() else {
-        return Ok(());
+fn lifecycle(kind: u32) {
+    let Ok(o) = offsets() else {
+        return;
     };
-    let (pid, uid) = current_ids();
-    push_record(RawExecEvent {
-        kind: KIND_EXIT,
-        pid,
-        ppid: 0,
-        uid,
-        comm,
-    });
-    Ok(())
+    let Some(mut slot) = EVENTS.reserve::<Record>(0) else {
+        dropped(DROP_RING);
+        return;
+    };
+    let e = unsafe { &mut *slot.as_mut_ptr() };
+    if !fill_identity(e, &o) {
+        slot.discard(0);
+        return;
+    }
+    e.kind = kind;
+    slot.submit(0);
 }
-
 #[tracepoint(category = "sock", name = "inet_sock_set_state")]
 fn electric_eye_sock_state(ctx: TracePointContext) -> i32 {
-    match try_sock_state(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
+    let _ = socket_state(&ctx);
+    0
 }
-
-fn try_sock_state(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SockOffsets = unsafe { *SOCK_OFFSETS.get(&0).ok_or(())? };
-
-    let newstate: i32 = ctx_read(ctx, offs.newstate as usize)?;
-    let kind = match newstate {
-        TCP_SYN_SENT => KIND_CONNECT,
-        TCP_LISTEN => KIND_LISTEN,
-        _ => return Ok(()),
-    };
-
-    let family: u16 = ctx_read(ctx, offs.family as usize)?;
-    if family != AF_INET && family != AF_INET6 {
+fn socket_state(ctx: &TracePointContext) -> Result<(), ()> {
+    let o = offsets()?;
+    let s = unsafe { SOCK_OFFSETS.get(&0).copied().ok_or(())? };
+    let state: i32 = unsafe { ctx.read_at(s.newstate as usize).map_err(|_| ())? };
+    if state != 2 && state != 10 {
         return Ok(());
     }
-    let protocol: u16 = ctx_read(ctx, offs.protocol as usize)?;
-    if protocol != IPPROTO_TCP {
+    let family: u16 = unsafe { ctx.read_at(s.family as usize).map_err(|_| ())? };
+    let protocol: u16 = unsafe { ctx.read_at(s.protocol as usize).map_err(|_| ())? };
+    if (family != 2 && family != 10) || protocol != 6 {
         return Ok(());
     }
-
-    let sport: u16 = ctx_read(ctx, offs.sport as usize)?;
-    let dport: u16 = ctx_read(ctx, offs.dport as usize)?;
-
-    let remote = matches!(kind, KIND_CONNECT | KIND_ACCEPT);
-    let mut addr = [0u8; 16];
-    match family {
-        AF_INET => {
-            let raw: u32 = if remote {
-                ctx_read(ctx, offs.daddr4 as usize)?
-            } else {
-                ctx_read(ctx, offs.saddr4 as usize)?
-            };
-            addr[..4].copy_from_slice(&raw.to_ne_bytes());
-        }
-        AF_INET6 => {
-            addr = if remote {
-                ctx_read(ctx, offs.daddr6 as usize)?
-            } else {
-                ctx_read(ctx, offs.saddr6 as usize)?
-            };
-        }
-        _ => return Ok(()),
-    }
-
-    let Ok(comm) = current_comm() else {
+    let Some(mut slot) = EVENTS.reserve::<Record>(0) else {
+        dropped(DROP_RING);
         return Ok(());
     };
-    let (pid, uid) = current_ids();
-
-    push_record(RawNetEvent {
-        kind,
-        pid,
-        uid,
-        family: family as u32,
-        sport: sport as u32,
-        dport: dport as u32,
-        addr,
-        comm,
-    });
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_openat")]
-fn electric_eye_openat(ctx: TracePointContext) -> i32 {
-    match try_openat(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
+    let e = unsafe { &mut *slot.as_mut_ptr() };
+    if !fill_identity(e, &o) {
+        slot.discard(0);
+        return Ok(());
     }
-}
-
-fn try_openat(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let flags: i32 = ctx_read(ctx, offs.openat_flags as usize)?;
-    let filename: u64 = ctx_read(ctx, offs.openat_filename as usize)?;
-    if !writable_open(flags) {
-        if sensitive_read(filename) {
-            reserve_path_event(KIND_FILE_READ, filename, flags as u32, 0);
+    e.kind = if state == 2 { CONNECT } else { LISTEN };
+    e.family = family as u32;
+    e.local_port = unsafe { ctx.read_at::<u16>(s.sport as usize).unwrap_or(0) } as u32;
+    e.remote_port = unsafe { ctx.read_at::<u16>(s.dport as usize).unwrap_or(0) } as u32;
+    let at = if family == 2 {
+        if state == 2 {
+            s.daddr4
+        } else {
+            s.saddr4
         }
-        return Ok(());
-    }
-    note_open(filename, flags as u32);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_exit_openat")]
-fn electric_eye_openat_exit(ctx: TracePointContext) -> i32 {
-    match try_finish_open(&ctx, OpenKind::Openat) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_openat2")]
-fn electric_eye_openat2(ctx: TracePointContext) -> i32 {
-    match try_openat2(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_openat2(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let how: u64 = ctx_read(ctx, offs.openat2_how as usize)?;
-    if how == 0 {
-        return Ok(());
-    }
-    let flags: u64 = unsafe { bpf_probe_read_user(how as *const u64) }.map_err(|_| ())?;
-    let filename: u64 = ctx_read(ctx, offs.openat2_filename as usize)?;
-    if !writable_open(flags as i32) {
-        if sensitive_read(filename) {
-            reserve_path_event(KIND_FILE_READ, filename, flags as u32, 0);
-        }
-        return Ok(());
-    }
-    note_open(filename, flags as u32);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_exit_openat2")]
-fn electric_eye_openat2_exit(ctx: TracePointContext) -> i32 {
-    match try_finish_open(&ctx, OpenKind::Openat2) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_open")]
-fn electric_eye_open(ctx: TracePointContext) -> i32 {
-    match try_open(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_open(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let flags: i32 = ctx_read(ctx, offs.open_flags as usize)?;
-    let filename: u64 = ctx_read(ctx, offs.open_filename as usize)?;
-    if !writable_open(flags) {
-        if sensitive_read(filename) {
-            reserve_path_event(KIND_FILE_READ, filename, flags as u32, 0);
-        }
-        return Ok(());
-    }
-    note_open(filename, flags as u32);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_exit_open")]
-fn electric_eye_open_exit(ctx: TracePointContext) -> i32 {
-    match try_finish_open(&ctx, OpenKind::Open) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_unlinkat")]
-fn electric_eye_unlinkat(ctx: TracePointContext) -> i32 {
-    match try_unlinkat(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_unlinkat(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let pathname: u64 = ctx_read(ctx, offs.unlinkat_pathname as usize)?;
-    reserve_path_event(KIND_FILE_UNLINK, pathname, 0, 0);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_unlink")]
-fn electric_eye_unlink(ctx: TracePointContext) -> i32 {
-    match try_unlink(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_unlink(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let pathname: u64 = ctx_read(ctx, offs.unlink_pathname as usize)?;
-    reserve_path_event(KIND_FILE_UNLINK, pathname, 0, 0);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_rmdir")]
-fn electric_eye_rmdir(ctx: TracePointContext) -> i32 {
-    match try_rmdir(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_rmdir(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let pathname: u64 = ctx_read(ctx, offs.rmdir_pathname as usize)?;
-    reserve_path_event(KIND_FILE_UNLINK, pathname, 0, 0);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_rename")]
-fn electric_eye_rename(ctx: TracePointContext) -> i32 {
-    match try_rename(&ctx, false) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_renameat")]
-fn electric_eye_renameat(ctx: TracePointContext) -> i32 {
-    match try_rename(&ctx, true) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_rename(ctx: &TracePointContext, at: bool) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let (old_off, new_off) = if at {
-        (offs.renameat_oldname, offs.renameat_newname)
+    } else if state == 2 {
+        s.daddr6
     } else {
-        (offs.rename_oldname, offs.rename_newname)
+        s.saddr6
     };
-    let oldname: u64 = ctx_read(ctx, old_off as usize)?;
-    let newname: u64 = ctx_read(ctx, new_off as usize)?;
-    reserve_rename_event(oldname, newname);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_renameat2")]
-fn electric_eye_renameat2(ctx: TracePointContext) -> i32 {
-    match try_renameat2(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_renameat2(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let oldname: u64 = ctx_read(ctx, offs.renameat2_oldname as usize)?;
-    let newname: u64 = ctx_read(ctx, offs.renameat2_newname as usize)?;
-    reserve_rename_event(oldname, newname);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_write")]
-fn electric_eye_write(ctx: TracePointContext) -> i32 {
-    match try_write(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_write(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let fd: u32 = ctx_read(ctx, offs.write_fd as usize)?;
-    let count: u64 = ctx_read(ctx, offs.write_count as usize)?;
-    push_write(KIND_FILE_WRITE, fd as u64, count);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_writev")]
-fn electric_eye_writev(ctx: TracePointContext) -> i32 {
-    match try_writev(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_writev(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let fd: u64 = ctx_read(ctx, offs.writev_fd as usize)?;
-    let vec: u64 = ctx_read(ctx, offs.writev_vec as usize)?;
-    let vlen: u64 = ctx_read(ctx, offs.writev_vlen as usize)?;
-    push_write(KIND_FILE_WRITE, fd, iovec_bytes(vec, vlen));
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_pwrite64")]
-fn electric_eye_pwrite64(ctx: TracePointContext) -> i32 {
-    match try_pwrite64(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_pwrite64(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let fd: u64 = ctx_read(ctx, offs.pwrite64_fd as usize)?;
-    let count: u64 = ctx_read(ctx, offs.pwrite64_count as usize)?;
-    push_write(KIND_FILE_WRITE, fd, count);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_pwritev")]
-fn electric_eye_pwritev(ctx: TracePointContext) -> i32 {
-    match try_pwritev(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_pwritev(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let fd: u64 = ctx_read(ctx, offs.pwritev_fd as usize)?;
-    let vec: u64 = ctx_read(ctx, offs.pwritev_vec as usize)?;
-    let vlen: u64 = ctx_read(ctx, offs.pwritev_vlen as usize)?;
-    push_write(KIND_FILE_WRITE, fd, iovec_bytes(vec, vlen));
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_sendfile64")]
-fn electric_eye_sendfile(ctx: TracePointContext) -> i32 {
-    match try_sendfile(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_sendfile(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let out_fd: u64 = ctx_read(ctx, offs.sendfile_out_fd as usize)?;
-    let count: u64 = ctx_read(ctx, offs.sendfile_count as usize)?;
-    push_write(KIND_FILE_WRITE, out_fd, count);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_copy_file_range")]
-fn electric_eye_copy_file_range(ctx: TracePointContext) -> i32 {
-    match try_copy_file_range(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_copy_file_range(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let out_fd: u64 = ctx_read(ctx, offs.copy_out_fd as usize)?;
-    let len: u64 = ctx_read(ctx, offs.copy_len as usize)?;
-    push_write(KIND_FILE_WRITE, out_fd, len);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_mmap")]
-fn electric_eye_mmap(ctx: TracePointContext) -> i32 {
-    match try_mmap(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_mmap(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let len: u64 = ctx_read(ctx, offs.mmap_len as usize)?;
-    let prot: u64 = ctx_read(ctx, offs.mmap_prot as usize)?;
-    let flags: u64 = ctx_read(ctx, offs.mmap_flags as usize)?;
-    let fd: u64 = ctx_read(ctx, offs.mmap_fd as usize)?;
-    const PROT_WRITE: u64 = 0x2;
-    const MAP_SHARED: u64 = 0x1;
-    if prot & PROT_WRITE == 0 || flags & MAP_SHARED == 0 || fd > i32::MAX as u64 {
-        return Ok(());
-    }
-    push_write(KIND_FILE_MMAP, fd, len);
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_accept")]
-fn electric_eye_accept_enter(ctx: TracePointContext) -> i32 {
-    match note_accept(&ctx, false) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-#[tracepoint(category = "syscalls", name = "sys_exit_accept")]
-fn electric_eye_accept_exit(ctx: TracePointContext) -> i32 {
-    match finish_accept(&ctx, false) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_accept4")]
-fn electric_eye_accept4_enter(ctx: TracePointContext) -> i32 {
-    match note_accept(&ctx, true) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-#[tracepoint(category = "syscalls", name = "sys_exit_accept4")]
-fn electric_eye_accept4_exit(ctx: TracePointContext) -> i32 {
-    match finish_accept(&ctx, true) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn note_accept(ctx: &TracePointContext, accept4: bool) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let (fd_off, peer_off, len_off) = if accept4 {
-        (offs.accept4_fd, offs.accept4_sockaddr, offs.accept4_addrlen)
+    if family == 2 {
+        let a: [u8; 4] = unsafe { ctx.read_at(at as usize).unwrap_or([0; 4]) };
+        e.addr[..4].copy_from_slice(&a);
     } else {
-        (offs.accept_fd, offs.accept_sockaddr, offs.accept_addrlen)
-    };
-    let listen_fd: u32 = ctx_read(ctx, fd_off as usize)?;
-    let peer: u64 = ctx_read(ctx, peer_off as usize)?;
-    let peer_len: u64 = ctx_read(ctx, len_off as usize)?;
-    let key = current_tid();
-    let _ = PENDING_ACCEPT.insert(
-        &key,
-        PendingAccept {
-            peer,
-            peer_len,
-            listen_fd,
-        },
-        0,
-    );
+        e.addr = unsafe { ctx.read_at(at as usize).unwrap_or([0; 16]) };
+    }
+    slot.submit(0);
     Ok(())
 }
-
-fn finish_accept(ctx: &TracePointContext, accept4: bool) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let key = current_tid();
-    let Some(pending) = PENDING_ACCEPT.get_ptr(&key).map(|p| unsafe { *p }) else {
-        return Ok(());
-    };
-    let _ = PENDING_ACCEPT.remove(&key);
-    let ret_offset = if accept4 {
-        offs.accept4_ret
-    } else {
-        offs.accept_ret
-    };
-    let ret: i64 = ctx_read(ctx, ret_offset as usize)?;
-    if ret < 0 || ret > u32::MAX as i64 {
-        return Ok(());
-    }
-    let (family, addr, port) = read_sockaddr(pending.peer);
-    let Ok(comm) = current_comm() else {
-        return Ok(());
-    };
-    let (pid, uid) = current_ids();
-    push_record(RawAcceptEvent {
-        kind: KIND_ACCEPT,
-        pid,
-        uid,
-        fd: ret as u32,
-        listen_fd: pending.listen_fd,
-        family,
-        port: port as u32,
-        addr,
-        comm,
-    });
-    Ok(())
-}
-
-fn read_sockaddr(peer: u64) -> (u32, [u8; 16], u16) {
-    let mut addr = [0u8; 16];
-    if peer == 0 {
-        return (0, addr, 0);
-    }
-    let family: u16 = match unsafe { bpf_probe_read_user(peer as *const u16) } {
-        Ok(value) => value,
-        Err(_) => return (0, addr, 0),
-    };
-    let port_be: u16 = match unsafe { bpf_probe_read_user((peer + 2) as *const u16) } {
-        Ok(value) => value,
-        Err(_) => return (0, addr, 0),
-    };
-    let port = u16::from_be(port_be);
-    match family {
-        AF_INET => {
-            let raw: [u8; 4] = match unsafe { bpf_probe_read_user((peer + 4) as *const [u8; 4]) } {
-                Ok(value) => value,
-                Err(_) => return (0, [0; 16], 0),
-            };
-            addr[..4].copy_from_slice(&raw);
-        }
-        AF_INET6 => {
-            addr = match unsafe { bpf_probe_read_user((peer + 8) as *const [u8; 16]) } {
-                Ok(value) => value,
-                Err(_) => return (0, [0; 16], 0),
-            };
-        }
-        _ => return (0, [0; 16], 0),
-    }
-    (family as u32, addr, port)
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_dup2")]
-fn electric_eye_dup2(ctx: TracePointContext) -> i32 {
-    match try_dup(&ctx, false) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_dup3")]
-fn electric_eye_dup3(ctx: TracePointContext) -> i32 {
-    match try_dup(&ctx, true) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_dup(ctx: &TracePointContext, dup3: bool) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let (old_off, new_off) = if dup3 {
-        (offs.dup3_oldfd, offs.dup3_newfd)
-    } else {
-        (offs.dup2_oldfd, offs.dup2_newfd)
-    };
-    let oldfd: u32 = ctx_read(ctx, old_off as usize)?;
-    let newfd: u32 = ctx_read(ctx, new_off as usize)?;
-    let Ok(comm) = current_comm() else {
-        return Ok(());
-    };
-    let (pid, uid) = current_ids();
-    push_record(RawFdEvent {
-        kind: KIND_FD_DUP,
-        pid,
-        uid,
-        oldfd,
-        newfd,
-        comm,
-    });
-    Ok(())
-}
-
-#[tracepoint(category = "syscalls", name = "sys_enter_close")]
-fn electric_eye_close(ctx: TracePointContext) -> i32 {
-    match try_close(&ctx) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn try_close(ctx: &TracePointContext) -> Result<(), ()> {
-    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
-    let fd: u32 = ctx_read(ctx, offs.close_fd as usize)?;
-    let Ok(comm) = current_comm() else {
-        return Ok(());
-    };
-    let (pid, uid) = current_ids();
-    push_record(RawFdEvent {
-        kind: KIND_FD_CLOSE,
-        pid,
-        uid,
-        oldfd: fd,
-        newfd: 0,
-        comm,
-    });
-    Ok(())
-}
-
+// Byte deltas are immutable events. There is no PID-indexed counter map to
+// fill, reset, race with readers, or confuse with a reused process identifier.
 #[kretprobe]
 fn electric_eye_tcp_sent(ctx: RetProbeContext) -> i32 {
-    match try_traffic(&ctx, true) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
+    traffic(&ctx, SENT);
+    0
 }
-
 #[kretprobe]
 fn electric_eye_tcp_recv(ctx: RetProbeContext) -> i32 {
-    match try_traffic(&ctx, false) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
+    traffic(&ctx, RECEIVED);
+    0
 }
-
 #[kretprobe]
 fn electric_eye_udp_sent(ctx: RetProbeContext) -> i32 {
-    match try_traffic(&ctx, true) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
+    traffic(&ctx, SENT);
+    0
 }
-
 #[kretprobe]
 fn electric_eye_udp_recv(ctx: RetProbeContext) -> i32 {
-    match try_traffic(&ctx, false) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
+    traffic(&ctx, RECEIVED);
+    0
 }
-
-fn try_traffic(ctx: &RetProbeContext, sent: bool) -> Result<(), ()> {
+fn traffic(ctx: &RetProbeContext, kind: u32) {
     let ret: i32 = ctx.ret();
     if ret <= 0 {
-        return Ok(());
+        return;
     }
-
-    let (pid, _) = current_ids();
-    unsafe {
-        match NET_BYTES.get_ptr_mut(&pid) {
-            Some(p) => {
-                let totals = &mut *p;
-                if sent {
-                    totals.sent += ret as u64;
-                } else {
-                    totals.recv += ret as u64;
-                }
-            }
-            None => {
-                let totals = NetTotals {
-                    sent: if sent { ret as u64 } else { 0 },
-                    recv: if sent { 0 } else { ret as u64 },
-                };
-                let _ = NET_BYTES.insert(&pid, totals, 0);
-            }
-        }
+    let Ok(o) = offsets() else {
+        return;
+    };
+    let Some(mut slot) = EVENTS.reserve::<Record>(0) else {
+        dropped(DROP_RING);
+        return;
+    };
+    let e = unsafe { &mut *slot.as_mut_ptr() };
+    if !fill_identity(e, &o) {
+        slot.discard(0);
+        return;
     }
-    Ok(())
+    e.kind = kind;
+    e.count = ret as u64;
+    slot.submit(0);
 }
-
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }

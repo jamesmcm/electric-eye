@@ -149,6 +149,11 @@ impl Allowlist {
 #[derive(Debug, Clone, Serialize)]
 pub struct Incident {
     pub ts_ms: u64,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<crate::api::ProcessIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
     pub severity: Severity,
     pub title: String,
     pub pid: u32,
@@ -186,9 +191,22 @@ impl AnomalyEngine {
 
     pub fn observe(&mut self, entry: &ActivityEntry) -> Vec<Incident> {
         let mut incidents = Vec::new();
+        if entry.syscall_result.is_some_and(|result| result < 0)
+            || matches!(
+                entry.path_resolution.as_deref(),
+                Some("unresolved" | "lexical")
+            )
+        {
+            return incidents;
+        }
         self.observe_paths(entry, &mut incidents);
         self.observe_exec(entry, &mut incidents);
         self.observe_network(entry, &mut incidents);
+        for incident in &mut incidents {
+            incident.id = incident_id();
+            incident.process = entry.process.clone();
+            incident.exe = entry.exe.clone();
+        }
         incidents
     }
 
@@ -225,27 +243,27 @@ impl AnomalyEngine {
 
         let (pid, uid, comm) = event_identity(&entry.event);
         let app = app_key(entry);
+        let actor = timeline_key(entry);
         let home = self.home_for(uid);
         let now = entry.ts_ms;
         let mut categories = Vec::new();
         let mutation = matches!(
             &entry.event,
             ObservedEvent::FileUnlink(_) | ObservedEvent::FileRename(_)
-        );
+        ) || matches!(&entry.event, ObservedEvent::FileWrite(e) if e.kind==FileKind::Write)
+            || matches!(&entry.event, ObservedEvent::FileOpen(e) if e.kind==FileKind::Truncate
+            );
 
         for path in &paths {
             if self.allowlist.allows_identity(&comm, &app, path) {
                 continue;
             }
             let known = self.baseline.knows_path(&app, path);
-            if mutation && !known && !is_bulk_noise_path(path) {
+            if mutation && !is_bulk_noise_path(path) {
                 self.mutations
-                    .entry(app.clone())
+                    .entry(actor.clone())
                     .or_default()
                     .push_back((now, (*path).to_string()));
-            }
-            if known {
-                continue;
             }
             if let Some((category, severity)) = classify_with_home(path, home.as_deref()) {
                 if category == "Browser credentials" && is_browser_app(&app) {
@@ -253,8 +271,11 @@ impl AnomalyEngine {
                 }
                 categories.push(category);
                 let title = format!("Sensitive path access: {category}");
-                if self.should_emit(&title, &app, Some(path), now) {
+                if !known && self.should_emit(&title, &app, Some(path), now) {
                     incidents.push(Incident {
+                        id: String::new(),
+                        process: None,
+                        exe: None,
                         ts_ms: now,
                         severity,
                         title,
@@ -278,6 +299,9 @@ impl AnomalyEngine {
                 let title = "Write attempted under /nix/store".to_string();
                 if self.should_emit(&title, &app, Some(path), now) {
                     incidents.push(Incident {
+                        id: String::new(),
+                        process: None,
+                        exe: None,
                         ts_ms: now,
                         severity: Severity::High,
                         title,
@@ -297,7 +321,7 @@ impl AnomalyEngine {
         }
 
         if !categories.is_empty() {
-            let window = self.sensitive.entry(app.clone()).or_default();
+            let window = self.sensitive.entry(actor.clone()).or_default();
             for category in categories {
                 window.push_back((now, category));
             }
@@ -312,6 +336,9 @@ impl AnomalyEngine {
                 let title = "Credential sweep across multiple sensitive categories".to_string();
                 if self.should_emit(&title, &app, None, now) {
                     incidents.push(Incident {
+                        id: String::new(),
+                        process: None,
+                        exe: None,
                         ts_ms: now,
                         severity: Severity::High,
                         title,
@@ -329,23 +356,24 @@ impl AnomalyEngine {
             }
         }
 
-        self.observe_bulk(pid, &app, &comm, entry.unit.as_deref(), now, incidents);
+        self.observe_bulk(entry, &app, &actor, incidents);
     }
 
     fn observe_bulk(
         &mut self,
-        pid: u32,
+        entry: &ActivityEntry,
         app: &str,
-        comm: &str,
-        unit: Option<&str>,
-        now: u64,
+        actor: &str,
         incidents: &mut Vec<Incident>,
     ) {
+        let (pid, _, comm) = event_identity(&entry.event);
+        let now = entry.ts_ms;
+        let unit = entry.unit.as_deref();
         if is_high_churn_app(app) {
             return;
         }
         let unique_count = {
-            let Some(window) = self.mutations.get_mut(app) else {
+            let Some(window) = self.mutations.get_mut(actor) else {
                 return;
             };
             while window
@@ -361,6 +389,9 @@ impl AnomalyEngine {
             let title = "Bulk filesystem mutation".to_string();
             if self.should_emit(&title, app, None, now) {
                 incidents.push(Incident {
+                    id: String::new(),
+                    process: None,
+                    exe: None,
                     ts_ms: now,
                     severity: Severity::Medium,
                     title,
@@ -392,6 +423,9 @@ impl AnomalyEngine {
         let title = "Executable launched from a suspicious location".to_string();
         if self.should_emit(&title, &event.comm, Some(&exe), entry.ts_ms) {
             incidents.push(Incident {
+                id: String::new(),
+                process: None,
+                exe: None,
                 ts_ms: entry.ts_ms,
                 severity: Severity::Medium,
                 title,
@@ -431,7 +465,7 @@ impl AnomalyEngine {
         }
 
         let recent = {
-            let Some(window) = self.sensitive.get(&app) else {
+            let Some(window) = self.sensitive.get(&timeline_key(entry)) else {
                 self.maybe_novel_network(entry, net, &app, &destination, incidents);
                 return;
             };
@@ -445,6 +479,9 @@ impl AnomalyEngine {
             let title = "Sensitive path access followed by network egress".to_string();
             if self.should_emit(&title, &app, None, entry.ts_ms) {
                 incidents.push(Incident {
+                    id: String::new(),
+                    process: None,
+                    exe: None,
                     ts_ms: entry.ts_ms,
                     severity: Severity::High,
                     title,
@@ -497,6 +534,9 @@ impl AnomalyEngine {
         let title = "Novel network destination".to_string();
         if self.should_emit(&title, app, Some(destination), entry.ts_ms) {
             incidents.push(Incident {
+                id: String::new(),
+                process: None,
+                exe: None,
                 ts_ms: entry.ts_ms,
                 severity: Severity::Medium,
                 title,
@@ -533,6 +573,29 @@ impl AnomalyEngine {
         let home = home_for_uid(uid);
         self.homes.insert(uid, home.clone());
         home
+    }
+}
+
+fn incident_id() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| {
+            format!(
+                "{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        })
+}
+fn timeline_key(entry: &ActivityEntry) -> String {
+    match &entry.process {
+        Some(p) => format!("{}:{}:{}", p.boot_id, p.pid, p.start_ns),
+        None => format!("{}:{}", event_identity(&entry.event).0, app_key(entry)),
     }
 }
 
@@ -859,6 +922,9 @@ mod tests {
             AnomalyEngine::with_context(BaselineData::default(), Allowlist::load_default());
         let entry = ActivityEntry {
             ts_ms: 1_000,
+            syscall_result: None,
+            process: None,
+            path_resolution: None,
             event: ObservedEvent::FileRead(electric_eye_core::FileEvent {
                 pid: 10,
                 uid: 0,
@@ -882,6 +948,9 @@ mod tests {
             AnomalyEngine::with_context(BaselineData::default(), Allowlist::load_default());
         let entry = ActivityEntry {
             ts_ms: 1_000,
+            syscall_result: None,
+            process: None,
+            path_resolution: None,
             event: ObservedEvent::FileRead(electric_eye_core::FileEvent {
                 pid: 10,
                 uid: 1000,
@@ -904,6 +973,9 @@ mod tests {
         let mut engine = AnomalyEngine::new();
         let entry = ActivityEntry {
             ts_ms: 1_000,
+            syscall_result: None,
+            process: None,
+            path_resolution: None,
             event: ObservedEvent::FileWrite(electric_eye_core::FileEvent {
                 pid: 10,
                 uid: 1000,
@@ -930,5 +1002,137 @@ mod tests {
         assert!(is_high_churn_app("transmission-gtk"));
         assert!(is_high_churn_app("/usr/lib/firefox/firefox"));
         assert!(!is_high_churn_app("/usr/bin/python3"));
+    }
+}
+
+#[cfg(test)]
+mod correlation_regressions {
+    use super::*;
+    use electric_eye_core::{FileEvent, TrafficSummary};
+    fn file(path: &str, kind: FileKind) -> ActivityEntry {
+        let e = FileEvent {
+            pid: 123,
+            uid: 1000,
+            comm: "test-app".into(),
+            path: path.into(),
+            kind,
+            bytes: Some(1),
+            count: Some(1),
+        };
+        ActivityEntry {
+            ts_ms: 1_000_000,
+            syscall_result: None,
+            process: Some(crate::api::ProcessIdentity {
+                pid: 123,
+                start_ns: 1,
+                boot_id: "boot".into(),
+            }),
+            path_resolution: Some("kernel".into()),
+            event: if kind == FileKind::Read {
+                ObservedEvent::FileRead(e)
+            } else {
+                ObservedEvent::FileWrite(e)
+            },
+            unit: None,
+            nix: None,
+            parent: None,
+            exe: Some("/opt/test-app".into()),
+        }
+    }
+    fn network() -> ActivityEntry {
+        let mut e = file("", FileKind::Read);
+        e.event = ObservedEvent::Connect(NetEvent {
+            pid: 123,
+            uid: 1000,
+            comm: "test-app".into(),
+            family: 2,
+            addr: [8, 8, 8, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            local_port: 1234,
+            remote_port: 443,
+            hostname: None,
+            fd: None,
+        });
+        e
+    }
+    #[test]
+    fn known_credentials_still_feed_sweep_and_egress() {
+        let paths = [
+            "/root/.ssh/key",
+            "/root/.aws/credentials",
+            "/root/.gnupg/key",
+        ];
+        let baseline = BaselineData::from_pairs(
+            paths
+                .iter()
+                .map(|p| ("/opt/test-app".into(), p.to_string())),
+            [],
+        );
+        let mut engine = AnomalyEngine::with_context(baseline, Allowlist::default());
+        let mut incidents = Vec::new();
+        for path in paths {
+            incidents.extend(engine.observe(&file(path, FileKind::Read)));
+        }
+        incidents.extend(engine.observe(&network()));
+        assert!(
+            !incidents
+                .iter()
+                .any(|i| i.details["rule"] == "sensitive_path")
+        );
+        assert!(
+            incidents
+                .iter()
+                .any(|i| i.details["rule"] == "credential_sweep")
+        );
+        assert!(
+            incidents
+                .iter()
+                .any(|i| i.details["rule"] == "sensitive_egress")
+        );
+        assert!(
+            incidents
+                .iter()
+                .all(|i| !i.id.is_empty() && i.process.is_some() && i.exe.is_some())
+        );
+    }
+    #[test]
+    fn known_document_overwrites_trigger_bulk_rule() {
+        let paths: Vec<_> = (0..60)
+            .map(|i| format!("/home/review/Documents/{i}.txt"))
+            .collect();
+        let baseline = BaselineData::from_pairs(
+            paths.iter().map(|p| ("/opt/test-app".into(), p.clone())),
+            [],
+        );
+        let mut engine = AnomalyEngine::with_context(baseline, Allowlist::default());
+        let incidents: Vec<_> = paths
+            .iter()
+            .flat_map(|p| engine.observe(&file(p, FileKind::Write)))
+            .collect();
+        assert!(
+            incidents
+                .iter()
+                .any(|i| i.details["rule"] == "bulk_mutation")
+        );
+    }
+    #[test]
+    fn credential_access_does_not_cross_process_generations() {
+        let mut engine = AnomalyEngine::new();
+        engine.observe(&file("/root/.ssh/key", FileKind::Read));
+        let mut net = network();
+        net.process.as_mut().unwrap().start_ns = 2;
+        assert!(
+            !engine
+                .observe(&net)
+                .iter()
+                .any(|i| i.details["rule"] == "sensitive_egress")
+        );
+        // Process traffic summaries do not by themselves create egress events.
+        net.event = ObservedEvent::Traffic(TrafficSummary {
+            pid: 123,
+            comm: "test-app".into(),
+            sent: 10,
+            recv: 0,
+        });
+        assert!(engine.observe(&net).is_empty());
     }
 }

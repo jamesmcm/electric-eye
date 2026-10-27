@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 10;
 
@@ -29,10 +27,6 @@ struct ProcNetTcp {
     inode: u64,
 }
 
-pub fn resolve_exe(pid: u32) -> Option<PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-}
-
 pub fn process_stat(pid: u32) -> Option<ProcessStat> {
     let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_stat(&raw)
@@ -50,16 +44,6 @@ pub fn parse_stat(raw: &str) -> Option<ProcessStat> {
     })
 }
 
-pub fn argv0(pid: u32) -> Option<String> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let first = raw.split(|b| *b == 0).next()?;
-    if first.is_empty() {
-        None
-    } else {
-        Some(String::from_utf8_lossy(first).into_owned())
-    }
-}
-
 pub fn systemd_unit(pid: u32) -> Option<String> {
     let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     let line = cgroup.lines().find_map(|line| {
@@ -69,19 +53,6 @@ pub fn systemd_unit(pid: u32) -> Option<String> {
     let unit = line.rsplit('/').next()?.to_string();
     if (unit.ends_with(".scope") || unit.ends_with(".service")) && !unit.is_empty() {
         Some(unit)
-    } else {
-        None
-    }
-}
-
-/// Resolves an open file descriptor to a path. Returns None for sockets,
-/// pipes, anonymous inodes and fds that vanished before we looked.
-pub fn resolve_fd_path(pid: u32, fd: u32) -> Option<PathBuf> {
-    let target = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
-    let text = target.to_string_lossy();
-    let path = text.strip_suffix(" (deleted)").unwrap_or(&text);
-    if path.starts_with('/') {
-        Some(PathBuf::from(path))
     } else {
         None
     }
@@ -192,26 +163,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_own_executable() {
-        let exe = resolve_exe(std::process::id()).expect("test binary must have /proc/self/exe");
-        assert!(exe.exists());
-    }
-
-    #[test]
-    fn reads_own_argv0() {
-        let argv = argv0(std::process::id());
-        assert!(argv.is_some());
-    }
-
-    #[test]
-    fn missing_process_yields_none() {
-        let bogus = find_absent_pid();
-        assert!(resolve_exe(bogus).is_none());
-        assert!(argv0(bogus).is_none());
-        assert!(systemd_unit(bogus).is_none());
-    }
-
-    #[test]
     fn parses_stat_with_parens_in_comm() {
         let raw = "123 (chrome:renderer) S 456 123 123 0 -1 4194560 ".to_owned()
             + &"0 ".repeat(12)
@@ -256,14 +207,5 @@ mod tests {
         assert_eq!(rows[0].inode, 2641095);
         assert_eq!(rows[1].remote_port, 0x3039);
         assert_eq!(rows[1].state, "01");
-    }
-
-    fn find_absent_pid() -> u32 {
-        for candidate in (u16::MAX as u32..u16::MAX as u32 + 4096).rev() {
-            if !std::path::Path::new(&format!("/proc/{candidate}")).exists() {
-                return candidate;
-            }
-        }
-        panic!("no free pid found for the test");
     }
 }

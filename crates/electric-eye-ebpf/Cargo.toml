@@ -18,6 +18,7 @@ debug-assertions = false
 overflow-checks = false
 
 [profile.release]
+debug = 2
 lto = true
 panic = "abort"
 codegen-units = 1

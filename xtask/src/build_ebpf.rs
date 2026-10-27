@@ -22,6 +22,14 @@ pub fn build(project_root: &Path) -> Result<()> {
         .envs(spawn_env())
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("RUSTC", &nightly_rustc)
+        // bpf_loop callbacks require BTF function metadata.
+        .env(
+            "RUSTFLAGS",
+            format!(
+                "{} -C link-arg=--btf",
+                std::env::var("RUSTFLAGS").unwrap_or_default()
+            ),
+        )
         .current_dir(&ebpf_dir)
         .status()
         .context("failed to spawn rustup-managed cargo for the eBPF build")?;

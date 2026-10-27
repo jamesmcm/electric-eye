@@ -1,8 +1,10 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,9 +18,22 @@ pub const DEFAULT_SOCKET: &str = "/run/electric-eye/electric-eye.sock";
 const ACTIVITY_LIMIT: usize = 2048;
 const CLIENT_TIMEOUT: Duration = Duration::from_millis(500);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_ns: u64,
+    pub boot_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ActivityEntry {
     pub ts_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syscall_result: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_resolution: Option<String>,
     pub event: ObservedEvent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
@@ -46,6 +61,7 @@ pub struct SharedState {
     apps: HashMap<String, AppStat>,
     incidents: VecDeque<Value>,
     store: Option<StoreClient>,
+    capture_loss: Vec<u64>,
 }
 
 impl SharedState {
@@ -59,10 +75,20 @@ impl SharedState {
             apps: HashMap::new(),
             incidents: VecDeque::new(),
             store: None,
+            capture_loss: vec![],
         }
     }
 
     pub fn record_incident(&mut self, incident: Value) {
+        if let Some(id) = incident["id"].as_str()
+            && let Some(existing) = self
+                .incidents
+                .iter_mut()
+                .find(|item| item["id"].as_str() == Some(id))
+        {
+            *existing = incident;
+            return;
+        }
         self.incidents.push_back(incident);
         while self.incidents.len() > 200 {
             self.incidents.pop_front();
@@ -79,6 +105,10 @@ impl SharedState {
 
     pub fn store_client(&self) -> Option<StoreClient> {
         self.store.clone()
+    }
+
+    pub fn set_capture_loss(&mut self, counts: Vec<u64>) {
+        self.capture_loss = counts;
     }
 
     pub fn set_probes(&mut self, attached: Vec<String>, skipped: Vec<String>) {
@@ -105,7 +135,7 @@ impl SharedState {
     }
 
     pub fn status_value(&self) -> Value {
-        let mut value = json!({
+        json!({
             "daemon": "electric-eyed",
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
@@ -115,13 +145,8 @@ impl SharedState {
             "skipped_probes": self.skipped,
             "events_total": self.events_total,
             "activity_buffered": self.activity.len(),
-        });
-        value["store"] = self
-            .store
-            .as_ref()
-            .map(StoreClient::status_value)
-            .unwrap_or(Value::Null);
-        value
+            "capture_loss": self.capture_loss,
+        })
     }
 
     pub fn activity_value(&self, limit: usize) -> Value {
@@ -214,31 +239,116 @@ pub fn bind_socket(path: &Path) -> io::Result<SocketGuard> {
     })
 }
 
-pub fn serve_pending(socket: &SocketGuard, state: &Arc<Mutex<SharedState>>) {
-    loop {
-        match socket.listener.accept() {
-            Ok((stream, _addr)) => {
-                if let Err(err) = handle_client(stream, state) {
-                    log::warn!("api client failed: {err}");
+const API_WORKERS: usize = 4;
+const MAX_REQUEST_BYTES: usize = 16 * 1024;
+
+pub struct ApiServer {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+impl ApiServer {
+    pub fn start(socket: SocketGuard, state: Arc<Mutex<SharedState>>) -> io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let join = std::thread::Builder::new()
+            .name("electric-eye-api".into())
+            .spawn(move || {
+                let mut workers = Vec::new();
+                let mut queues = Vec::new();
+                for _ in 0..API_WORKERS {
+                    let (tx, rx) = sync_channel::<UnixStream>(1);
+                    let state = Arc::clone(&state);
+                    workers.push(std::thread::spawn(move || {
+                        while let Ok(stream) = rx.recv() {
+                            if let Err(err) = handle_client(stream, &state) {
+                                log::debug!("API request rejected: {err}");
+                            }
+                        }
+                    }));
+                    queues.push(tx);
                 }
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-            Err(err) => {
-                log::warn!("api accept failed: {err}");
-                break;
-            }
+                let mut next = 0;
+                while !stopping.load(Ordering::Relaxed) {
+                    for _ in 0..16 {
+                        match socket.listener.accept() {
+                            Ok((mut stream, _)) => {
+                                for _ in 0..API_WORKERS {
+                                    let index = next;
+                                    next = (next + 1) % API_WORKERS;
+                                    match queues[index].try_send(stream) {
+                                        Ok(()) => break,
+                                        Err(TrySendError::Full(s)) => {
+                                            stream = s;
+                                        }
+                                        Err(TrySendError::Disconnected(_)) => break,
+                                    }
+                                }
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(err) => {
+                                log::warn!("API accept: {err}");
+                                break;
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                drop(queues);
+                for worker in workers {
+                    let _ = worker.join();
+                }
+                drop(socket);
+            })?;
+        Ok(Self {
+            stop,
+            join: Some(join),
+        })
+    }
+}
+impl Drop for ApiServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
         }
     }
 }
-
-fn handle_client(stream: UnixStream, state: &Arc<Mutex<SharedState>>) -> io::Result<()> {
-    stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
-    stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
-    let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "API request deadline exceeded"))
+}
+fn read_request(stream: &mut UnixStream) -> io::Result<String> {
+    let deadline = Instant::now() + CLIENT_TIMEOUT;
+    let mut line = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete API request",
+            ));
+        }
+        let end = buf[..n].iter().position(|b| *b == b'\n');
+        let count = end.unwrap_or(n);
+        if line.len() + count > MAX_REQUEST_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "API request too large",
+            ));
+        }
+        line.extend_from_slice(&buf[..count]);
+        if end.is_some() {
+            return String::from_utf8(line)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        }
+    }
+}
+fn handle_client(mut stream: UnixStream, state: &Arc<Mutex<SharedState>>) -> io::Result<()> {
+    let line = read_request(&mut stream)?;
     let request: Value = serde_json::from_str(line.trim()).unwrap_or_else(|_| json!({}));
     let op = request["op"].as_str().unwrap_or_default();
     let limit = request["limit"]
@@ -253,7 +363,14 @@ fn handle_client(stream: UnixStream, state: &Arc<Mutex<SharedState>>) -> io::Res
     let no_store = || json!({ "error": "persistence disabled (--no-db or database unavailable)" });
 
     let response = match op {
-        "status" => state.lock().unwrap().status_value(),
+        "status" => {
+            let mut value = state.lock().unwrap().status_value();
+            value["store"] = store
+                .as_ref()
+                .map(StoreClient::status_value)
+                .unwrap_or(Value::Null);
+            value
+        }
         "activity" => {
             let mut value = state.lock().unwrap().activity_value(limit);
             if let Some(store) = &store
@@ -316,9 +433,22 @@ fn handle_client(stream: UnixStream, state: &Arc<Mutex<SharedState>>) -> io::Res
         other => json!({ "error": format!("unknown op {other}") }),
     };
 
-    serde_json::to_writer(&mut writer, &response)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
+    let mut response = serde_json::to_vec(&response)?;
+    response.push(b'\n');
+    let deadline = Instant::now() + CLIENT_TIMEOUT;
+    let mut written = 0;
+    while written < response.len() {
+        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        let n = stream.write(&response[written..])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "API client closed",
+            ));
+        }
+        written += n;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -330,6 +460,9 @@ mod tests {
     fn entry(pid: u32, comm: &str) -> ActivityEntry {
         ActivityEntry {
             ts_ms: now_ms(),
+            syscall_result: None,
+            process: None,
+            path_resolution: None,
             event: ObservedEvent::Exec(ExecEvent {
                 pid,
                 ppid: 1,
@@ -363,6 +496,9 @@ mod tests {
         state.record(entry(1, "curl"));
         state.record(ActivityEntry {
             ts_ms: now_ms(),
+            syscall_result: None,
+            process: None,
+            path_resolution: None,
             event: ObservedEvent::FileUnlink(FileEvent {
                 pid: 1,
                 uid: 1000,
@@ -380,5 +516,63 @@ mod tests {
         let value = state.apps_value();
         assert_eq!(value["apps"][0]["comm"], "curl");
         assert_eq!(value["apps"][0]["events"], 2);
+    }
+}
+
+#[cfg(test)]
+mod request_regressions {
+    use super::*;
+    #[test]
+    fn rejects_oversized_lines() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            let _ = client.write_all(&vec![b'x'; MAX_REQUEST_BYTES + 1]);
+        });
+        assert_eq!(
+            read_request(&mut server).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        writer.join().unwrap();
+    }
+    #[test]
+    fn deadline_is_absolute_even_when_client_keeps_sending() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..15 {
+                if client.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let start = Instant::now();
+        assert!(read_request(&mut server).is_err());
+        assert!(start.elapsed() < Duration::from_millis(750));
+        drop(server);
+        writer.join().unwrap();
+    }
+    #[test]
+    fn slow_client_does_not_block_another_request_or_capture_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("api.sock");
+        let socket = bind_socket(&path).unwrap();
+        let state = Arc::new(Mutex::new(SharedState::new()));
+        let server = ApiServer::start(socket, Arc::clone(&state)).unwrap();
+        let _slow = UnixStream::connect(&path).unwrap();
+        let start = Instant::now();
+        state.lock().unwrap().set_capture_loss(vec![1]);
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        client.write_all(b"{\"op\":\"status\"}\n").unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["capture_loss"][0],
+            1
+        );
+        assert!(start.elapsed() < Duration::from_millis(450));
+        drop(server);
     }
 }

@@ -10,18 +10,24 @@ attribution plus a small local query API.
 
 ## What works
 
-- `EXEC` / `EXIT` with pid, ppid, uid and stable `(pid, start_ticks)` identity
+- `EXEC` / `EXIT` with pid, ppid where available, uid and kernel-captured
+  `(boot_id, pid, start_ns)` identity (`start_ticks` remains on EXEC)
 - `CONNECT`, `LISTEN` and `ACCEPT` for IPv4/IPv6 TCP. ACCEPT is captured at
   `accept()`/`accept4()` exit, so it is attributed to the accepting server
   rather than the packet-processing context.
 - `OPEN` / `CREATE` / `TRUNC` for writable opens, and aggregated actual-write
   summaries for `write(2)`, `writev`, `pwrite64`, `pwritev`, `sendfile`,
-  `copy_file_range` and writable shared `mmap` mappings (including fd
-  redirection via `dup2`/`dup3`)
+  `pwritev2`, `copy_file_range` and writable shared `mmap` intent. File
+  paths are captured from kernel file objects, including inherited or duplicated
+  descriptors; successful writes use returned byte counts
 - filtered read-open capture for sensitive paths via an in-kernel LPM trie;
   credential reads are observable without reporting every read-only open
-- `unlink`/`unlinkat`/`rmdir` and `rename`/`renameat`/`renameat2`
-- per-process TCP/UDP sent/received byte totals (top-N every 5 seconds)
+- `unlink`/`unlinkat`/`rmdir` and `rename`/`renameat`/`renameat2`, completed
+  at syscall exit. Failed file operations have negative `syscall_result` values
+  and `.attempt` history kinds; they do not add written bytes or trigger
+  success-based correlations
+- per-process TCP/UDP sent/received byte totals from immutable return-value
+  deltas; all process totals reach history, with top-N stdout every 5 seconds
 - systemd unit and Nix store-path suffixes on human output
 - JSON Lines output (`--json`) and a read-only Unix socket API
 - SQLite persistence with a background writer, 5-minute raw retention,
@@ -39,10 +45,19 @@ attribution plus a small local query API.
   default
 - `electric-eye status|activity|apps|app|file|network|why|incidents`
 
-Kernel events are collected with Aya. Tracepoint offsets are discovered from
-the live kernel's tracefs at startup, so the object is not tied to a specific
-kernel build. A single perf attachment enables each tracepoint/kprobe
-system-wide; the kernel's BPF program array is shared by all CPUs.
+Kernel events are collected with Aya. Kernel BTF and tracefs supply live struct
+and tracepoint offsets, so the object is not tied to a specific kernel build.
+Linux **5.17 or newer**, kernel BTF, and raw syscall tracepoints are required.
+The BPF build includes BTF function metadata for bounded path-walking callbacks;
+rebuild both userspace and the BPF object when updating the event ABI.
+
+A single perf attachment enables each tracepoint/kprobe across CPUs. Capture is
+scoped to the daemon's PID namespace: running on the host observes the system,
+while a daemon inside LXC observes its container. Paths use the monitored task's
+filesystem root and mount namespace. `path_resolution` identifies exact kernel
+paths, lexical fallbacks, or unresolved names; uncertain paths do not trigger
+sensitive-resource correlations. Kernel event losses are exposed in `status` as
+`capture_loss` (ring, pending syscall, identity, and path failures).
 
 ## Build and run (development)
 
@@ -82,13 +97,18 @@ Useful daemon flags:
 The service stores data in `/var/lib/electric-eye/electric-eye.db` via
 systemd's `StateDirectory`. Raw events are retained for 5 minutes, rolled into
 5-minute activity buckets, and activities are retained for 30 days. Incidents
-are stored separately for long-term review.
+are stored separately as complete records with stable IDs, process identities,
+executables, and affected paths. Rename rollups retain both source and destination.
+Existing databases are migrated without deleting history; metadata missing from
+old incident records cannot be reconstructed.
 
 The allowlist is read from `/etc/electric-eye/allowlist.conf` (override with
 `ELECTRIC_EYE_ALLOWLIST`). Each line is `<comm-or-exe> <subject-prefix>`; `*`
 suppresses all rules for that identity. Known paths and network destinations
 from recent events/activities form a baseline at startup, and deterministic
-rules are suppressed for previously seen file paths. Bulk mutation ignores
+standalone sensitive-path novelty alerts are suppressed for previously seen file
+paths. Known credential accesses still feed per-process sweep/egress correlation;
+known document writes and truncations still feed bulk mutation. Bulk mutation ignores
 cache/thumbnail/build directories; novel-network rules are skipped for
 browsers and high-churn P2P clients.
 
@@ -149,25 +169,41 @@ cargo fmt --all -- --check
 ```
 
 Kernel-facing testing that touches the host is run in an isolated Arch LXC
-container (see `tests/lxc/capture-test.sh`). It starts the daemon on the host,
-runs workloads pinned to non-zero CPUs inside the container, and asserts that
-file events are captured from those CPUs.
+container (see `tests/lxc/capture-test.sh`). The daemon and workloads both run
+inside an existing container, as its unprivileged test user; only the observer
+receives BPF/perf/read capabilities. No mounts or package installation are done.
+
+```bash
+EE_LXC_NAME=ee-arch ./tests/lxc/capture-test.sh
+```
+
+The test verifies syscall failures and short writes, cwd/dirfd/symlink paths,
+FD redirection, short-lived writers, aggregation beyond display limits, sensitive
+reads, bulk mutation, TCP/UDP byte totals, ACCEPT endpoints, API responsiveness,
+and incident identity after a daemon restart. Workloads run on a non-zero CPU.
+Test artifacts are retained in fresh container directories for inspection.
 
 ## Known limitations / next steps
 
 - `mmap` coverage reports writable shared mappings as `MMAP` intent; it does
   not track dirty-page writeback. Anonymous/private mappings are ignored.
-- Sensitive read capture matches absolute paths registered in the LPM trie:
-  home sensitive directories, `/etc/ssh`, shadow/sudoers files and browser
-  credential files discovered at startup. Relative-path reads are not
-  resolved for matching.
-- Write syscalls are aggregated into 5-second top-32 summaries; SQLite retains
-  per-process/path totals after the 5-minute raw window.
+- Sensitive read capture filters resolved absolute paths in the LPM trie,
+  including successful relative opens. Home-directory prefixes are populated
+  from `/etc/passwd` at startup; new accounts require a daemon restart.
+- Path snapshots are bounded to 511 bytes and 80 dentry/mount steps. A missing
+  VFS path hook leaves rename/unlink names marked lexical; incomplete walks
+  remain unresolved. These fallbacks are visible in history.
+- Write syscalls are aggregated into 5-second summaries. The top 32 are printed;
+  every aggregate is persisted and every original write is evaluated by rules.
+- API clients use a bounded worker pool, 16 KiB request limit, and absolute
+  request/write deadlines. Journal context is fetched asynchronously with a
+  200 ms subprocess deadline and output limit; base incidents are saved first.
 - Baseline suppression is intentionally conservative: it only suppresses
   already-known file paths, and novelty network alerts require at least five
   known destinations for that application.
 - Quickshell UI, freeze/enforcement and NixOS packaging remain future work.
-- Process ancestry for very short-lived processes can fall back to `(exited)`
-  when `/proc/<pid>` disappears before enrichment.
+- Executable and parent names are captured in the kernel, even for short-lived
+  processes. Optional systemd-unit enrichment can be absent after process exit.
+  Parent PID can be unavailable when observing inside a nested PID namespace.
 - NixOS packaging and NixOS VM tests are deferred until the Arch release is
   stable.

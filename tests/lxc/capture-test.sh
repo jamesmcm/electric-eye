@@ -1,192 +1,87 @@
 #!/usr/bin/env bash
-# Isolated kernel-capture smoke test.
-#
-# The daemon runs on the host (it needs to load BPF into the kernel), while the
-# synthetic workload runs inside an Arch Linux LXC container. Pinning the
-# workload to a non-zero CPU catches the classic "perf attachment only sees CPU
-# 0" regression without running test processes directly on the host.
+# All observer/workload processes run in an existing LXC PID namespace. Root
+# is used only to enter it and grant capabilities before dropping to the test
+# UID. No mounts, package installs, host collectors, or root file writes.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-NAME="${EE_LXC_NAME:-ee-capture-test}"
-CPU="${EE_TEST_CPU:-5}"
-LOG="$(mktemp /tmp/electric-eye-lxc.XXXXXX)"
-SOCKET="$(mktemp -u /tmp/electric-eye-lxc.XXXXXX.sock)"
-DB="$(mktemp -u /tmp/electric-eye-lxc.XXXXXX.db)"
-DAEMON_PID=""
-CREATED=0
-
-cleanup() {
-  if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-    sudo kill -TERM "$DAEMON_PID" 2>/dev/null || true
-    wait "$DAEMON_PID" 2>/dev/null || true
-  fi
-  rm -f "$LOG" "$SOCKET"
-  sudo rm -f "$DB" "$DB-shm" "$DB-wal"
+NAME="${EE_LXC_NAME:-ee-arch}"
+TEST_UID="${EE_LXC_UID:-1000}"
+TEST_GID="${EE_LXC_GID:-1000}"
+LOG_DIR="$(mktemp -d /tmp/electric-eye-capture.XXXXXX)"
+DAEMON_JOB=""
+STAGE=""
+guest() {
+  sudo -n lxc-attach -n "$NAME" -- setpriv \
+    --reuid="$TEST_UID" --regid="$TEST_GID" --clear-groups "$@"
 }
-trap cleanup EXIT
-
-if ! sudo lxc-info -n "$NAME" >/dev/null 2>&1; then
-  echo "==> creating Arch LXC container $NAME"
-  sudo lxc-create -t download -n "$NAME" -- -d archlinux -r current -a amd64
-  sudo sed -i 's/^lxc.net.0.type =.*/lxc.net.0.type = none/' \
-    "/var/lib/lxc/$NAME/config"
-  CREATED=1
-fi
-
-if [[ "$(sudo lxc-info -n "$NAME" -s -H)" != "RUNNING" ]]; then
-  sudo lxc-start -n "$NAME" -d
-fi
-
-for _ in $(seq 1 30); do
-  if sudo lxc-attach -n "$NAME" -- true >/dev/null 2>&1; then
-    break
+stop_daemon() {
+  if [[ -n "$STAGE" ]]; then
+    guest python3 -c '
+import os,signal,socket,json,sys
+from pathlib import Path
+try:
+    pid=int(Path(sys.argv[1]).read_text())
+    with socket.socket(socket.AF_UNIX) as stream:
+        stream.settimeout(2);stream.connect(str(Path(sys.argv[1]).parent/"eye.sock"))
+        stream.sendall(b"{\"op\":\"status\"}\n");data=b""
+        while chunk:=stream.recv(65536):data+=chunk
+    if json.loads(data)["pid"]==pid:os.kill(pid,signal.SIGTERM)
+except (FileNotFoundError,ProcessLookupError,ConnectionRefusedError): pass
+' "$STAGE/daemon.pid" || true
   fi
-  sleep 1
-done
+  if [[ -n "$DAEMON_JOB" ]]; then wait "$DAEMON_JOB" || true; DAEMON_JOB=""; fi
+}
+trap stop_daemon EXIT
 
-if ! sudo lxc-attach -n "$NAME" -- python3 --version >/dev/null 2>&1; then
-  echo "==> installing python3 in the test container"
-  sudo lxc-attach -n "$NAME" -- pacman -Sy --noconfirm python >/dev/null
+if [[ "$(sudo -n lxc-info -n "$NAME" -s -H)" != RUNNING ]]; then
+  echo "An existing running LXC container is required: $NAME" >&2
+  exit 1
 fi
-
+guest python3 --version
+STAGE="$(guest mktemp -d /tmp/electric-eye-regression.XXXXXX)"
 cd "$ROOT"
-echo "==> building userspace and eBPF object"
-cargo xtask build-ebpf >/dev/null
-cargo build --release -p electric-eyed -p electric-eye-cli >/dev/null
-
-echo "==> starting daemon (socket $SOCKET)"
-sudo stdbuf -oL -eL ./target/release/electric-eyed \
-  --json --socket "$SOCKET" --db "$DB" >"$LOG" 2>&1 &
-DAEMON_PID=$!
-
-for _ in $(seq 1 50); do
-  if grep -q "streaming events:" "$LOG"; then
-    break
-  fi
-  if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-    echo "daemon exited during startup:" >&2
-    cat "$LOG" >&2
-    exit 1
-  fi
-  sleep 0.2
-done
-
-if ! grep -q "streaming events:" "$LOG"; then
-  echo "daemon did not reach streaming state:" >&2
-  cat "$LOG" >&2
-  exit 1
-fi
-
-MARKER="/tmp/electric-eye-lxc-$$"
-WRITE_MARKER="$MARKER.write"
-PORT="${EE_TEST_PORT:-$((20000 + ($$ % 20000)))}"
-echo "==> running workload on guest CPU $CPU"
-sudo lxc-attach -n "$NAME" -- taskset -c "$CPU" sh -c "
-set -e
-echo payload > '$MARKER'
-touch '$MARKER.touch'
-mv '$MARKER' '$MARKER.renamed'
-rm '$MARKER.renamed' '$MARKER.touch'
-"
-sudo lxc-attach -n "$NAME" -- taskset -c "$CPU" python3 -c '
-import sys, time
-f = open(sys.argv[1], "wb")
-for _ in range(4):
-    f.write(b"x" * 4096)
-    f.flush()
-    time.sleep(0.2)
-time.sleep(1)
-f.close()
-' "$WRITE_MARKER"
-sudo lxc-attach -n "$NAME" -- sh -c "
-python3 -c '
-import socket, time
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind((\"127.0.0.1\", $PORT))
-s.listen(1)
-c, _ = s.accept()
-time.sleep(2)
-c.close()
-s.close()
-' &
-srv=\$!
-sleep 0.7
-taskset -c '$CPU' curl -s --max-time 1 http://127.0.0.1:'$PORT'/ >/dev/null || true
-wait \$srv 2>/dev/null || true
-"
-
-for _ in $(seq 1 50); do
-  if grep -q "$MARKER" "$LOG"; then
-    break
-  fi
-  sleep 0.2
-done
-
-# Actual write events are aggregated into a 5-second window.
-for _ in $(seq 1 60); do
-  if grep "$WRITE_MARKER" "$LOG" | grep -q '"event":"file_write"'; then
-    break
-  fi
-  sleep 0.2
-done
-
-fail=0
-for expected in '"event":"file_open"' '"event":"file_write"' \
-  '"event":"file_rename"' '"event":"file_unlink"' "$MARKER"; do
-  if ! grep -q "$expected" "$LOG"; then
-    echo "missing expected output: $expected" >&2
-    fail=1
-  fi
-done
-
-if ! grep -q '"event":"accept"' "$LOG"; then
-  echo "missing ACCEPT event" >&2
-  fail=1
-elif ! grep '"event":"accept"' "$LOG" | grep -q '"comm":"python3"'; then
-  echo "ACCEPT attribution did not identify the python server" >&2
-  fail=1
-fi
-
-echo "==> triggering a sensitive-path incident inside the container"
-sudo lxc-attach -n "$NAME" -- sh -c \
-  'mkdir -p /root/.ssh; echo test > /root/.ssh/electric-eye-lxc-test; cat /root/.ssh/electric-eye-lxc-test >/dev/null; rm /root/.ssh/electric-eye-lxc-test'
-sleep 1
-if ! grep -q '"event":"file_read"' "$LOG"; then
-  echo "sensitive read was not captured" >&2
-  fail=1
-fi
-if ! sudo ./target/release/electric-eye --socket "$SOCKET" incidents \
-  | grep -q 'Sensitive path access'; then
-  echo "sensitive-path rule did not fire" >&2
-  fail=1
-fi
-
-echo "==> checking query API"
-if ! sudo ./target/release/electric-eye --socket "$SOCKET" status \
-  | grep -q '"attached_probes"'; then
-  echo "status API did not respond" >&2
-  fail=1
-fi
-
-echo "==> stopping daemon"
-sudo kill -TERM "$DAEMON_PID"
-wait "$DAEMON_PID" || true
-DAEMON_PID=""
-
-if [[ -e "$SOCKET" ]]; then
-  echo "socket was not removed on SIGTERM: $SOCKET" >&2
-  fail=1
-fi
-
-if [[ "$fail" -ne 0 ]]; then
-  echo "--- captured events ---" >&2
-  grep "$MARKER\|daemon\|error" "$LOG" >&2 || true
-  exit 1
-fi
-
-echo "capture test passed (CPU $CPU, container $NAME)"
-if [[ "$CREATED" == 1 ]]; then
-  echo "container left running for reuse: $NAME"
-fi
+cargo xtask build-ebpf
+cargo build --locked -p electric-eyed -p electric-eye-cli
+# Pipes keep lxc-attach from changing ownership on host artifact descriptors.
+python3 - <<'PY' | guest tar -xf - -C "$STAGE"
+import sys,tarfile
+with tarfile.open(fileobj=sys.stdout.buffer,mode="w|") as archive:
+    for source,name in [("target/debug/electric-eyed","electric-eyed"),("target/debug/electric-eye","electric-eye"),("target/bpfel-unknown-none/release/electric-eye-ebpf","ebpf"),("tests/lxc/regressions.py","regressions.py")]:
+        archive.add(source,arcname=name)
+PY
+start_daemon() {
+  local log="$1"
+  sudo -n lxc-attach -n "$NAME" -- setpriv \
+    --reuid="$TEST_UID" --regid="$TEST_GID" --clear-groups \
+    --inh-caps=+bpf,+perfmon,+dac_read_search,+sys_ptrace \
+    --ambient-caps=+bpf,+perfmon,+dac_read_search,+sys_ptrace \
+    sh -c 'echo $$ > "$1/daemon.pid"; exec "$1/electric-eyed" --json --socket "$1/eye.sock" --db "$1/eye.db" --ebpf-object "$1/ebpf"' sh "$STAGE" \
+    2>&1 | tee "$log" >/dev/null &
+  DAEMON_JOB=$!
+  for _ in $(seq 1 100); do
+    if rg -q 'streaming events:' "$log"; then return; fi
+    if ! kill -0 "$DAEMON_JOB" 2>/dev/null; then tail -30 "$log" >&2; return 1; fi
+    sleep 0.1
+  done
+  tail -30 "$log" >&2
+  return 1
+}
+start_daemon "$LOG_DIR/capture.log"
+CPU="${EE_TEST_CPU:-$(guest python3 -c 'import os; c=sorted(os.sched_getaffinity(0)); print(next((n for n in c if n>0),c[0]))')}"
+guest taskset -c "$CPU" python3 "$STAGE/regressions.py" "$STAGE/eye.sock" | tee "$LOG_DIR/results.json"
+# Check that complete incident identity survives a real daemon restart.
+stop_daemon
+start_daemon "$LOG_DIR/restarted.log"
+guest python3 -c '
+import socket,json,sys
+with socket.socket(socket.AF_UNIX) as s:
+    s.connect(sys.argv[1]);s.sendall(b"{\"op\":\"incidents\",\"limit\":1000}\n");data=b""
+    while chunk:=s.recv(65536):data+=chunk
+incidents=json.loads(data)["incidents"]
+assert any(i.get("path") and i.get("exe") and i.get("process",{}).get("start_ns") and i.get("id") for i in incidents), incidents
+print("Incident identity survived restart")
+' "$STAGE/eye.sock"
+stop_daemon
+if guest test -e "$STAGE/eye.sock"; then echo "socket survived daemon shutdown" >&2; exit 1; fi
+printf 'Capture regressions passed on CPU %s; logs: %s; guest artifacts: %s\n' "$CPU" "$LOG_DIR" "$STAGE"

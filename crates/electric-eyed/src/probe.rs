@@ -1,7 +1,6 @@
-use std::collections::HashSet;
 use std::path::Path;
 
-pub const MIN_KERNEL: (u64, u64) = (5, 8);
+pub const MIN_KERNEL: (u64, u64) = (5, 17);
 
 pub fn kernel_release() -> String {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -96,20 +95,6 @@ pub fn online_cpus() -> std::io::Result<Vec<u32>> {
             Ok((0..count as u32).collect())
         }
     }
-}
-
-pub fn available_ksyms() -> std::io::Result<HashSet<String>> {
-    let text = std::fs::read_to_string("/proc/kallsyms")?;
-    let mut names = HashSet::new();
-    for line in text.lines() {
-        let mut columns = line.split_whitespace();
-        let _addr = columns.next();
-        let _type = columns.next();
-        if let Some(name) = columns.next() {
-            names.insert(name.to_string());
-        }
-    }
-    Ok(names)
 }
 
 #[cfg(test)]

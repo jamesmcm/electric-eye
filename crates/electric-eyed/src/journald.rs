@@ -1,5 +1,11 @@
 use std::ffi::CString;
-use std::process::Command;
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[link(name = "systemd")]
 unsafe extern "C" {
@@ -73,8 +79,7 @@ pub fn send_incident(incident: &crate::rules::Incident, journal: &[String]) -> b
 /// should treat this as optional enrichment: journal permissions or a missing
 /// journalctl must never break event capture.
 pub fn nearby(unit: Option<&str>, ts_ms: u64, window_secs: u64, limit: usize) -> Vec<String> {
-    let start = ts_ms / 1000;
-    let end = start.saturating_add(window_secs);
+    let (start, end) = context_window(ts_ms, window_secs);
     let mut command = Command::new("journalctl");
     command.args([
         "--since",
@@ -91,17 +96,129 @@ pub fn nearby(unit: Option<&str>, ts_ms: u64, window_secs: u64, limit: usize) ->
     if let Some(unit) = unit {
         command.args(["--unit", unit]);
     }
-    let Ok(output) = command.output() else {
+    let Some(output) = bounded_output(&mut command, Duration::from_millis(200), 128 * 1024) else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
+    String::from_utf8_lossy(&output)
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| line.chars().take(500).collect())
         .collect()
+}
+
+fn context_window(ts_ms: u64, window_secs: u64) -> (u64, u64) {
+    let incident = ts_ms / 1000;
+    (
+        incident.saturating_sub(window_secs),
+        incident.saturating_add(window_secs),
+    )
+}
+fn bounded_output(command: &mut Command, timeout: Duration, max_bytes: usize) -> Option<Vec<u8>> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let fd = stdout.as_raw_fd();
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    let deadline = Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stdout.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                if output.len() + n > max_bytes {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                output.extend_from_slice(&buf[..n]);
+            }
+            Ok(_) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return status.success().then_some(output);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+pub struct IncidentWorker {
+    tx: Option<SyncSender<crate::rules::Incident>>,
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+impl IncidentWorker {
+    pub fn start(
+        state: Arc<Mutex<crate::api::SharedState>>,
+        store: Option<crate::store::StoreClient>,
+    ) -> std::io::Result<Self> {
+        let (tx, rx) = sync_channel::<crate::rules::Incident>(128);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let join = std::thread::Builder::new()
+            .name("electric-eye-incidents".into())
+            .spawn(move || {
+                while let Ok(mut incident) = rx.recv() {
+                    if stopping.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let journal = nearby(incident.unit.as_deref(), incident.ts_ms, 60, 20);
+                    if let Some(details) = incident.details.as_object_mut() {
+                        details.insert("journal".into(), serde_json::json!(&journal));
+                    }
+                    if let Some(store) = &store {
+                        store.record_incident(crate::store::IncidentRow::from_incident(&incident));
+                    }
+                    let mut value = serde_json::to_value(&incident).unwrap_or_default();
+                    value["event"] = serde_json::json!("incident");
+                    state.lock().unwrap().record_incident(value);
+                    send_incident(&incident, &journal);
+                }
+            })?;
+        Ok(Self {
+            tx: Some(tx),
+            stop,
+            join: Some(join),
+        })
+    }
+    pub fn enqueue(&self, incident: crate::rules::Incident) {
+        if let Some(tx) = &self.tx
+            && tx.try_send(incident).is_err()
+        {
+            log::warn!("incident enrichment queue full; base incident retained");
+        }
+    }
+}
+impl Drop for IncidentWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.tx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -113,5 +230,29 @@ mod tests {
         // exercising the encoding path is enough.
         let encoded = fields[0].1.replace(['\n', '\r'], " ");
         assert_eq!(encoded, "hello world");
+    }
+}
+
+#[cfg(test)]
+mod context_regressions {
+    use super::*;
+    #[test]
+    fn context_includes_preceding_minute() {
+        assert_eq!(context_window(120_000, 60), (60, 180));
+        assert_eq!(context_window(1_000, 60), (0, 61));
+    }
+    #[test]
+    fn hung_command_has_a_deadline() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("2");
+        let start = Instant::now();
+        assert!(bounded_output(&mut cmd, Duration::from_millis(50), 1024).is_none());
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+    #[test]
+    fn command_output_is_bounded() {
+        let mut cmd = Command::new("printf");
+        cmd.arg("1234567890");
+        assert!(bounded_output(&mut cmd, Duration::from_secs(1), 5).is_none());
     }
 }
