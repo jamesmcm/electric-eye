@@ -11,6 +11,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
 
 use crate::api::ActivityEntry;
+use crate::rules::BaselineData;
 
 pub const RAW_RETENTION_MS: i64 = 5 * 60 * 1000;
 pub const ACTIVITY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -42,6 +43,7 @@ struct StoreEvent {
     pid: i64,
     uid: i64,
     comm: String,
+    exe: Option<String>,
     unit: Option<String>,
     nix: Option<String>,
     parent: Option<String>,
@@ -156,6 +158,38 @@ impl StoreClient {
             "incidents": incidents,
             "dropped": self.dropped(),
         })
+    }
+
+    pub fn baseline(&self) -> Result<BaselineData> {
+        let conn = self.read_connection()?;
+        let mut paths = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(exe, nix, comm), subject FROM events WHERE kind LIKE 'file.%'
+             UNION
+             SELECT COALESCE(exe, nix, app), subject FROM activities WHERE kind LIKE 'file.%'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            paths.push(row?);
+        }
+
+        let mut network = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(exe, nix, comm), subject FROM events
+             WHERE kind LIKE 'net.%' AND kind NOT IN ('net.traffic', 'net.listen')
+             UNION
+             SELECT COALESCE(exe, nix, app), subject FROM activities
+             WHERE kind LIKE 'net.%' AND kind NOT IN ('net.traffic', 'net.listen')",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            network.push(row?);
+        }
+        Ok(BaselineData::from_pairs(paths, network))
     }
 
     pub fn recent_activities(&self, limit: usize) -> Result<Value> {
@@ -330,6 +364,7 @@ impl StoreEvent {
             pid: pid as i64,
             uid: uid as i64,
             comm,
+            exe: entry.exe.clone(),
             unit: entry.unit.clone(),
             nix: entry.nix.clone(),
             parent: entry.parent.clone(),
@@ -366,6 +401,10 @@ impl StoreEvent {
                 } else {
                     event.remote_endpoint()
                 };
+            }
+            ObservedEvent::FileRead(event) => {
+                row.path = Some(event.path.clone());
+                row.subject = event.path.clone();
             }
             ObservedEvent::FileOpen(event) => {
                 row.path = Some(event.path.clone());
@@ -422,18 +461,27 @@ fn identity(event: &ObservedEvent) -> (String, u32, u32, String) {
             event.uid,
             event.comm.clone(),
         ),
+        ObservedEvent::FileRead(event) => {
+            ("file.read".into(), event.pid, event.uid, event.comm.clone())
+        }
         ObservedEvent::FileOpen(event) => {
             let kind = match event.kind {
+                FileKind::Read => "file.read",
                 FileKind::Open => "file.open",
                 FileKind::Create => "file.create",
                 FileKind::Truncate => "file.truncate",
                 FileKind::Write => "file.write",
+                FileKind::Mmap => "file.mmap",
                 FileKind::Unlink => "file.unlink",
             };
             (kind.into(), event.pid, event.uid, event.comm.clone())
         }
         ObservedEvent::FileWrite(event) => (
-            "file.write".into(),
+            match event.kind {
+                FileKind::Mmap => "file.mmap",
+                _ => "file.write",
+            }
+            .into(),
             event.pid,
             event.uid,
             event.comm.clone(),
@@ -475,6 +523,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             pid INTEGER NOT NULL,
             uid INTEGER NOT NULL,
             comm TEXT NOT NULL,
+            exe TEXT,
             unit TEXT,
             nix TEXT,
             parent TEXT,
@@ -504,7 +553,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             count INTEGER NOT NULL,
             bytes INTEGER NOT NULL,
             unit TEXT,
-            nix TEXT
+            nix TEXT,
+            exe TEXT
         );
         CREATE INDEX IF NOT EXISTS activities_bucket ON activities(bucket_ms);
         CREATE INDEX IF NOT EXISTS activities_app ON activities(app, bucket_ms);
@@ -519,6 +569,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS incidents_ts ON incidents(ts_ms);",
     )?;
+    let _ = conn.execute("ALTER TABLE events ADD COLUMN exe TEXT", []);
+    let _ = conn.execute("ALTER TABLE activities ADD COLUMN exe TEXT", []);
     Ok(())
 }
 
@@ -586,11 +638,11 @@ fn flush_events(conn: &mut Connection, batch: &mut Vec<StoreEvent>) -> Result<()
     {
         let mut stmt = tx.prepare(
             "INSERT INTO events (
-                ts_ms, kind, pid, uid, comm, unit, nix, parent,
+                ts_ms, kind, pid, uid, comm, exe, unit, nix, parent,
                 path, from_path, to_path, family, addr, local_port, remote_port,
                 bytes, count, hostname, subject, json
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                       ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                       ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         )?;
         for event in batch.drain(..) {
             stmt.execute(params![
@@ -599,6 +651,7 @@ fn flush_events(conn: &mut Connection, batch: &mut Vec<StoreEvent>) -> Result<()
                 event.pid,
                 event.uid,
                 event.comm,
+                event.exe,
                 event.unit,
                 event.nix,
                 event.parent,
@@ -641,11 +694,11 @@ fn maintain(conn: &mut Connection) -> Result<()> {
     let activity_cutoff = now - ACTIVITY_RETENTION_MS;
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO activities (bucket_ms, kind, app, subject, count, bytes, unit, nix)
+        "INSERT INTO activities (bucket_ms, kind, app, subject, count, bytes, unit, nix, exe)
          SELECT (ts_ms / ?1) * ?1, kind, comm, subject, SUM(COALESCE(count, 1)),
-                COALESCE(SUM(bytes), 0), MAX(unit), MAX(nix)
+                COALESCE(SUM(bytes), 0), MAX(unit), MAX(nix), exe
          FROM events WHERE ts_ms < ?2
-         GROUP BY (ts_ms / ?1) * ?1, kind, comm, subject",
+         GROUP BY (ts_ms / ?1) * ?1, kind, comm, subject, exe",
         params![ACTIVITY_BUCKET_MS, raw_cutoff],
     )?;
     tx.execute("DELETE FROM events WHERE ts_ms < ?1", params![raw_cutoff])?;
@@ -679,6 +732,7 @@ mod tests {
             unit: Some("test.service".into()),
             nix: None,
             parent: Some("bash".into()),
+            exe: None,
         }
     }
 
@@ -737,6 +791,29 @@ mod tests {
         assert_eq!(activities["activities"][0]["kind"], "file.write");
         assert_eq!(activities["activities"][0]["count"], 2);
         assert_eq!(activities["activities"][0]["bytes"], 4096);
+        store.shutdown();
+    }
+
+    #[test]
+    fn baselines_from_stored_events() {
+        let path = temp_db();
+        let store = Store::open(&path).unwrap();
+        let client = store.client();
+        client.record(&entry(
+            "sudo",
+            ObservedEvent::FileRead(FileEvent {
+                pid: 1,
+                uid: 0,
+                comm: "sudo".into(),
+                path: "/root/.ssh/id_rsa".into(),
+                kind: FileKind::Read,
+                bytes: None,
+                count: None,
+            }),
+        ));
+        std::thread::sleep(Duration::from_millis(300));
+        let baseline = client.baseline().unwrap();
+        assert!(baseline.knows_path("sudo", "/root/.ssh/id_rsa"));
         store.shutdown();
     }
 

@@ -208,11 +208,12 @@ struct Session {
     registry: ProvenanceRegistry,
     comm_by_pid: HashMap<u32, String>,
     cwd_by_pid: HashMap<u32, PathBuf>,
+    exe_by_pid: HashMap<u32, String>,
     ppid_by_pid: HashMap<u32, u32>,
     start_by_pid: HashMap<u32, u64>,
     fd_paths: HashMap<(u32, u32), String>,
     traffic_window: HashMap<u32, (u64, u64)>,
-    write_window: HashMap<(u32, String), WriteStat>,
+    write_window: HashMap<(u32, String, FileKind), WriteStat>,
     dns: dns::DnsCache,
     anomalies: rules::AnomalyEngine,
     own_pid: u32,
@@ -227,6 +228,18 @@ impl Session {
             self.comm_by_pid.clear();
         }
         self.comm_by_pid.insert(pid, comm.to_string());
+    }
+
+    fn exe_for(&mut self, pid: u32) -> Option<PathBuf> {
+        if let Some(path) = self.exe_by_pid.get(&pid) {
+            return Some(PathBuf::from(path));
+        }
+        let path = enrich::resolve_exe(pid)?;
+        if self.exe_by_pid.len() >= PID_CACHE_LIMIT {
+            self.exe_by_pid.clear();
+        }
+        self.exe_by_pid.insert(pid, path.display().to_string());
+        Some(path)
     }
 
     fn comm_for(&mut self, pid: u32) -> String {
@@ -290,6 +303,7 @@ impl Session {
     }
 
     fn emit(&mut self, observed: ObservedEvent, pid: u32, exe: Option<PathBuf>) {
+        let exe_string = exe.as_ref().map(|path| path.display().to_string());
         let (unit, nix, parent) = self.context_for(pid, exe);
         let entry = api::ActivityEntry {
             ts_ms: api::now_ms(),
@@ -297,6 +311,7 @@ impl Session {
             unit,
             nix,
             parent,
+            exe: exe_string,
         };
         if self.json {
             match serde_json::to_string(&entry) {
@@ -434,10 +449,11 @@ impl Session {
 
     fn emit_file(&mut self, event: FileEvent) {
         let pid = event.pid;
-        let exe = enrich::resolve_exe(pid);
+        let exe = self.exe_for(pid);
         let observed = match event.kind {
+            FileKind::Read => ObservedEvent::FileRead(event),
             FileKind::Unlink => ObservedEvent::FileUnlink(event),
-            FileKind::Write => ObservedEvent::FileWrite(event),
+            FileKind::Write | FileKind::Mmap => ObservedEvent::FileWrite(event),
             FileKind::Open | FileKind::Create | FileKind::Truncate => {
                 ObservedEvent::FileOpen(event)
             }
@@ -457,6 +473,9 @@ impl Session {
                 let start_ticks = stat.map(|s| s.start_ticks).unwrap_or(0);
                 self.ppid_by_pid.insert(event.pid, ppid);
                 self.start_by_pid.insert(event.pid, start_ticks);
+                if exe.as_path() != Path::new("(exited)") {
+                    self.exe_by_pid.insert(event.pid, exe.display().to_string());
+                }
                 let observed = ObservedEvent::Exec(ExecEvent {
                     pid: event.pid,
                     ppid,
@@ -469,7 +488,7 @@ impl Session {
             }
             RawEvent::Exit(event) => {
                 self.remember_comm(event.pid, &event.comm_str());
-                let exe = enrich::resolve_exe(event.pid);
+                let exe = self.exe_for(event.pid);
                 let observed = ObservedEvent::Exit(ExitEvent {
                     pid: event.pid,
                     uid: event.uid,
@@ -478,13 +497,14 @@ impl Session {
                 self.emit(observed, event.pid, exe);
                 self.comm_by_pid.remove(&event.pid);
                 self.cwd_by_pid.remove(&event.pid);
+                self.exe_by_pid.remove(&event.pid);
                 self.ppid_by_pid.remove(&event.pid);
                 self.start_by_pid.remove(&event.pid);
                 self.fd_paths.retain(|(pid, _), _| *pid != event.pid);
             }
             RawEvent::Connect(event) => {
                 let net = self.net_event(&event);
-                let exe = enrich::resolve_exe(event.pid);
+                let exe = self.exe_for(event.pid);
                 self.emit(ObservedEvent::Connect(net), event.pid, exe);
             }
             RawEvent::Accept(event) => {
@@ -496,7 +516,7 @@ impl Session {
                     );
                     return;
                 };
-                let exe = enrich::resolve_exe(event.pid);
+                let exe = self.exe_for(event.pid);
                 self.emit(ObservedEvent::Accept(net), event.pid, exe);
             }
             RawEvent::FdDup(event) => {
@@ -511,8 +531,24 @@ impl Session {
             }
             RawEvent::Listen(event) => {
                 let net = self.net_event(&event);
-                let exe = enrich::resolve_exe(event.pid);
+                let exe = self.exe_for(event.pid);
                 self.emit(ObservedEvent::Listen(net), event.pid, exe);
+            }
+            RawEvent::FileRead(event) => {
+                self.remember_comm(event.pid, &event.comm_str());
+                let path = self.resolve_path(event.pid, &event.path_str());
+                if is_noise_path(&path) {
+                    return;
+                }
+                self.emit_file(FileEvent {
+                    pid: event.pid,
+                    uid: event.uid,
+                    comm: event.comm_str(),
+                    path,
+                    kind: FileKind::Read,
+                    bytes: None,
+                    count: None,
+                });
             }
             RawEvent::FileOpen(event) => {
                 self.remember_comm(event.pid, &event.comm_str());
@@ -553,14 +589,21 @@ impl Session {
                 if is_noise_path(&path) {
                     return;
                 }
+                let kind = if event.kind == collector::KIND_FILE_MMAP {
+                    FileKind::Mmap
+                } else {
+                    FileKind::Write
+                };
                 if self.write_window.len() >= WRITE_WINDOW_LIMIT
-                    && !self.write_window.contains_key(&(event.pid, path.clone()))
+                    && !self
+                        .write_window
+                        .contains_key(&(event.pid, path.clone(), kind))
                 {
                     return;
                 }
                 let stat = self
                     .write_window
-                    .entry((event.pid, path))
+                    .entry((event.pid, path, kind))
                     .or_insert_with(|| WriteStat {
                         uid: event.uid,
                         comm: event.comm_str(),
@@ -587,7 +630,7 @@ impl Session {
             }
             RawEvent::FileRename(event) => {
                 self.remember_comm(event.pid, &event.comm_str());
-                let exe = enrich::resolve_exe(event.pid);
+                let exe = self.exe_for(event.pid);
                 let observed = ObservedEvent::FileRename(RenameEvent {
                     pid: event.pid,
                     uid: event.uid,
@@ -604,16 +647,17 @@ impl Session {
         if self.write_window.is_empty() {
             return;
         }
-        let mut writes: Vec<((u32, String), WriteStat)> = self.write_window.drain().collect();
+        let mut writes: Vec<((u32, String, FileKind), WriteStat)> =
+            self.write_window.drain().collect();
         writes.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.bytes));
         let total = writes.len();
-        for ((pid, path), stat) in writes.into_iter().take(WRITE_TOP) {
+        for ((pid, path, kind), stat) in writes.into_iter().take(WRITE_TOP) {
             self.emit_file(FileEvent {
                 pid,
                 uid: stat.uid,
                 comm: stat.comm,
                 path,
-                kind: FileKind::Write,
+                kind,
                 bytes: Some(stat.bytes),
                 count: Some(stat.count),
             });
@@ -657,7 +701,7 @@ impl Session {
         summaries.sort_by_key(|summary| std::cmp::Reverse(summary.total()));
         for summary in summaries.into_iter().take(TRAFFIC_TOP) {
             let pid = summary.pid;
-            let exe = enrich::resolve_exe(pid);
+            let exe = self.exe_for(pid);
             self.emit(ObservedEvent::Traffic(summary), pid, exe);
         }
     }
@@ -779,17 +823,30 @@ fn run() -> ExitCode {
         state.set_store(store_client.clone());
     }
 
+    let baseline = store_client
+        .as_ref()
+        .and_then(|client| match client.baseline() {
+            Ok(baseline) => Some(baseline),
+            Err(err) => {
+                log::warn!("could not load baseline: {err:#}");
+                None
+            }
+        })
+        .unwrap_or_default();
+    let allowlist = rules::Allowlist::load_default();
+
     let mut session = Session {
         registry: ProvenanceRegistry::new(),
         comm_by_pid: HashMap::new(),
         cwd_by_pid: HashMap::new(),
+        exe_by_pid: HashMap::new(),
         ppid_by_pid: HashMap::new(),
         start_by_pid: HashMap::new(),
         fd_paths: HashMap::new(),
         traffic_window: HashMap::new(),
         write_window: HashMap::new(),
         dns: dns::DnsCache::new(),
-        anomalies: rules::AnomalyEngine::new(),
+        anomalies: rules::AnomalyEngine::with_context(baseline, allowlist),
         own_pid: std::process::id(),
         store: store_client,
         json: options.json,

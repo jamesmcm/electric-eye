@@ -9,7 +9,7 @@ use aya_ebpf::{
         bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kretprobe, map, tracepoint},
-    maps::{HashMap, RingBuf},
+    maps::{HashMap, RingBuf, lpm_trie::Key},
     programs::{RetProbeContext, TracePointContext},
 };
 
@@ -24,6 +24,8 @@ pub const KIND_ACCEPT: u32 = 7;
 pub const KIND_FILE_WRITE: u32 = 8;
 pub const KIND_FD_DUP: u32 = 9;
 pub const KIND_FD_CLOSE: u32 = 10;
+pub const KIND_FILE_MMAP: u32 = 11;
+pub const KIND_FILE_READ: u32 = 12;
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
@@ -90,6 +92,22 @@ pub struct SyscallOffsets {
     pub dup3_oldfd: u32,
     pub dup3_newfd: u32,
     pub close_fd: u32,
+    pub writev_fd: u32,
+    pub writev_vec: u32,
+    pub writev_vlen: u32,
+    pub pwrite64_fd: u32,
+    pub pwrite64_count: u32,
+    pub pwritev_fd: u32,
+    pub pwritev_vec: u32,
+    pub pwritev_vlen: u32,
+    pub sendfile_out_fd: u32,
+    pub sendfile_count: u32,
+    pub copy_out_fd: u32,
+    pub copy_len: u32,
+    pub mmap_len: u32,
+    pub mmap_prot: u32,
+    pub mmap_flags: u32,
+    pub mmap_fd: u32,
 }
 
 #[repr(C)]
@@ -205,6 +223,15 @@ static PENDING_OPEN: HashMap<u32, PendingOpen> = HashMap::with_max_entries(8192,
 #[map]
 static PENDING_ACCEPT: HashMap<u32, PendingAccept> = HashMap::with_max_entries(4096, 0);
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PathKey {
+    pub bytes: [u8; 128],
+}
+
+#[map]
+static READ_PREFIXES: aya_ebpf::maps::LpmTrie<PathKey, u8> = aya_ebpf::maps::LpmTrie::with_max_entries(4096, 0);
+
 #[map]
 static NET_BYTES: HashMap<u32, NetTotals> = HashMap::with_max_entries(16384, 0);
 
@@ -301,6 +328,59 @@ fn reserve_rename_event(old_ptr: u64, new_ptr: u64) {
 
 fn writable_open(flags: i32) -> bool {
     (flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)) != 0
+}
+
+fn sensitive_read(path_ptr: u64) -> bool {
+    if path_ptr == 0 {
+        return false;
+    }
+    let mut bytes = [0u8; 128];
+    if unsafe { bpf_probe_read_user_str_bytes(path_ptr as *const u8, &mut bytes) }.is_err() {
+        return false;
+    }
+    if bytes[0] != b'/' {
+        return false;
+    }
+    READ_PREFIXES
+        .get(&Key::new(1024, PathKey { bytes }))
+        .is_some()
+}
+
+fn push_write(kind: u32, fd: u64, count: u64) {
+    if count == 0 || fd > u32::MAX as u64 {
+        return;
+    }
+    let Ok(comm) = current_comm() else {
+        return;
+    };
+    let (pid, uid) = current_ids();
+    push_record(RawWriteEvent {
+        kind,
+        pid,
+        uid,
+        fd: fd as u32,
+        count,
+        comm,
+    });
+}
+
+fn iovec_bytes(vec: u64, vlen: u64) -> u64 {
+    if vec == 0 {
+        return 0;
+    }
+    let count = vlen.min(64);
+    let mut total = 0u64;
+    let mut index = 0u64;
+    while index < count {
+        let len: u64 =
+            match unsafe { bpf_probe_read_user((vec + index * 16 + 8) as *const u64) } {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+        total = total.saturating_add(len);
+        index += 1;
+    }
+    total
 }
 
 fn note_open(path: u64, flags: u32) {
@@ -473,10 +553,13 @@ fn electric_eye_openat(ctx: TracePointContext) -> i32 {
 fn try_openat(ctx: &TracePointContext) -> Result<(), ()> {
     let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
     let flags: i32 = ctx_read(ctx, offs.openat_flags as usize)?;
+    let filename: u64 = ctx_read(ctx, offs.openat_filename as usize)?;
     if !writable_open(flags) {
+        if sensitive_read(filename) {
+            reserve_path_event(KIND_FILE_READ, filename, flags as u32, 0);
+        }
         return Ok(());
     }
-    let filename: u64 = ctx_read(ctx, offs.openat_filename as usize)?;
     note_open(filename, flags as u32);
     Ok(())
 }
@@ -504,10 +587,13 @@ fn try_openat2(ctx: &TracePointContext) -> Result<(), ()> {
         return Ok(());
     }
     let flags: u64 = unsafe { bpf_probe_read_user(how as *const u64) }.map_err(|_| ())?;
+    let filename: u64 = ctx_read(ctx, offs.openat2_filename as usize)?;
     if !writable_open(flags as i32) {
+        if sensitive_read(filename) {
+            reserve_path_event(KIND_FILE_READ, filename, flags as u32, 0);
+        }
         return Ok(());
     }
-    let filename: u64 = ctx_read(ctx, offs.openat2_filename as usize)?;
     note_open(filename, flags as u32);
     Ok(())
 }
@@ -531,10 +617,13 @@ fn electric_eye_open(ctx: TracePointContext) -> i32 {
 fn try_open(ctx: &TracePointContext) -> Result<(), ()> {
     let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
     let flags: i32 = ctx_read(ctx, offs.open_flags as usize)?;
+    let filename: u64 = ctx_read(ctx, offs.open_filename as usize)?;
     if !writable_open(flags) {
+        if sensitive_read(filename) {
+            reserve_path_event(KIND_FILE_READ, filename, flags as u32, 0);
+        }
         return Ok(());
     }
-    let filename: u64 = ctx_read(ctx, offs.open_filename as usize)?;
     note_open(filename, flags as u32);
     Ok(())
 }
@@ -649,21 +738,112 @@ fn try_write(ctx: &TracePointContext) -> Result<(), ()> {
     let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
     let fd: u32 = ctx_read(ctx, offs.write_fd as usize)?;
     let count: u64 = ctx_read(ctx, offs.write_count as usize)?;
-    if count == 0 {
+    push_write(KIND_FILE_WRITE, fd as u64, count);
+    Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_writev")]
+fn electric_eye_writev(ctx: TracePointContext) -> i32 {
+    match try_writev(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_writev(ctx: &TracePointContext) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let fd: u64 = ctx_read(ctx, offs.writev_fd as usize)?;
+    let vec: u64 = ctx_read(ctx, offs.writev_vec as usize)?;
+    let vlen: u64 = ctx_read(ctx, offs.writev_vlen as usize)?;
+    push_write(KIND_FILE_WRITE, fd, iovec_bytes(vec, vlen));
+    Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_pwrite64")]
+fn electric_eye_pwrite64(ctx: TracePointContext) -> i32 {
+    match try_pwrite64(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_pwrite64(ctx: &TracePointContext) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let fd: u64 = ctx_read(ctx, offs.pwrite64_fd as usize)?;
+    let count: u64 = ctx_read(ctx, offs.pwrite64_count as usize)?;
+    push_write(KIND_FILE_WRITE, fd, count);
+    Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_pwritev")]
+fn electric_eye_pwritev(ctx: TracePointContext) -> i32 {
+    match try_pwritev(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_pwritev(ctx: &TracePointContext) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let fd: u64 = ctx_read(ctx, offs.pwritev_fd as usize)?;
+    let vec: u64 = ctx_read(ctx, offs.pwritev_vec as usize)?;
+    let vlen: u64 = ctx_read(ctx, offs.pwritev_vlen as usize)?;
+    push_write(KIND_FILE_WRITE, fd, iovec_bytes(vec, vlen));
+    Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_sendfile64")]
+fn electric_eye_sendfile(ctx: TracePointContext) -> i32 {
+    match try_sendfile(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_sendfile(ctx: &TracePointContext) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let out_fd: u64 = ctx_read(ctx, offs.sendfile_out_fd as usize)?;
+    let count: u64 = ctx_read(ctx, offs.sendfile_count as usize)?;
+    push_write(KIND_FILE_WRITE, out_fd, count);
+    Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_copy_file_range")]
+fn electric_eye_copy_file_range(ctx: TracePointContext) -> i32 {
+    match try_copy_file_range(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_copy_file_range(ctx: &TracePointContext) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let out_fd: u64 = ctx_read(ctx, offs.copy_out_fd as usize)?;
+    let len: u64 = ctx_read(ctx, offs.copy_len as usize)?;
+    push_write(KIND_FILE_WRITE, out_fd, len);
+    Ok(())
+}
+
+#[tracepoint(category = "syscalls", name = "sys_enter_mmap")]
+fn electric_eye_mmap(ctx: TracePointContext) -> i32 {
+    match try_mmap(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_mmap(ctx: &TracePointContext) -> Result<(), ()> {
+    let offs: SyscallOffsets = unsafe { *SYSCALL_OFFSETS.get(&0).ok_or(())? };
+    let len: u64 = ctx_read(ctx, offs.mmap_len as usize)?;
+    let prot: u64 = ctx_read(ctx, offs.mmap_prot as usize)?;
+    let flags: u64 = ctx_read(ctx, offs.mmap_flags as usize)?;
+    let fd: u64 = ctx_read(ctx, offs.mmap_fd as usize)?;
+    const PROT_WRITE: u64 = 0x2;
+    const MAP_SHARED: u64 = 0x1;
+    if prot & PROT_WRITE == 0 || flags & MAP_SHARED == 0 || fd > i32::MAX as u64 {
         return Ok(());
     }
-    let Ok(comm) = current_comm() else {
-        return Ok(());
-    };
-    let (pid, uid) = current_ids();
-    push_record(RawWriteEvent {
-        kind: KIND_FILE_WRITE,
-        pid,
-        uid,
-        fd,
-        count,
-        comm,
-    });
+    push_write(KIND_FILE_MMAP, fd, len);
     Ok(())
 }
 

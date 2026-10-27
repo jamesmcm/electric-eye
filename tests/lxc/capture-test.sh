@@ -151,8 +151,12 @@ fi
 
 echo "==> triggering a sensitive-path incident inside the container"
 sudo lxc-attach -n "$NAME" -- sh -c \
-  'mkdir -p /root/.ssh; echo test > /root/.ssh/electric-eye-lxc-test; rm /root/.ssh/electric-eye-lxc-test'
+  'mkdir -p /root/.ssh; echo test > /root/.ssh/electric-eye-lxc-test; cat /root/.ssh/electric-eye-lxc-test >/dev/null; rm /root/.ssh/electric-eye-lxc-test'
 sleep 1
+if ! grep -q '"event":"file_read"' "$LOG"; then
+  echo "sensitive read was not captured" >&2
+  fail=1
+fi
 if ! sudo ./target/release/electric-eye --socket "$SOCKET" incidents \
   | grep -q 'Sensitive path access'; then
   echo "sensitive-path rule did not fire" >&2

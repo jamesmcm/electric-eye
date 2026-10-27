@@ -4,6 +4,7 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{HashMap, MapData, RingBuf};
 use aya::programs::{KProbe, TracePoint};
 use aya::{Ebpf, Pod};
@@ -36,6 +37,8 @@ pub const KIND_ACCEPT: u32 = 7;
 pub const KIND_FILE_WRITE: u32 = 8;
 pub const KIND_FD_DUP: u32 = 9;
 pub const KIND_FD_CLOSE: u32 = 10;
+pub const KIND_FILE_MMAP: u32 = 11;
+pub const KIND_FILE_READ: u32 = 12;
 
 const PERF_TYPE_TRACEPOINT: u32 = 2;
 const PERF_SAMPLE_RAW: u64 = 1 << 10;
@@ -96,6 +99,22 @@ pub struct SyscallOffsets {
     pub dup3_oldfd: u32,
     pub dup3_newfd: u32,
     pub close_fd: u32,
+    pub writev_fd: u32,
+    pub writev_vec: u32,
+    pub writev_vlen: u32,
+    pub pwrite64_fd: u32,
+    pub pwrite64_count: u32,
+    pub pwritev_fd: u32,
+    pub pwritev_vec: u32,
+    pub pwritev_vlen: u32,
+    pub sendfile_out_fd: u32,
+    pub sendfile_count: u32,
+    pub copy_out_fd: u32,
+    pub copy_len: u32,
+    pub mmap_len: u32,
+    pub mmap_prot: u32,
+    pub mmap_flags: u32,
+    pub mmap_fd: u32,
 }
 
 unsafe impl Pod for SyscallOffsets {}
@@ -222,6 +241,7 @@ impl RawPathEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawWriteEvent {
+    pub kind: u32,
     pub pid: u32,
     pub uid: u32,
     pub fd: u32,
@@ -302,6 +322,7 @@ pub enum RawEvent {
     Accept(RawAcceptEvent),
     FdDup(RawFdEvent),
     FdClose(RawFdEvent),
+    FileRead(RawPathEvent),
     FileOpen(RawPathEvent),
     FileWrite(RawWriteEvent),
     FileUnlink(RawPathEvent),
@@ -388,7 +409,7 @@ pub fn decode(data: &[u8]) -> Option<RawEvent> {
                 RawEvent::FdClose(event)
             })
         }
-        KIND_FILE_OPEN | KIND_FILE_UNLINK => {
+        KIND_FILE_OPEN | KIND_FILE_UNLINK | KIND_FILE_READ => {
             if data.len() < RAW_PATH_LEN {
                 return None;
             }
@@ -401,17 +422,18 @@ pub fn decode(data: &[u8]) -> Option<RawEvent> {
                 comm: read_array(data, 20)?,
                 path: read_array(data, 36)?,
             };
-            Some(if kind == KIND_FILE_OPEN {
-                RawEvent::FileOpen(event)
-            } else {
-                RawEvent::FileUnlink(event)
+            Some(match kind {
+                KIND_FILE_OPEN => RawEvent::FileOpen(event),
+                KIND_FILE_READ => RawEvent::FileRead(event),
+                _ => RawEvent::FileUnlink(event),
             })
         }
-        KIND_FILE_WRITE => {
+        KIND_FILE_WRITE | KIND_FILE_MMAP => {
             if data.len() < RAW_WRITE_LEN {
                 return None;
             }
             Some(RawEvent::FileWrite(RawWriteEvent {
+                kind,
                 pid: read_u32(data, 4)?,
                 uid: read_u32(data, 8)?,
                 fd: read_u32(data, 12)?,
@@ -480,6 +502,7 @@ impl Collector {
 
         let sock_ok = fill_sock_offsets(&mut bpf, &mut report);
         let syscall_plan = fill_syscall_offsets(&mut bpf, &mut report);
+        fill_read_prefixes(&mut bpf, &mut report);
 
         let ksyms = match probe::available_ksyms() {
             Ok(ksyms) => Some(ksyms),
@@ -600,6 +623,42 @@ impl Collector {
                 "electric_eye_write",
                 "syscalls",
                 "sys_enter_write",
+            ),
+            (
+                syscall_plan.writev,
+                "electric_eye_writev",
+                "syscalls",
+                "sys_enter_writev",
+            ),
+            (
+                syscall_plan.pwrite64,
+                "electric_eye_pwrite64",
+                "syscalls",
+                "sys_enter_pwrite64",
+            ),
+            (
+                syscall_plan.pwritev,
+                "electric_eye_pwritev",
+                "syscalls",
+                "sys_enter_pwritev",
+            ),
+            (
+                syscall_plan.sendfile,
+                "electric_eye_sendfile",
+                "syscalls",
+                "sys_enter_sendfile64",
+            ),
+            (
+                syscall_plan.copy_file_range,
+                "electric_eye_copy_file_range",
+                "syscalls",
+                "sys_enter_copy_file_range",
+            ),
+            (
+                syscall_plan.mmap,
+                "electric_eye_mmap",
+                "syscalls",
+                "sys_enter_mmap",
             ),
             (
                 syscall_plan.accept,
@@ -849,6 +908,114 @@ fn perf_ioctl(fd: &OwnedFd, request: libc::c_ulong, arg: libc::c_ulong) -> io::R
     }
 }
 
+fn fill_read_prefixes(bpf: &mut Ebpf, report: &mut AttachReport) {
+    let prefixes = sensitive_read_prefixes();
+    if prefixes.is_empty() {
+        return;
+    }
+    let publish = (|| -> Result<()> {
+        let mut trie: LpmTrie<&mut MapData, [u8; 128], u8> = bpf
+            .map_mut("READ_PREFIXES")
+            .context("READ_PREFIXES map missing")?
+            .try_into()?;
+        for prefix in prefixes {
+            let bytes = prefix.as_bytes();
+            if bytes.len() > 128 {
+                continue;
+            }
+            let mut data = [0_u8; 128];
+            data[..bytes.len()].copy_from_slice(bytes);
+            let key = Key::new((bytes.len() * 8) as u32, data);
+            trie.insert(&key, 1, 0)
+                .with_context(|| format!("inserting read prefix {prefix}"))?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = publish {
+        report.skip("read-prefix-filter", &format!("{err:#}"));
+    }
+}
+
+fn sensitive_read_prefixes() -> Vec<String> {
+    let mut prefixes = vec![
+        "/etc/ssh".to_string(),
+        "/etc/shadow".to_string(),
+        "/etc/gshadow".to_string(),
+        "/etc/sudoers".to_string(),
+        "/etc/sudoers.d".to_string(),
+        "/root/.ssh".to_string(),
+        "/root/.gnupg".to_string(),
+        "/root/.aws".to_string(),
+        "/root/.kube".to_string(),
+    ];
+
+    let Ok(passwd) = std::fs::read_to_string("/etc/passwd") else {
+        return prefixes;
+    };
+    for line in passwd.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let home = Path::new(fields[5]);
+        if !home.is_absolute() {
+            continue;
+        }
+        for relative in [
+            ".ssh",
+            ".gnupg",
+            ".aws",
+            ".azure",
+            ".kube",
+            ".config/gcloud",
+            ".config/gh",
+            ".config/keepassxc",
+            ".local/share/keyrings",
+            ".password-store",
+            ".git-credentials",
+            ".netrc",
+        ] {
+            prefixes.push(home.join(relative).display().to_string());
+        }
+        for browser in [
+            ".mozilla/firefox",
+            ".config/google-chrome",
+            ".config/chromium",
+            ".config/BraveSoftware/Brave-Browser",
+        ] {
+            add_browser_credential_files(&home.join(browser), &mut prefixes);
+        }
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
+}
+
+fn add_browser_credential_files(root: &Path, prefixes: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let profile = entry.path();
+        if !profile.is_dir() {
+            continue;
+        }
+        for name in [
+            "logins.json",
+            "key4.db",
+            "key3.db",
+            "cookies.sqlite",
+            "Login Data",
+            "Cookies",
+        ] {
+            let path = profile.join(name);
+            if path.exists() {
+                prefixes.push(path.display().to_string());
+            }
+        }
+    }
+}
+
 fn fill_sock_offsets(bpf: &mut Ebpf, report: &mut AttachReport) -> bool {
     match publish_sock_offsets(bpf) {
         Ok(()) => true,
@@ -924,6 +1091,22 @@ fn fill_syscall_offsets(bpf: &mut Ebpf, report: &mut AttachReport) -> SyscallPla
         dup3_oldfd: UNRESOLVED_OFFSET,
         dup3_newfd: UNRESOLVED_OFFSET,
         close_fd: UNRESOLVED_OFFSET,
+        writev_fd: UNRESOLVED_OFFSET,
+        writev_vec: UNRESOLVED_OFFSET,
+        writev_vlen: UNRESOLVED_OFFSET,
+        pwrite64_fd: UNRESOLVED_OFFSET,
+        pwrite64_count: UNRESOLVED_OFFSET,
+        pwritev_fd: UNRESOLVED_OFFSET,
+        pwritev_vec: UNRESOLVED_OFFSET,
+        pwritev_vlen: UNRESOLVED_OFFSET,
+        sendfile_out_fd: UNRESOLVED_OFFSET,
+        sendfile_count: UNRESOLVED_OFFSET,
+        copy_out_fd: UNRESOLVED_OFFSET,
+        copy_len: UNRESOLVED_OFFSET,
+        mmap_len: UNRESOLVED_OFFSET,
+        mmap_prot: UNRESOLVED_OFFSET,
+        mmap_flags: UNRESOLVED_OFFSET,
+        mmap_fd: UNRESOLVED_OFFSET,
     };
 
     let openat_enter = resolve_syscall(
@@ -1029,6 +1212,64 @@ fn fill_syscall_offsets(bpf: &mut Ebpf, report: &mut AttachReport) -> SyscallPla
         ],
         report,
         "electric_eye_write",
+    );
+    plan.writev = resolve_syscall(
+        "sys_enter_writev",
+        &mut [
+            ("fd", &mut offsets.writev_fd),
+            ("vec", &mut offsets.writev_vec),
+            ("vlen", &mut offsets.writev_vlen),
+        ],
+        report,
+        "electric_eye_writev",
+    );
+    plan.pwrite64 = resolve_syscall(
+        "sys_enter_pwrite64",
+        &mut [
+            ("fd", &mut offsets.pwrite64_fd),
+            ("count", &mut offsets.pwrite64_count),
+        ],
+        report,
+        "electric_eye_pwrite64",
+    );
+    plan.pwritev = resolve_syscall(
+        "sys_enter_pwritev",
+        &mut [
+            ("fd", &mut offsets.pwritev_fd),
+            ("vec", &mut offsets.pwritev_vec),
+            ("vlen", &mut offsets.pwritev_vlen),
+        ],
+        report,
+        "electric_eye_pwritev",
+    );
+    plan.sendfile = resolve_syscall(
+        "sys_enter_sendfile64",
+        &mut [
+            ("out_fd", &mut offsets.sendfile_out_fd),
+            ("count", &mut offsets.sendfile_count),
+        ],
+        report,
+        "electric_eye_sendfile",
+    );
+    plan.copy_file_range = resolve_syscall(
+        "sys_enter_copy_file_range",
+        &mut [
+            ("fd_out", &mut offsets.copy_out_fd),
+            ("len", &mut offsets.copy_len),
+        ],
+        report,
+        "electric_eye_copy_file_range",
+    );
+    plan.mmap = resolve_syscall(
+        "sys_enter_mmap",
+        &mut [
+            ("len", &mut offsets.mmap_len),
+            ("prot", &mut offsets.mmap_prot),
+            ("flags", &mut offsets.mmap_flags),
+            ("fd", &mut offsets.mmap_fd),
+        ],
+        report,
+        "electric_eye_mmap",
     );
     let accept_enter = resolve_syscall(
         "sys_enter_accept",
@@ -1152,6 +1393,12 @@ pub struct SyscallPlan {
     dup2: bool,
     dup3: bool,
     close: bool,
+    writev: bool,
+    pwrite64: bool,
+    pwritev: bool,
+    sendfile: bool,
+    copy_file_range: bool,
+    mmap: bool,
 }
 
 impl SyscallPlan {
@@ -1171,6 +1418,12 @@ impl SyscallPlan {
             || self.dup2
             || self.dup3
             || self.close
+            || self.writev
+            || self.pwrite64
+            || self.pwritev
+            || self.sendfile
+            || self.copy_file_range
+            || self.mmap
     }
 }
 

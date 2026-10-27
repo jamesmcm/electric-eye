@@ -26,6 +26,8 @@ pub struct ActivityEntry {
     pub nix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -152,7 +154,8 @@ fn event_comm(event: &ObservedEvent) -> String {
         ObservedEvent::Connect(event)
         | ObservedEvent::Accept(event)
         | ObservedEvent::Listen(event) => event.comm.clone(),
-        ObservedEvent::FileOpen(event)
+        ObservedEvent::FileRead(event)
+        | ObservedEvent::FileOpen(event)
         | ObservedEvent::FileWrite(event)
         | ObservedEvent::FileUnlink(event) => event.comm.clone(),
         ObservedEvent::FileRename(event) => event.comm.clone(),
@@ -338,6 +341,7 @@ mod tests {
             unit: None,
             nix: None,
             parent: Some("bash".into()),
+            exe: None,
         }
     }
 
@@ -371,6 +375,7 @@ mod tests {
             unit: None,
             nix: None,
             parent: None,
+            exe: None,
         });
         let value = state.apps_value();
         assert_eq!(value["apps"][0]["comm"], "curl");

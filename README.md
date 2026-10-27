@@ -14,9 +14,12 @@ attribution plus a small local query API.
 - `CONNECT`, `LISTEN` and `ACCEPT` for IPv4/IPv6 TCP. ACCEPT is captured at
   `accept()`/`accept4()` exit, so it is attributed to the accepting server
   rather than the packet-processing context.
-- `OPEN` / `CREATE` / `TRUNC` for writable opens, and aggregated `WRITE`
-  summaries for actual `write(2)` syscalls (including fd redirection via
-  `dup2`/`dup3`)
+- `OPEN` / `CREATE` / `TRUNC` for writable opens, and aggregated actual-write
+  summaries for `write(2)`, `writev`, `pwrite64`, `pwritev`, `sendfile`,
+  `copy_file_range` and writable shared `mmap` mappings (including fd
+  redirection via `dup2`/`dup3`)
+- filtered read-open capture for sensitive paths via an in-kernel LPM trie;
+  credential reads are observable without reporting every read-only open
 - `unlink`/`unlinkat`/`rmdir` and `rename`/`renameat`/`renameat2`
 - per-process TCP/UDP sent/received byte totals (top-N every 5 seconds)
 - systemd unit and Nix store-path suffixes on human output
@@ -26,10 +29,14 @@ attribution plus a small local query API.
 - structured journald export for startup/incidents plus bounded nearby-journal
   context on incidents
 - asynchronous reverse-DNS/hosts enrichment for connect/accept/listen events
-- deterministic rules: sensitive-path writes (SSH, GnuPG, cloud, browser and
-  password-manager stores), persistence paths, `/nix/store` writes,
-  executable-from-suspicious-location, credential sweep, bulk mutation and
-  sensitive-access-then-egress
+- deterministic rules: sensitive-path accesses (SSH, GnuPG, cloud, browser
+  and password-manager stores), persistence paths, `/nix/store` writes,
+  executable-from-suspicious-location, credential sweep, bulk mutation,
+  sensitive-access-then-egress and novel network destinations
+- baseline suppression and a per-application allowlist
+  (`/etc/electric-eye/allowlist.conf`) to reduce deterministic-rule false
+  positives; system authentication helpers reading shadow files are allowed by
+  default
 - `electric-eye status|activity|apps|app|file|network|why|incidents`
 
 Kernel events are collected with Aya. Tracepoint offsets are discovered from
@@ -75,7 +82,15 @@ Useful daemon flags:
 The service stores data in `/var/lib/electric-eye/electric-eye.db` via
 systemd's `StateDirectory`. Raw events are retained for 5 minutes, rolled into
 5-minute activity buckets, and activities are retained for 30 days. Incidents
-are stored separately for future anomaly rules.
+are stored separately for long-term review.
+
+The allowlist is read from `/etc/electric-eye/allowlist.conf` (override with
+`ELECTRIC_EYE_ALLOWLIST`). Each line is `<comm-or-exe> <subject-prefix>`; `*`
+suppresses all rules for that identity. Known paths and network destinations
+from recent events/activities form a baseline at startup, and deterministic
+rules are suppressed for previously seen file paths. Bulk mutation ignores
+cache/thumbnail/build directories; novel-network rules are skipped for
+browsers and high-churn P2P clients.
 
 ## Arch Linux package
 
@@ -120,7 +135,7 @@ crates/electric-eye-core   shared event types and rendering
 crates/electric-eyed       loader, enrichment, daemon and Unix socket API
 crates/electric-eye-cli    electric-eye query client
 crates/electric-eye-nix    Nix store-path provenance
-packaging/                 Arch package, systemd unit, sysusers
+packaging/                 Arch package, systemd unit, sysusers, allowlist
 tests/lxc                  isolated kernel-capture integration test
 docs/TOOLCHAIN.md          LLVM/nightly/bpf-linker pinning notes
 ```
@@ -140,17 +155,18 @@ file events are captured from those CPUs.
 
 ## Known limitations / next steps
 
-- Actual write capture currently covers `write(2)`. `writev`, `pwrite64`,
-  `sendfile`, `copy_file_range` and mmap-based writes are not yet covered.
-  Write syscalls are aggregated into 5-second top-32 summaries; the SQLite
-  layer retains per-process/path totals after the 5-minute raw window.
-- Sensitive-path rules currently see writable opens, actual writes, unlinks
-  and renames, not read-only opens. Read-based credential-access and
-  baseline-style novelty rules need a filtered read-open capture mode.
-- Rules are deterministic and not yet baseline-aware; `nix-daemon` writes to
-  `/nix/store` are exempted, but package activation and legitimate bulk
-  operations can still produce incidents.
-- No Quickshell UI, freeze/enforcement or NixOS packaging yet.
+- `mmap` coverage reports writable shared mappings as `MMAP` intent; it does
+  not track dirty-page writeback. Anonymous/private mappings are ignored.
+- Sensitive read capture matches absolute paths registered in the LPM trie:
+  home sensitive directories, `/etc/ssh`, shadow/sudoers files and browser
+  credential files discovered at startup. Relative-path reads are not
+  resolved for matching.
+- Write syscalls are aggregated into 5-second top-32 summaries; SQLite retains
+  per-process/path totals after the 5-minute raw window.
+- Baseline suppression is intentionally conservative: it only suppresses
+  already-known file paths, and novelty network alerts require at least five
+  known destinations for that application.
+- Quickshell UI, freeze/enforcement and NixOS packaging remain future work.
 - Process ancestry for very short-lived processes can fall back to `(exited)`
   when `/proc/<pid>` disappears before enrichment.
 - NixOS packaging and NixOS VM tests are deferred until the Arch release is

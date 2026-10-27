@@ -134,23 +134,27 @@ pub struct FileEvent {
     pub count: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileKind {
+    Read,
     Open,
     Create,
     Truncate,
     Write,
+    Mmap,
     Unlink,
 }
 
 impl FileKind {
     pub fn label(&self) -> &'static str {
         match self {
+            FileKind::Read => "READ",
             FileKind::Open => "OPEN",
             FileKind::Create => "CREATE",
             FileKind::Truncate => "TRUNC",
             FileKind::Write => "WRITE",
+            FileKind::Mmap => "MMAP",
             FileKind::Unlink => "UNLINK",
         }
     }
@@ -255,6 +259,7 @@ pub enum ObservedEvent {
     Connect(NetEvent),
     Accept(NetEvent),
     Listen(NetEvent),
+    FileRead(FileEvent),
     FileOpen(FileEvent),
     FileWrite(FileEvent),
     FileUnlink(FileEvent),
@@ -270,6 +275,7 @@ impl ObservedEvent {
             ObservedEvent::Connect(_) => "CONNECT",
             ObservedEvent::Accept(_) => "ACCEPT",
             ObservedEvent::Listen(_) => "LISTEN",
+            ObservedEvent::FileRead(event) => event.kind.label(),
             ObservedEvent::FileOpen(event) => event.kind.label(),
             ObservedEvent::FileWrite(event) => event.kind.label(),
             ObservedEvent::FileUnlink(event) => event.kind.label(),
@@ -298,6 +304,7 @@ impl fmt::Display for ObservedEvent {
                 ),
             },
             ObservedEvent::Listen(event) => format!("{} -> {}", event.comm, event.endpoint()),
+            ObservedEvent::FileRead(event) => return write!(f, "{}", event),
             ObservedEvent::FileOpen(event) => return write!(f, "{}", event),
             ObservedEvent::FileWrite(event) => return write!(f, "{}", event),
             ObservedEvent::FileUnlink(event) => return write!(f, "{}", event),
