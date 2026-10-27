@@ -10,6 +10,7 @@ TEST_UID="${EE_LXC_UID:-1000}"
 TEST_GID="${EE_LXC_GID:-1000}"
 LOG_DIR="$(mktemp -d /tmp/electric-eye-capture.XXXXXX)"
 DAEMON_JOB=""
+INVENTORY_JOB=""
 STAGE=""
 guest() {
   sudo -n lxc-attach -n "$NAME" -- setpriv \
@@ -47,16 +48,25 @@ cargo build --locked -p electric-eyed -p electric-eye-cli
 python3 - <<'PY' | guest tar -xf - -C "$STAGE"
 import sys,tarfile
 with tarfile.open(fileobj=sys.stdout.buffer,mode="w|") as archive:
-    for source,name in [("target/debug/electric-eyed","electric-eyed"),("target/debug/electric-eye","electric-eye"),("target/bpfel-unknown-none/release/electric-eye-ebpf","ebpf"),("tests/lxc/regressions.py","regressions.py")]:
+    for source,name in [("tests/lxc/startup.py","startup.py"),("target/debug/electric-eyed","electric-eyed"),("target/debug/electric-eye","electric-eye"),("target/bpfel-unknown-none/release/electric-eye-ebpf","ebpf"),("tests/lxc/regressions.py","regressions.py"),("tests/lxc/usability.py","usability.py")]:
         archive.add(source,arcname=name)
 PY
+# Nondefault TOML values exercise loader map sizes and userspace settings.
+guest python3 -c 'import sys;from pathlib import Path;Path(sys.argv[1]).write_text("[limits]\naggregation_ms=1000\napi_workers=3\nactivity_entries=4096\n[capture]\nring_bytes=33554432\npending_entries=4096\n[rules]\nsensitive_window_ms=45000\ndedup_window_ms=120000\n")' "$STAGE/config.toml"
+guest python3 "$STAGE/startup.py" "$STAGE" 2>&1 | tee "$LOG_DIR/inventory.log" &
+INVENTORY_JOB=$!
+for _ in $(seq 1 100); do
+  if guest test -e "$STAGE/inventory.pid"; then break; fi
+  sleep 0.05
+done
 start_daemon() {
   local log="$1"
+  local mode="${2:-persist}"
   sudo -n lxc-attach -n "$NAME" -- setpriv \
     --reuid="$TEST_UID" --regid="$TEST_GID" --clear-groups \
     --inh-caps=+bpf,+perfmon,+dac_read_search,+sys_ptrace \
     --ambient-caps=+bpf,+perfmon,+dac_read_search,+sys_ptrace \
-    sh -c 'echo $$ > "$1/daemon.pid"; exec "$1/electric-eyed" --json --socket "$1/eye.sock" --db "$1/eye.db" --ebpf-object "$1/ebpf"' sh "$STAGE" \
+    sh -c 'echo $$ > "$1/daemon.pid"; if [ "$2" = memory ]; then exec "$1/electric-eyed" --json --config "$1/config.toml" --socket "$1/eye.sock" --no-db --ebpf-object "$1/ebpf"; else exec "$1/electric-eyed" --json --config "$1/config.toml" --socket "$1/eye.sock" --db "$1/eye.db" --ebpf-object "$1/ebpf"; fi' sh "$STAGE" "$mode" \
     2>&1 | tee "$log" >/dev/null &
   DAEMON_JOB=$!
   for _ in $(seq 1 100); do
@@ -68,20 +78,50 @@ start_daemon() {
   return 1
 }
 start_daemon "$LOG_DIR/capture.log"
+guest python3 -c '
+import json,socket,sys
+from pathlib import Path
+stage=Path(sys.argv[1]);pid=(stage/"inventory.pid").read_text()
+with socket.socket(socket.AF_UNIX) as s:
+    s.connect(str(stage/"eye.sock"));s.sendall(json.dumps(dict(op="process",process=pid)).encode()+b"\n");data=b""
+    while chunk:=s.recv(65536):data+=chunk
+rows=json.loads(data)["processes"]
+assert any(p["source"]=="inventory" and p["argv"] for p in rows),rows
+(stage/"inventory-trigger").touch()
+' "$STAGE"
+wait "$INVENTORY_JOB"
+INVENTORY_JOB=""
 CPU="${EE_TEST_CPU:-$(guest python3 -c 'import os; c=sorted(os.sched_getaffinity(0)); print(next((n for n in c if n>0),c[0]))')}"
 guest taskset -c "$CPU" python3 "$STAGE/regressions.py" "$STAGE/eye.sock" | tee "$LOG_DIR/results.json"
 # Check that complete incident identity survives a real daemon restart.
+WORKLOAD_PID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["pid"])' "$LOG_DIR/results.json")"
 stop_daemon
 start_daemon "$LOG_DIR/restarted.log"
 guest python3 -c '
 import socket,json,sys
-with socket.socket(socket.AF_UNIX) as s:
-    s.connect(sys.argv[1]);s.sendall(b"{\"op\":\"incidents\",\"limit\":1000}\n");data=b""
-    while chunk:=s.recv(65536):data+=chunk
-incidents=json.loads(data)["incidents"]
+def query(op,**fields):
+    with socket.socket(socket.AF_UNIX) as s:
+        s.connect(sys.argv[1]);s.sendall(json.dumps(dict(op=op,**fields)).encode()+b"\n");data=b""
+        while chunk:=s.recv(65536):data+=chunk
+    return json.loads(data)
+incidents=query("incidents",limit=1000)["incidents"]
 assert any(i.get("path") and i.get("exe") and i.get("process",{}).get("start_ns") and i.get("id") for i in incidents), incidents
-print("Incident identity survived restart")
-' "$STAGE/eye.sock"
+process=query("process",process=sys.argv[2])["processes"]
+assert process and process[0]["exited_ms"] and process[0]["argv"] and process[0]["package"]["package"],process
+assert query("process",process=sys.argv[2])["execs"]
+assert len(query("tree",process=sys.argv[2])["processes"])>1
+flows=query("flows",limit=1000)["flows"]
+assert any(f["sent"] and f["received"] and f["closed_ms"] for f in flows),flows
+summaries=query("summaries",limit=1000)["summaries"]
+assert any(s["kind"]=="build_session" and s["evidence"] and s["root_exit_code"]==0 for s in summaries),summaries
+assert query("apps")["tasks"]
+assert any(e["event"].get("comm")=="ee-regression" for e in query("activity",limit=1000)["activity"])
+print("Process/exec trees, package snapshots, application tasks, flows, summaries and incidents survived restart")
+' "$STAGE/eye.sock" "$WORKLOAD_PID"
+
+stop_daemon
+start_daemon "$LOG_DIR/memory.log" memory
+guest taskset -c "$CPU" python3 "$STAGE/usability.py" "$STAGE"
 stop_daemon
 if guest test -e "$STAGE/eye.sock"; then echo "socket survived daemon shutdown" >&2; exit 1; fi
 printf 'Capture regressions passed on CPU %s; logs: %s; guest artifacts: %s\n' "$CPU" "$LOG_DIR" "$STAGE"

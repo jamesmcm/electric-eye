@@ -1,0 +1,238 @@
+.TH ELECTRIC-EYE 1 "October 2026" "electric-eye 0.1.0" "User Commands"
+.SH NAME
+electric-eye \- query and inspect the electric-eyed activity monitor
+.SH SYNOPSIS
+.B electric-eye
+[\fIOPTIONS\fR] \fICOMMAND\fR [\fIARGS\fR]
+.SH DESCRIPTION
+.B electric-eye
+is the read-only client for
+.BR electric-eyed (8).
+It queries a Unix socket and can render human-readable output or structured JSON.
+It never modifies capture state or configuration.
+.PP
+The optional
+.B tui
+command provides an interactive, read-only terminal dashboard.
+.SH OPTIONS
+.TP
+.B \-\-json
+Print pretty JSON.
+.TP
+.B \-\-jsonl
+Print one JSON object per line.
+.TP
+.BI \-\-limit " N"
+Limit results to 1..1000.
+.TP
+.BI \-\-socket " PATH"
+Use an alternate daemon query socket.
+.TP
+.BI \-\-mcp-socket " PATH"
+Use an alternate MCP bridge socket.
+.TP
+.BI \-\-since " TIME"
+Only include results since a relative time (for example
+.BR 15m ", " 1h ", " 24h )
+or an epoch timestamp.
+.TP
+.BI \-\-before " TIME"
+Only include results before a relative time or epoch timestamp.
+.TP
+.BI \-\-cursor " CURSOR"
+Resume after the opaque
+.B next_cursor
+value returned by a previous activity or incident query.
+.TP
+.BI \-\-severity " LEVEL"
+For incidents, filter to
+.BR low ", " medium ", or " high .
+.TP
+.BI \-\-rule " TEXT"
+For incidents, filter by rule or title substring.
+.TP
+.BI \-\-app " TEXT"
+For incidents, filter by application or executable substring.
+.TP
+.BI \-\-netns " TEXT"
+For flows, netns and explain, filter by namespace, container, unit or context label substring.
+.TP
+.BI \-\-role " TEXT"
+For flows, netns and explain, filter by flow role substring.
+.TP
+.B \-\-unacked
+For incidents, hide locally acknowledged or muted entries.
+.TP
+.BI \-\-for " DURATION"
+Lifetime for
+.B ack
+or
+.B mute
+(for example
+.BR 30m " or " 1h ).
+.TP
+.B \-\-follow
+For
+.BR activity ,
+stream new events until interrupted.
+.SH COMMANDS
+.TP
+.B tui
+Interactive terminal dashboard with Overview, Incidents, Activity, Apps & Flows, and Noise views.
+Use
+.B h/[
+and
+.B l/]
+to cycle pane focus,
+.B j/k
+to select with wrap-around,
+.B PgUp/PgDn
+and
+.B Ctrl+U/D
+to scroll,
+.B Space
+to freeze,
+.B s
+to cycle network scope,
+.B c
+and
+.B v
+to cycle context and role filters, and
+.B a/A
+and
+.B m/u
+to manage local incident review state. Mouse clicks switch tabs, select rows,
+focus panes and choose the network scope. Use
+.B ?
+for help and
+.B Esc
+to close help without quitting.
+.TP
+.B doctor
+Check systemd status, socket/group access, BTF, tracefs, probes, capture loss, storage headroom, configuration and noise.
+.TP
+.B status
+Daemon health, attached probes, capture loss, storage state and effective configuration.
+.TP
+.B activity
+Recent observed events.
+.TP
+.B apps
+Applications and tasks with event and byte totals.
+.TP
+.BI app " NAME|ID"
+Activity for one application, application ID or task ID.
+.TP
+.BI process " PID|ID"
+Process metadata and exec history.
+.TP
+.BI tree " [PID|ID]"
+Retained process descendants.
+.TP
+.BI file " PATH"
+File activity for an exact path.
+.TP
+.BI why " PATH"
+Processes that accessed or mutated a path, with evidence.
+.TP
+.B network
+Recent network observations.
+.TP
+.B flows
+TCP/UDP flow lifecycles, bytes, contributors, network context, role and exposure.
+.TP
+.B netns
+List network namespaces and containers with apps, listeners, published ports, Docker/Podman port mappings, LXC DNAT fallback, vopono provider/protocol/server, forwarded-port renewal and health metadata, and byte totals.
+.TP
+.BI explain " network " APP
+Combine flows, network context, roles and file activity into a semantic network verdict for an application.
+.TP
+.B summaries
+Build, save, startup and download-like summaries.
+.TP
+.B incidents
+Deterministic-rule incidents.
+.TP
+.B focus
+Summarise configured focus rules, matching activity, flows, incidents and auto-detected harness logs.
+.TP
+.BI investigate " ID"
+Render a complete Markdown investigation prompt and evidence bundle for an incident. Electric-eye does not call a model itself.
+
+.TP
+.B noise
+Suggest likely capture filters, rule allowlists and noisy correlations. The suggestion is reviewable TOML; nothing is applied.
+.TP
+.B db status
+Database size, WAL, table counts, retention window, disk headroom and storage drops.
+.TP
+.B db compact
+Flush pending writes, VACUUM the database and truncate the WAL.
+.TP
+.B config show
+Print the effective TOML configuration.
+.TP
+.BI config validate " PATH"
+Validate a configuration file without starting the daemon.
+.TP
+.BI export " KIND"
+Write JSONL for
+.BR activity ", " incidents ", " flows ", " summaries ", " apps " or " noise .
+.TP
+.BI ack " INCIDENT-ID"
+Locally acknowledge an incident; optional
+.B \-\-for
+sets an expiry.
+.TP
+.BI unack " INCIDENT-ID"
+Remove a local acknowledgement.
+.TP
+.BI mute " APP RULE"
+Locally mute matching incidents for one hour by default; optional
+.B \-\-for
+sets an expiry.
+.TP
+.BI unmute " APP RULE"
+Remove a local mute.
+.TP
+.BI completions " SHELL"
+Print a completion script for
+.BR bash ", " zsh " or " fish .
+.TP
+.B mcp
+Run the MCP stdio bridge to the daemon's MCP socket.
+.SH EXAMPLES
+.nf
+electric-eye status
+electric-eye doctor
+electric-eye tui
+electric-eye incidents --since 1h --severity high
+electric-eye activity --follow
+electric-eye export incidents --since 24h > incidents.jsonl
+electric-eye db status
+electric-eye noise
+.fi
+.SH ENVIRONMENT
+.TP
+.B ELECTRIC_EYE_SOCKET
+Default query socket override.
+.TP
+.B ELECTRIC_EYE_MCP_SOCKET
+Default MCP socket override.
+.TP
+.B ELECTRIC_EYED
+Path to the daemon binary used by
+.BR "config validate" .
+.SH FILES
+.TP
+.I /run/electric-eye/electric-eye.sock
+Query API socket.
+.TP
+.I /run/electric-eye/mcp.sock
+MCP socket.
+.TP
+.I /etc/electric-eye/config.toml
+System configuration fallback.
+.SH SEE ALSO
+.BR electric-eyed (8),
+.BR systemctl (1)

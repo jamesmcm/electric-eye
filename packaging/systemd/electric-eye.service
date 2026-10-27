@@ -11,6 +11,10 @@ ExecStart=/usr/bin/electric-eyed
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=5s
+# Structured startup/incident records go directly to journald. Per-event
+# stdout would otherwise copy every captured syscall into the journal.
+StandardOutput=null
+StandardError=journal
 
 # Runtime socket: /run/electric-eye/electric-eye.sock
 RuntimeDirectory=electric-eye

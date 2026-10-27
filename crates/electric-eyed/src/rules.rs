@@ -3,20 +3,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use electric_eye_core::{FileKind, NetEvent, ObservedEvent};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::ActivityEntry;
 
-const SENSITIVE_WINDOW_MS: u64 = 60_000;
-const BULK_WINDOW_MS: u64 = 10_000;
-const DEDUP_WINDOW_MS: u64 = 5 * 60_000;
-const BULK_FILE_THRESHOLD: usize = 50;
-const CREDENTIAL_CATEGORY_THRESHOLD: usize = 3;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    Low,
     Medium,
     High,
 }
@@ -24,6 +19,7 @@ pub enum Severity {
 impl Severity {
     pub fn as_str(self) -> &'static str {
         match self {
+            Severity::Low => "low",
             Severity::Medium => "medium",
             Severity::High => "high",
         }
@@ -31,6 +27,7 @@ impl Severity {
 
     pub fn priority(self) -> &'static str {
         match self {
+            Severity::Low => "5",
             Severity::Medium => "4",
             Severity::High => "3",
         }
@@ -82,26 +79,58 @@ pub struct Allowlist {
 }
 
 impl Allowlist {
+    #[cfg(test)]
     pub fn load_default() -> Self {
-        let mut allowlist = Self::default();
-        for comm in [
-            "unix_chkpwd",
-            "sudo",
-            "su",
-            "login",
-            "sshd",
-            "systemd-userdbd",
-        ] {
-            for path in ["/etc/shadow", "/etc/passwd", "/etc/gshadow"] {
-                allowlist.add(comm, path);
-            }
-        }
-        for comm in ["sudo", "visudo"] {
-            for path in ["/etc/sudoers", "/etc/sudoers.d"] {
-                allowlist.add(comm, path);
-            }
-        }
+        Self::load(&crate::config::RuleConfig::default())
+    }
 
+    pub fn load(config: &crate::config::RuleConfig) -> Self {
+        let mut allowlist = Self::default();
+        if config.builtin_auth_allowlist {
+            for comm in [
+                "unix_chkpwd",
+                "sudo",
+                "su",
+                "login",
+                "sshd",
+                "systemd-userdbd",
+                "pwck",
+                "chage",
+                "passwd",
+                "gpasswd",
+                "systemd-tmpfiles",
+                "systemd-tmpfile",
+                "systemd-sysusers",
+                "systemd-sysuser",
+                "useradd",
+                "usermod",
+                "userdel",
+                "groupadd",
+                "groupmod",
+                "groupdel",
+            ] {
+                for path in ["/etc/shadow", "/etc/passwd", "/etc/gshadow"] {
+                    allowlist.add(comm, path);
+                }
+            }
+            for comm in ["sudo", "visudo"] {
+                for path in ["/etc/sudoers", "/etc/sudoers.d"] {
+                    allowlist.add(comm, path);
+                }
+            }
+        }
+        if config.builtin_noise_allowlist {
+            // These identities routinely read credentials, logs, caches, and
+            // network metadata as part of their normal operation. Their
+            // activity remains visible in history; only rule incidents are
+            // suppressed. Users can turn this off and add narrower entries.
+            for comm in ["tailscaled", "thunar", "git", "cargo"] {
+                allowlist.add(comm, "*");
+            }
+        }
+        for rule in &config.allowlist {
+            allowlist.add(&rule.application, &rule.subject_prefix);
+        }
         let path = std::env::var_os("ELECTRIC_EYE_ALLOWLIST")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/etc/electric-eye/allowlist.conf"));
@@ -133,6 +162,7 @@ impl Allowlist {
         self.rules.push((comm.to_string(), prefix.to_string()));
     }
 
+    #[cfg(test)]
     pub fn allows(&self, comm: &str, subject: &str) -> bool {
         self.rules.iter().any(|(allowed_comm, prefix)| {
             allowed_comm == comm && (prefix == "*" || subject.starts_with(prefix))
@@ -165,14 +195,18 @@ pub struct Incident {
     pub details: Value,
 }
 
-#[derive(Default)]
 pub struct AnomalyEngine {
-    homes: HashMap<u32, Option<PathBuf>>,
-    sensitive: HashMap<String, VecDeque<(u64, &'static str)>>,
-    mutations: HashMap<String, VecDeque<(u64, String)>>,
-    dedup: HashMap<String, u64>,
+    homes: crate::cache::Recent<Option<PathBuf>>,
+    sensitive: crate::cache::Recent<VecDeque<(u64, String)>>,
+    mutations: crate::cache::Recent<VecDeque<(u64, String)>>,
+    trusted_ssh: crate::cache::Recent<Vec<String>>,
+    dedup: crate::cache::Recent<u64>,
     baseline: BaselineData,
     allowlist: Allowlist,
+    network_allowlist: Vec<crate::config::NetworkAllowRule>,
+    config: crate::config::RuleConfig,
+    last_prune: u64,
+    watermark: u64,
 }
 
 impl AnomalyEngine {
@@ -181,15 +215,117 @@ impl AnomalyEngine {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn with_context(baseline: BaselineData, allowlist: Allowlist) -> Self {
+        Self::configured(baseline, allowlist, crate::config::RuleConfig::default())
+    }
+    pub fn configured(
+        mut baseline: BaselineData,
+        allowlist: Allowlist,
+        config: crate::config::RuleConfig,
+    ) -> Self {
+        baseline.paths = baseline
+            .paths
+            .into_iter()
+            .take(config.max_baseline_entries)
+            .collect();
+        baseline.network = baseline
+            .network
+            .into_iter()
+            .take(config.max_baseline_entries)
+            .collect();
+        baseline.network_counts.clear();
+        for (app, _) in &baseline.network {
+            *baseline.network_counts.entry(app.clone()).or_default() += 1;
+        }
         Self {
+            homes: crate::cache::Recent::new(config.max_actors),
+            sensitive: crate::cache::Recent::new(config.max_actors),
+            mutations: crate::cache::Recent::new(config.max_actors),
+            trusted_ssh: crate::cache::Recent::new(config.max_actors),
+            dedup: crate::cache::Recent::new(config.max_dedup_entries),
             baseline,
             allowlist,
-            ..Self::default()
+            network_allowlist: config.network_allowlist.clone(),
+            config,
+            last_prune: 0,
+            watermark: 0,
         }
     }
-
+    pub fn prune(&mut self, now: u64) {
+        self.watermark = self.watermark.max(now);
+        if self.watermark.saturating_sub(self.last_prune) < self.config.prune_interval_ms {
+            return;
+        }
+        self.last_prune = self.watermark;
+        self.sensitive.expire_before(
+            self.watermark
+                .saturating_sub(self.config.sensitive_window_ms),
+        );
+        self.mutations
+            .expire_before(self.watermark.saturating_sub(self.config.bulk_window_ms));
+        self.trusted_ssh.expire_before(
+            self.watermark
+                .saturating_sub(self.config.sensitive_window_ms.max(300_000)),
+        );
+        self.dedup
+            .expire_before(self.watermark.saturating_sub(self.config.dedup_window_ms));
+    }
+    fn classify(&self, path: &str, home: Option<&Path>) -> Option<(String, Severity)> {
+        self.config
+            .sensitive_paths
+            .iter()
+            .find(|r| Path::new(path).starts_with(&r.prefix))
+            .map(|r| (r.category.clone(), r.severity))
+            .or_else(|| {
+                self.config
+                    .builtin_sensitive_paths
+                    .then(|| classify_with_home(path, home))
+                    .flatten()
+                    .map(|(c, s)| (c.into(), s))
+            })
+    }
     pub fn observe(&mut self, entry: &ActivityEntry) -> Vec<Incident> {
+        self.prune(entry.ts_ms);
+        let actor = timeline_key(entry);
+        if matches!(entry.event, ObservedEvent::Exit(_) | ObservedEvent::Exec(_)) {
+            self.sensitive.remove(&actor);
+            self.mutations.remove(&actor);
+        }
+        if let ObservedEvent::Exec(event) = &entry.event
+            && event.comm == "ssh"
+            && let Some(info) = &entry.process_info
+        {
+            let mut hosts: Vec<String> = Vec::new();
+            if entry
+                .parent
+                .as_deref()
+                .is_some_and(|parent| parent == "git" || parent.starts_with("git-remote"))
+            {
+                hosts.extend(
+                    info.argv
+                        .iter()
+                        .filter_map(|arg| allowed_trusted_ssh_host(arg)),
+                );
+            }
+            if self.config.known_hosts_allow
+                && let Some((host, port)) = crate::known_hosts::destination(&info.argv)
+            {
+                let (_, uid, _) = event_identity(&entry.event);
+                let home = self.home_for(uid);
+                if crate::known_hosts::KnownHosts::load(home.as_deref()).is_known(&host, port) {
+                    hosts.push(host);
+                }
+            }
+            hosts.sort();
+            hosts.dedup();
+            if !hosts.is_empty() {
+                self.trusted_ssh.insert(actor.clone(), entry.ts_ms, hosts);
+            }
+        }
+        if matches!(entry.event, ObservedEvent::Exit(_)) {
+            self.trusted_ssh.remove(&actor);
+        }
         let mut incidents = Vec::new();
         if entry.syscall_result.is_some_and(|result| result < 0)
             || matches!(
@@ -244,8 +380,17 @@ impl AnomalyEngine {
         let (pid, uid, comm) = event_identity(&entry.event);
         let app = app_key(entry);
         let actor = timeline_key(entry);
+        if comm == "ssh" && self.trusted_ssh.get(&actor).is_some() {
+            return;
+        }
         let home = self.home_for(uid);
         let now = entry.ts_ms;
+        let directory_listing = matches!(&entry.event, ObservedEvent::FileRead(_))
+            || matches!(
+                &entry.event,
+                ObservedEvent::FileOpen(file)
+                    if matches!(file.kind, FileKind::Read | FileKind::Open)
+            );
         let mut categories = Vec::new();
         let mutation = matches!(
             &entry.event,
@@ -259,19 +404,31 @@ impl AnomalyEngine {
                 continue;
             }
             let known = self.baseline.knows_path(&app, path);
-            if mutation && !is_bulk_noise_path(path) {
-                self.mutations
-                    .entry(actor.clone())
-                    .or_default()
-                    .push_back((now, (*path).to_string()));
+            if self.config.bulk_mutation && mutation && !is_bulk_noise_path(path, &self.config) {
+                let window =
+                    self.mutations
+                        .get_or_insert_with(actor.clone(), self.watermark, VecDeque::new);
+                push_bounded(
+                    window,
+                    (now, (*path).to_string()),
+                    self.config.max_events_per_actor,
+                );
             }
-            if let Some((category, severity)) = classify_with_home(path, home.as_deref()) {
-                if category == "Browser credentials" && is_browser_app(&app) {
+            if let Some((category, severity)) = self.classify(path, home.as_deref()) {
+                // Listing a sensitive directory is metadata access, not reading
+                // the credentials inside it. Only file-level access is classified.
+                if directory_listing && path_is_directory(path) {
                     continue;
                 }
-                categories.push(category);
+                if category == "Browser credentials" && is_browser_app(&app, &self.config) {
+                    continue;
+                }
+                categories.push(category.clone());
                 let title = format!("Sensitive path access: {category}");
-                if !known && self.should_emit(&title, &app, Some(path), now) {
+                if self.config.sensitive_path
+                    && !known
+                    && self.should_emit(&title, &app, Some(path), now)
+                {
                     incidents.push(Incident {
                         id: String::new(),
                         process: None,
@@ -293,46 +450,29 @@ impl AnomalyEngine {
                         }),
                     });
                 }
-            } else if path.starts_with("/nix/store/")
-                && !matches!(comm.as_str(), "nix-daemon" | "nix" | "nix-store")
-            {
-                let title = "Write attempted under /nix/store".to_string();
-                if self.should_emit(&title, &app, Some(path), now) {
-                    incidents.push(Incident {
-                        id: String::new(),
-                        process: None,
-                        exe: None,
-                        ts_ms: now,
-                        severity: Severity::High,
-                        title,
-                        pid,
-                        comm: comm.clone(),
-                        path: Some((*path).to_string()),
-                        unit: entry.unit.clone(),
-                        details: json!({
-                            "rule": "nix_store_write",
-                            "operation": operation,
-                            "unit": entry.unit,
-                            "nix": entry.nix,
-                        }),
-                    });
-                }
             }
         }
 
         if !categories.is_empty() {
-            let window = self.sensitive.entry(actor.clone()).or_default();
+            let window =
+                self.sensitive
+                    .get_or_insert_with(actor.clone(), self.watermark, VecDeque::new);
             for category in categories {
-                window.push_back((now, category));
+                push_bounded(window, (now, category), self.config.max_events_per_actor);
             }
             while window
                 .front()
-                .is_some_and(|(ts, _)| now.saturating_sub(*ts) > SENSITIVE_WINDOW_MS)
+                .is_some_and(|(ts, _)| now.saturating_sub(*ts) > self.config.sensitive_window_ms)
             {
                 window.pop_front();
             }
-            let distinct: HashSet<&str> = window.iter().map(|(_, category)| *category).collect();
-            if distinct.len() >= CREDENTIAL_CATEGORY_THRESHOLD {
+            let distinct: HashSet<String> = window
+                .iter()
+                .map(|(_, category)| category.clone())
+                .collect();
+            if self.config.credential_sweep
+                && distinct.len() >= self.config.credential_category_threshold
+            {
                 let title = "Credential sweep across multiple sensitive categories".to_string();
                 if self.should_emit(&title, &app, None, now) {
                     incidents.push(Incident {
@@ -356,7 +496,7 @@ impl AnomalyEngine {
             }
         }
 
-        self.observe_bulk(entry, &app, &actor, incidents);
+        self.observe_bulk(entry, &app, &actor, home.as_deref(), incidents);
     }
 
     fn observe_bulk(
@@ -364,28 +504,34 @@ impl AnomalyEngine {
         entry: &ActivityEntry,
         app: &str,
         actor: &str,
+        home: Option<&Path>,
         incidents: &mut Vec<Incident>,
     ) {
         let (pid, _, comm) = event_identity(&entry.event);
         let now = entry.ts_ms;
         let unit = entry.unit.as_deref();
-        if is_high_churn_app(app) {
+        if !self.config.bulk_mutation || is_high_churn_app(app, &self.config) {
             return;
         }
-        let unique_count = {
+        let (unique_count, files, files_truncated, scope, severity) = {
             let Some(window) = self.mutations.get_mut(actor) else {
                 return;
             };
             while window
                 .front()
-                .is_some_and(|(ts, _)| now.saturating_sub(*ts) > BULK_WINDOW_MS)
+                .is_some_and(|(ts, _)| now.saturating_sub(*ts) > self.config.bulk_window_ms)
             {
                 window.pop_front();
             }
             let unique: HashSet<&str> = window.iter().map(|(_, path)| path.as_str()).collect();
-            unique.len()
+            let (scope, severity) = bulk_scope(unique.iter().copied(), home);
+            let mut files: Vec<String> = unique.iter().map(|path| (*path).to_string()).collect();
+            files.sort();
+            let truncated = files.len() > 32;
+            files.truncate(32);
+            (unique.len(), files, truncated, scope, severity)
         };
-        if unique_count >= BULK_FILE_THRESHOLD {
+        if unique_count >= self.config.bulk_file_threshold {
             let title = "Bulk filesystem mutation".to_string();
             if self.should_emit(&title, app, None, now) {
                 incidents.push(Incident {
@@ -393,7 +539,7 @@ impl AnomalyEngine {
                     process: None,
                     exe: None,
                     ts_ms: now,
-                    severity: Severity::Medium,
+                    severity,
                     title,
                     pid,
                     comm: comm.to_string(),
@@ -401,8 +547,11 @@ impl AnomalyEngine {
                     unit: unit.map(str::to_string),
                     details: json!({
                         "rule": "bulk_mutation",
+                        "scope": scope,
                         "files_in_window": unique_count,
-                        "window_seconds": BULK_WINDOW_MS / 1000,
+                        "files": files,
+                        "files_truncated": files_truncated,
+                        "window_seconds": self.config.bulk_window_ms / 1000,
                     }),
                 });
             }
@@ -410,14 +559,19 @@ impl AnomalyEngine {
     }
 
     fn observe_exec(&mut self, entry: &ActivityEntry, incidents: &mut Vec<Incident>) {
+        if !self.config.suspicious_execution {
+            return;
+        }
         let ObservedEvent::Exec(event) = &entry.event else {
             return;
         };
         let exe = event.exe.display().to_string();
-        if self.allowlist.allows(&event.comm, &exe) {
+        if self.allowlist.allows_identity(&event.comm, &exe, &exe) {
             return;
         }
-        let Some(reason) = suspicious_execution(&exe, self.home_for(event.uid).as_deref()) else {
+        let Some(reason) =
+            suspicious_execution(&exe, self.home_for(event.uid).as_deref(), &self.config)
+        else {
             return;
         };
         let title = "Executable launched from a suspicious location".to_string();
@@ -444,14 +598,127 @@ impl AnomalyEngine {
         }
     }
 
+    fn network_allowed(
+        &self,
+        comm: &str,
+        app: &str,
+        net: &NetEvent,
+        direction: crate::config::NetworkDirection,
+    ) -> bool {
+        let basename = app.rsplit('/').next().unwrap_or(app);
+        self.network_allowlist.iter().any(|rule| {
+            (rule.direction == crate::config::NetworkDirection::Both || rule.direction == direction)
+                && (rule.application == "*"
+                    || rule.application.eq_ignore_ascii_case(comm)
+                    || rule.application.eq_ignore_ascii_case(app)
+                    || rule.application.eq_ignore_ascii_case(basename))
+                && destination_matches(&rule.destination, net)
+        })
+    }
+
+    fn observe_incoming(
+        &mut self,
+        entry: &ActivityEntry,
+        net: &NetEvent,
+        app: &str,
+        incidents: &mut Vec<Incident>,
+    ) {
+        if !self.config.incoming_connections
+            || net.local_port == 0
+            || net.addr == [0; 16]
+            || is_high_churn_app(app, &self.config)
+        {
+            return;
+        }
+        let remote_ip = net.addr_string();
+        let Ok(ip) = remote_ip.parse::<IpAddr>() else {
+            return;
+        };
+        if ip.is_unspecified() {
+            return;
+        }
+        let source_scope = if is_loopback_ip(ip) {
+            "same_machine"
+        } else if is_private_ip(ip) {
+            "local_network"
+        } else {
+            "remote"
+        };
+        if source_scope != "remote" && !self.config.incoming_local_connections {
+            return;
+        }
+        let source_label = match source_scope {
+            "same_machine" => "same machine",
+            "local_network" => "local network",
+            _ => "remote",
+        };
+        let service = service_name(net.local_port);
+        let title = format!("Incoming connection: {service} [{source_label}]");
+        let subject = format!("{}:{}", net.local_port, remote_ip);
+        if !self.should_emit(&title, app, Some(&subject), entry.ts_ms) {
+            return;
+        }
+        incidents.push(Incident {
+            id: String::new(),
+            process: None,
+            exe: None,
+            ts_ms: entry.ts_ms,
+            // A remote source is materially more exposed than a local or
+            // same-machine peer.
+            severity: if source_scope == "remote" {
+                Severity::High
+            } else {
+                Severity::Medium
+            },
+            title,
+            pid: net.pid,
+            comm: net.comm.clone(),
+            path: Some(net.remote_endpoint()),
+            unit: entry.unit.clone(),
+            details: json!({
+                "rule": "incoming_connection",
+                "direction": "inbound",
+                "source_scope": source_scope,
+                "source_label": source_label,
+                "service": service,
+                "local_port": net.local_port,
+                "remote": net.remote_endpoint(),
+                "unit": entry.unit,
+            }),
+        });
+    }
+
     fn observe_network(&mut self, entry: &ActivityEntry, incidents: &mut Vec<Incident>) {
         let net = match &entry.event {
             ObservedEvent::Connect(event) => event,
             ObservedEvent::Accept(event) => event,
             _ => return,
         };
+        let actor = timeline_key(entry);
+        if net.comm == "ssh"
+            && self.trusted_ssh.get(&actor).is_some_and(|hosts| {
+                net.hostname.as_deref().is_some_and(|hostname| {
+                    let hostname = hostname.to_ascii_lowercase();
+                    hosts.iter().any(|host| hostname.contains(host))
+                })
+            })
+        {
+            return;
+        }
         let app = app_key(entry);
         let destination = net.remote_endpoint();
+        let direction = if matches!(&entry.event, ObservedEvent::Accept(_)) {
+            crate::config::NetworkDirection::Inbound
+        } else {
+            crate::config::NetworkDirection::Outbound
+        };
+        if self.network_allowed(&net.comm, &app, net, direction) {
+            return;
+        }
+        if matches!(&entry.event, ObservedEvent::Accept(_)) {
+            self.observe_incoming(entry, net, &app, incidents);
+            return;
+        }
         if self
             .allowlist
             .allows_identity(&net.comm, &app, &destination)
@@ -472,10 +739,10 @@ impl AnomalyEngine {
             window
                 .iter()
                 .rev()
-                .find(|(ts, _)| entry.ts_ms.saturating_sub(*ts) <= SENSITIVE_WINDOW_MS)
-                .map(|(ts, category)| (*ts, *category))
+                .find(|(ts, _)| entry.ts_ms.saturating_sub(*ts) <= self.config.sensitive_window_ms)
+                .map(|(ts, category)| (*ts, category.clone()))
         };
-        if let Some((ts, category)) = recent {
+        if let Some((ts, category)) = recent.filter(|_| self.config.sensitive_egress) {
             let title = "Sensitive path access followed by network egress".to_string();
             if self.should_emit(&title, &app, None, entry.ts_ms) {
                 incidents.push(Incident {
@@ -512,12 +779,12 @@ impl AnomalyEngine {
         destination: &str,
         incidents: &mut Vec<Incident>,
     ) {
-        if is_high_churn_app(app) {
+        if !self.config.novel_network || is_high_churn_app(app, &self.config) {
             return;
         }
         let known = self.baseline.knows_network(app, destination);
         let count = self.baseline.network_destination_count(app);
-        if !known && count >= 5 {
+        if !known && count >= self.config.novel_network_min_destinations {
             self.emit_novel_network(entry, net, app, destination, count, incidents);
         }
     }
@@ -558,20 +825,21 @@ impl AnomalyEngine {
     fn should_emit(&mut self, title: &str, comm: &str, path: Option<&str>, now: u64) -> bool {
         let key = format!("{title}|{comm}|{}", path.unwrap_or_default());
         if let Some(last) = self.dedup.get(&key)
-            && now.saturating_sub(*last) < DEDUP_WINDOW_MS
+            && now.saturating_sub(*last) < self.config.dedup_window_ms
         {
             return false;
         }
-        self.dedup.insert(key, now);
+        self.dedup.insert(key, self.watermark.max(now), now);
         true
     }
 
     fn home_for(&mut self, uid: u32) -> Option<PathBuf> {
-        if let Some(home) = self.homes.get(&uid) {
+        if let Some(home) = self.homes.get(&uid.to_string()) {
             return home.clone();
         }
         let home = home_for_uid(uid);
-        self.homes.insert(uid, home.clone());
+        self.homes
+            .insert(uid.to_string(), self.watermark, home.clone());
         home
     }
 }
@@ -609,78 +877,122 @@ fn app_key(entry: &ActivityEntry) -> String {
         .unwrap_or_else(|| event_identity(&entry.event).2)
 }
 
-fn is_browser_app(app: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "/usr/lib/firefox",
-        "/usr/bin/firefox",
-        "/opt/firefox",
-        "/usr/lib/chromium",
-        "/usr/bin/chromium",
-        "/opt/google/chrome",
-        "/opt/brave",
-        "/usr/bin/brave",
-        "/usr/lib/brave",
-    ];
-    PREFIXES.iter().any(|prefix| app.starts_with(prefix))
-        || (app.starts_with("/nix/store/")
-            && (app.contains("-firefox")
-                || app.contains("-chromium")
-                || app.contains("-google-chrome")
-                || app.contains("-brave")))
+fn allowed_trusted_ssh_host(argument: &str) -> Option<String> {
+    let argument = argument.to_ascii_lowercase();
+    [
+        "ssh.github.com",
+        "github.com",
+        "altssh.gitlab.com",
+        "gitlab.com",
+    ]
+    .iter()
+    .find(|host| argument.contains(**host))
+    .map(|host| (*host).to_string())
 }
 
-fn is_bulk_noise_path(path: &str) -> bool {
+pub(crate) fn is_browser_app(app: &str, config: &crate::config::RuleConfig) -> bool {
+    config
+        .browser_prefixes
+        .iter()
+        .any(|prefix| app.starts_with(prefix))
+        || app.starts_with("/nix/store/")
+            && config
+                .browser_nix_names
+                .iter()
+                .any(|name| app.contains(name))
+}
+fn is_bulk_noise_path(path: &str, config: &crate::config::RuleConfig) -> bool {
     let path = path.to_ascii_lowercase();
-    [
-        "/.cache/",
-        "/.thumbnails/",
-        "/cache/",
-        "/target/",
-        "/node_modules/",
-        "/.mozilla/",
-        "/.config/chromium/",
-        "/.config/google-chrome/",
-        "/.local/share/trash/",
-        "/tmp/",
-        "/var/tmp/",
-        "/var/cache/",
-    ]
-    .iter()
-    .any(|marker| path.contains(marker))
+    config
+        .bulk_noise_paths
+        .iter()
+        .any(|marker| path.contains(&marker.to_ascii_lowercase()))
+}
+pub(crate) fn bulk_scope<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    home: Option<&Path>,
+) -> (&'static str, Severity) {
+    let parents: Vec<std::path::PathBuf> = paths
+        .into_iter()
+        .filter_map(|path| Path::new(path).parent().map(Path::to_path_buf))
+        .collect();
+    if parents.is_empty() {
+        return ("unknown", Severity::Medium);
+    }
+    let common = common_parent(&parents);
+    if common == Path::new("/") {
+        return ("filesystem_wide", Severity::High);
+    }
+    if let Some(home) = home {
+        if common == home {
+            return ("home_root", Severity::High);
+        }
+        if common.starts_with(home) {
+            return ("single_directory", Severity::Low);
+        }
+    }
+    if common.starts_with("/etc")
+        || common.starts_with("/usr")
+        || common.starts_with("/boot")
+        || common.starts_with("/root")
+    {
+        return ("system_paths", Severity::High);
+    }
+    if common.starts_with("/var") || common.starts_with("/opt") || common.starts_with("/srv") {
+        return if common.components().count() >= 3 {
+            ("single_directory", Severity::Low)
+        } else {
+            ("system_paths", Severity::High)
+        };
+    }
+    if common.components().count() >= 3 {
+        ("single_directory", Severity::Low)
+    } else {
+        ("multiple_directories", Severity::Medium)
+    }
 }
 
-fn is_high_churn_app(app: &str) -> bool {
-    if is_browser_app(app) {
-        return true;
+fn common_parent(paths: &[std::path::PathBuf]) -> std::path::PathBuf {
+    let mut prefix = std::path::PathBuf::new();
+    for component in paths[0].components() {
+        let candidate = prefix.join(component.as_os_str());
+        if paths.iter().all(|path| path.starts_with(&candidate)) {
+            prefix = candidate;
+        } else {
+            break;
+        }
     }
-    let app = app.to_ascii_lowercase();
-    [
-        "transmission",
-        "qbittorrent",
-        "deluge",
-        "ktorrent",
-        "aria2",
-        "rtorrent",
-        "thunar",
-        "tumblerd",
-        "tracker",
-        "baloo",
-        "cargo",
-        "rustc",
-        "nix-daemon",
-        "nix-store",
-        "node",
-        "bun",
-        "deno",
-        "opencode",
-    ]
-    .iter()
-    .any(|name| app.contains(name))
+    prefix
+}
+
+pub(crate) fn is_high_churn_app(app: &str, config: &crate::config::RuleConfig) -> bool {
+    is_browser_app(app, config)
+        || config.high_churn_apps.iter().any(|name| {
+            app.to_ascii_lowercase()
+                .contains(&name.to_ascii_lowercase())
+        })
+}
+fn push_bounded<T>(window: &mut VecDeque<T>, value: T, limit: usize) {
+    while window.len() >= limit {
+        window.pop_front();
+    }
+    window.push_back(value);
+}
+impl Default for AnomalyEngine {
+    fn default() -> Self {
+        Self::configured(
+            BaselineData::default(),
+            Allowlist::default(),
+            crate::config::RuleConfig::default(),
+        )
+    }
 }
 
 fn event_identity(event: &ObservedEvent) -> (u32, u32, String) {
     match event {
-        ObservedEvent::Exec(event) => (event.pid, event.uid, event.comm.clone()),
+        ObservedEvent::Exec(event) | ObservedEvent::Fork(event) => {
+            (event.pid, event.uid, event.comm.clone())
+        }
         ObservedEvent::Exit(event) => (event.pid, event.uid, event.comm.clone()),
         ObservedEvent::Connect(event)
         | ObservedEvent::Accept(event)
@@ -708,11 +1020,29 @@ fn home_for_uid(uid: u32) -> Option<PathBuf> {
     None
 }
 
+fn path_is_directory(path: &str) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+}
+
 fn classify_with_home(path: &str, home: Option<&Path>) -> Option<(&'static str, Severity)> {
+    // known_hosts contains public host keys, not credentials. curl and other
+    // clients read it during normal startup even for non-SSH URLs.
+    if path.ends_with("/.ssh/known_hosts")
+        || path.ends_with("/.ssh/known_hosts.old")
+        || path.ends_with("/.ssh/known_hosts2")
+    {
+        return None;
+    }
     let path = Path::new(path);
     let home_relative = |relative: &str| {
         home.is_some_and(|home| path.starts_with(home.join(relative)))
-            || path.to_string_lossy().contains(&format!("/{relative}/"))
+            // Cross-user home paths are still meaningful, but arbitrary
+            // temporary directories containing `.aws`/`.ssh` components are
+            // not credential stores.
+            || ((path.starts_with("/home/") || path.starts_with("/root/"))
+                && path.to_string_lossy().contains(&format!("/{relative}/")))
     };
 
     if path.starts_with("/nix/store") {
@@ -724,7 +1054,19 @@ fn classify_with_home(path: &str, home: Option<&Path>) -> Option<(&'static str, 
     {
         return Some(("System credentials", Severity::High));
     }
-    if path.starts_with("/etc/ssh") || path.starts_with("/root/.ssh") {
+    if path.starts_with("/etc/ssh/") {
+        // moduli, ssh_config, sshd_config and public host keys are not
+        // credentials. Only private host keys belong in the credential rule.
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name.starts_with("ssh_host_") && name.contains("_key") && !name.ends_with(".pub") {
+            return Some(("SSH", Severity::High));
+        }
+        return None;
+    }
+    if path.starts_with("/root/.ssh") {
         return Some(("SSH", Severity::High));
     }
     if path.starts_with("/etc/systemd/system")
@@ -734,6 +1076,13 @@ fn classify_with_home(path: &str, home: Option<&Path>) -> Option<(&'static str, 
         return Some(("Persistence", Severity::High));
     }
     if home_relative(".ssh") {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name.ends_with(".pub") {
+            return None;
+        }
         return Some(("SSH", Severity::High));
     }
     if home_relative(".gnupg") {
@@ -788,26 +1137,109 @@ fn classify_with_home(path: &str, home: Option<&Path>) -> Option<(&'static str, 
     None
 }
 
-fn suspicious_execution(exe: &str, home: Option<&Path>) -> Option<&'static str> {
-    if exe == "(exited)" {
-        return None;
+fn suspicious_execution(
+    exe: &str,
+    home: Option<&Path>,
+    config: &crate::config::RuleConfig,
+) -> Option<String> {
+    if config
+        .suspicious_prefixes
+        .iter()
+        .any(|prefix| Path::new(exe).starts_with(prefix))
+    {
+        return Some("configured writable/runtime location".into());
     }
-    if exe.starts_with("/tmp/") || exe.starts_with("/dev/shm/") || exe.starts_with("/run/user/") {
-        return Some("temporary or writable runtime directory");
-    }
-    if let Some(home) = home {
-        let path = Path::new(exe);
-        if path.starts_with(home.join("Downloads")) {
-            return Some("downloads directory");
-        }
-        if path.starts_with(home.join(".cache")) {
-            return Some("browser/user cache");
-        }
-        if path.starts_with(home.join(".local/share/Trash")) {
-            return Some("trash");
-        }
+    if let Some(home) = home
+        && config
+            .suspicious_home_paths
+            .iter()
+            .any(|relative| Path::new(exe).starts_with(home.join(relative)))
+    {
+        return Some("configured user writable location".into());
     }
     None
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+        }
+    }
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => {
+            ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|ip| ip.is_private() || ip.is_link_local() || ip.is_loopback())
+        }
+    }
+}
+
+fn service_name(port: u16) -> String {
+    match port {
+        22 => "SSH",
+        80 => "HTTP",
+        443 => "HTTPS",
+        3306 => "MySQL",
+        5432 => "PostgreSQL",
+        6379 => "Redis",
+        9200 => "Elasticsearch",
+        _ => return format!("port {port}"),
+    }
+    .into()
+}
+
+fn destination_matches(pattern: &str, net: &NetEvent) -> bool {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    let target = net.addr_string();
+    if let Some((base, prefix)) = pattern.split_once('/') {
+        let (Ok(ip), Ok(base), Ok(prefix)) = (
+            target.parse::<IpAddr>(),
+            base.parse::<IpAddr>(),
+            prefix.parse::<u32>(),
+        ) else {
+            return false;
+        };
+        return ip_in_cidr(ip, base, prefix);
+    }
+    if let Ok(ip) = pattern.parse::<IpAddr>() {
+        return target.parse::<IpAddr>().ok() == Some(ip);
+    }
+    let host = net
+        .hostname
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == pattern || host.ends_with(&format!(".{pattern}"))
+}
+
+fn ip_in_cidr(ip: IpAddr, base: IpAddr, prefix: u32) -> bool {
+    match (ip, base) {
+        (IpAddr::V4(ip), IpAddr::V4(base)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(ip) & mask == u32::from(base) & mask
+        }
+        (IpAddr::V6(ip), IpAddr::V6(base)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(ip) & mask == u128::from(base) & mask
+        }
+        _ => false,
+    }
 }
 
 fn is_public_destination(net: &NetEvent) -> bool {
@@ -822,12 +1254,28 @@ fn is_public_destination(net: &NetEvent) -> bool {
         _ => return false,
     };
     match ip {
-        IpAddr::V4(ip) => !ip.is_private() && !ip.is_loopback() && !ip.is_link_local(),
+        IpAddr::V4(ip) => {
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_broadcast()
+                && !ip.is_multicast()
+        }
         IpAddr::V6(ip) => {
+            if let Some(ip) = ip.to_ipv4_mapped() {
+                return !ip.is_private()
+                    && !ip.is_loopback()
+                    && !ip.is_link_local()
+                    && !ip.is_unspecified()
+                    && !ip.is_broadcast()
+                    && !ip.is_multicast();
+            }
             let octets = ip.octets();
             !ip.is_loopback()
                 && !ip.is_unicast_link_local()
                 && !ip.is_unspecified()
+                && !ip.is_multicast()
                 && (octets[0] & 0xfe) != 0xfc
         }
     }
@@ -864,6 +1312,33 @@ mod tests {
             classify_with_home("/home/alice/notes.txt", Some(home)),
             None
         );
+        assert_eq!(
+            classify_with_home("/tmp/unrelated/.aws/credentials", Some(home)),
+            None,
+            "temporary directories must not look like credential stores"
+        );
+        assert_eq!(
+            classify_with_home("/home/bob/.aws/credentials", Some(home)).map(|v| v.0),
+            Some("AWS credentials")
+        );
+        assert_eq!(
+            classify_with_home("/home/alice/.ssh/id_ed25519.pub", Some(home)),
+            None
+        );
+        assert_eq!(classify_with_home("/etc/ssh/moduli", None), None);
+        assert_eq!(classify_with_home("/etc/ssh/ssh_config", None), None);
+        assert_eq!(
+            classify_with_home("/etc/ssh/ssh_host_ed25519_key", None).map(|v| v.0),
+            Some("SSH")
+        );
+        assert_eq!(
+            classify_with_home("/home/alice/.ssh/known_hosts", Some(home)),
+            None
+        );
+        assert_eq!(
+            classify_with_home("/home/alice/.ssh/known_hosts.old", Some(home)),
+            None
+        );
     }
 
     #[test]
@@ -886,7 +1361,12 @@ mod tests {
         let now = now_ms();
         assert!(engine.should_emit("rule", "comm", Some("/tmp/x"), now));
         assert!(!engine.should_emit("rule", "comm", Some("/tmp/x"), now + 1000));
-        assert!(engine.should_emit("rule", "comm", Some("/tmp/x"), now + DEDUP_WINDOW_MS + 1));
+        assert!(engine.should_emit(
+            "rule",
+            "comm",
+            Some("/tmp/x"),
+            now + engine.config.dedup_window_ms + 1
+        ));
     }
 
     #[test]
@@ -894,8 +1374,31 @@ mod tests {
         let allowlist = Allowlist::load_default();
         assert!(allowlist.allows("sudo", "/etc/shadow"));
         assert!(allowlist.allows("unix_chkpwd", "/etc/passwd"));
+        assert!(allowlist.allows("pwck", "/etc/shadow"));
+        assert!(allowlist.allows("systemd-tmpfiles", "/etc/shadow"));
+        assert!(allowlist.allows("systemd-tmpfile", "/etc/shadow"));
+        assert!(allowlist.allows("systemd-sysuser", "/etc/passwd"));
         assert!(!allowlist.allows("bash", "/etc/shadow"));
         assert!(!allowlist.allows("sudo", "/home/alice/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn builtin_noise_allowlist_covers_tailscaled_and_thunar_and_can_be_disabled() {
+        let allowlist = Allowlist::load_default();
+        assert!(allowlist.allows("tailscaled", "/var/lib/tailscale/tailscaled.state"));
+        assert!(allowlist.allows("thunar", "/home/alice/.ssh"));
+        assert!(allowlist.allows("git", "/home/alice/.ssh/id_ed25519"));
+        assert!(allowlist.allows("cargo", "/home/alice/.cargo/credentials"));
+        assert!(!allowlist.allows("ssh", "/home/alice/.ssh/config"));
+        let config = crate::config::RuleConfig {
+            builtin_noise_allowlist: false,
+            ..Default::default()
+        };
+        let allowlist = Allowlist::load(&config);
+        assert!(!allowlist.allows("tailscaled", "/var/lib/tailscale/tailscaled.state"));
+        assert!(!allowlist.allows("thunar", "/home/alice/.ssh"));
+        assert!(!allowlist.allows("git", "/home/alice/.ssh/id_ed25519"));
+        assert!(!allowlist.allows("ssh", "/home/alice/.ssh/config"));
     }
 
     #[test]
@@ -923,6 +1426,9 @@ mod tests {
         let entry = ActivityEntry {
             ts_ms: 1_000,
             syscall_result: None,
+            event_id: None,
+            process_info: None,
+            application: None,
             process: None,
             path_resolution: None,
             event: ObservedEvent::FileRead(electric_eye_core::FileEvent {
@@ -949,6 +1455,9 @@ mod tests {
         let entry = ActivityEntry {
             ts_ms: 1_000,
             syscall_result: None,
+            event_id: None,
+            process_info: None,
+            application: None,
             process: None,
             path_resolution: None,
             event: ObservedEvent::FileRead(electric_eye_core::FileEvent {
@@ -974,6 +1483,9 @@ mod tests {
         let entry = ActivityEntry {
             ts_ms: 1_000,
             syscall_result: None,
+            event_id: None,
+            process_info: None,
+            application: None,
             process: None,
             path_resolution: None,
             event: ObservedEvent::FileWrite(electric_eye_core::FileEvent {
@@ -996,12 +1508,25 @@ mod tests {
     #[test]
     fn cache_paths_do_not_trigger_bulk_mutation() {
         assert!(is_bulk_noise_path(
-            "/home/alice/.cache/thumbnails/large/abc.png"
+            "/home/alice/.cache/thumbnails/large/abc.png",
+            &crate::config::RuleConfig::default()
         ));
-        assert!(!is_bulk_noise_path("/home/alice/Documents/report.pdf"));
-        assert!(is_high_churn_app("transmission-gtk"));
-        assert!(is_high_churn_app("/usr/lib/firefox/firefox"));
-        assert!(!is_high_churn_app("/usr/bin/python3"));
+        assert!(!is_bulk_noise_path(
+            "/home/alice/Documents/report.pdf",
+            &crate::config::RuleConfig::default()
+        ));
+        assert!(is_high_churn_app(
+            "transmission-gtk",
+            &crate::config::RuleConfig::default()
+        ));
+        assert!(is_high_churn_app(
+            "/usr/lib/firefox/firefox",
+            &crate::config::RuleConfig::default()
+        ));
+        assert!(!is_high_churn_app(
+            "/usr/bin/python3",
+            &crate::config::RuleConfig::default()
+        ));
     }
 }
 
@@ -1022,6 +1547,9 @@ mod correlation_regressions {
         ActivityEntry {
             ts_ms: 1_000_000,
             syscall_result: None,
+            event_id: None,
+            process_info: None,
+            application: None,
             process: Some(crate::api::ProcessIdentity {
                 pid: 123,
                 start_ns: 1,
@@ -1115,6 +1643,84 @@ mod correlation_regressions {
         );
     }
     #[test]
+    fn bulk_scope_separates_project_workloads_from_broad_mutation() {
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            bulk_scope(
+                ["/home/alice/project/a.txt", "/home/alice/project/b.txt"],
+                Some(home)
+            ),
+            ("single_directory", Severity::Low)
+        );
+        assert_eq!(
+            bulk_scope(
+                ["/home/alice/project-a/a.txt", "/home/alice/project-b/b.txt"],
+                Some(home)
+            ),
+            ("home_root", Severity::High)
+        );
+        assert_eq!(
+            bulk_scope(["/home/alice/a.txt", "/home/alice/b.txt"], Some(home)),
+            ("home_root", Severity::High)
+        );
+        assert_eq!(
+            bulk_scope(["/etc/a", "/etc/b"], Some(home)),
+            ("system_paths", Severity::High)
+        );
+        assert_eq!(
+            bulk_scope(["/work/a", "/work/b"], Some(home)),
+            ("multiple_directories", Severity::Medium)
+        );
+        assert_eq!(
+            bulk_scope(["/var/lib/plex/a", "/var/lib/plex/b"], Some(home)),
+            ("single_directory", Severity::Low)
+        );
+    }
+
+    #[test]
+    fn bulk_mutation_severity_tracks_directory_scope() {
+        let mut config = crate::config::RuleConfig {
+            bulk_file_threshold: 2,
+            ..Default::default()
+        };
+        config.dedup_window_ms = 0;
+        let mut project = AnomalyEngine::configured(
+            BaselineData::default(),
+            Allowlist::default(),
+            config.clone(),
+        );
+        project
+            .homes
+            .insert("1000".into(), 1_000_000, Some(PathBuf::from("/home/alice")));
+        assert!(
+            project
+                .observe(&file("/home/alice/project/a", FileKind::Write))
+                .is_empty()
+        );
+        let incident = project
+            .observe(&file("/home/alice/project/b", FileKind::Write))
+            .into_iter()
+            .find(|incident| incident.details["rule"] == "bulk_mutation")
+            .unwrap();
+        assert_eq!(incident.severity, Severity::Low);
+        assert_eq!(incident.details["scope"], "single_directory");
+
+        let mut home_root =
+            AnomalyEngine::configured(BaselineData::default(), Allowlist::default(), config);
+        home_root
+            .homes
+            .insert("1000".into(), 1_000_000, Some(PathBuf::from("/home/alice")));
+        home_root.observe(&file("/home/alice/a", FileKind::Write));
+        let incident = home_root
+            .observe(&file("/home/alice/b", FileKind::Write))
+            .into_iter()
+            .find(|incident| incident.details["rule"] == "bulk_mutation")
+            .unwrap();
+        assert_eq!(incident.severity, Severity::High);
+        assert_eq!(incident.details["scope"], "home_root");
+    }
+
+    #[test]
     fn credential_access_does_not_cross_process_generations() {
         let mut engine = AnomalyEngine::new();
         engine.observe(&file("/root/.ssh/key", FileKind::Read));
@@ -1134,5 +1740,449 @@ mod correlation_regressions {
             recv: 0,
         });
         assert!(engine.observe(&net).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use electric_eye_core::ExecEvent;
+    fn write(pid: u32, ts_ms: u64, path: &str) -> ActivityEntry {
+        ActivityEntry {
+            ts_ms,
+            event_id: None,
+            syscall_result: Some(1),
+            process: Some(crate::api::ProcessIdentity {
+                boot_id: "boot".into(),
+                pid,
+                start_ns: pid as u64,
+            }),
+            path_resolution: Some("kernel".into()),
+            process_info: None,
+            application: None,
+            event: ObservedEvent::FileWrite(electric_eye_core::FileEvent {
+                pid,
+                uid: 1000,
+                comm: "writer".into(),
+                path: path.into(),
+                kind: FileKind::Write,
+                bytes: Some(1),
+                count: Some(1),
+            }),
+            unit: None,
+            nix: None,
+            parent: None,
+            exe: Some("/opt/writer".into()),
+        }
+    }
+    fn read(pid: u32, path: &str) -> ActivityEntry {
+        let mut entry = write(pid, 1_000_000, path);
+        entry.event = ObservedEvent::FileRead(electric_eye_core::FileEvent {
+            pid,
+            uid: 1000,
+            comm: "reader".into(),
+            path: path.into(),
+            kind: FileKind::Read,
+            bytes: None,
+            count: None,
+        });
+        entry
+    }
+
+    #[test]
+    fn expired_actors_and_paths_are_pruned_and_busy_windows_are_bounded() {
+        let config = crate::config::RuleConfig {
+            max_actors: 4,
+            max_dedup_entries: 8,
+            max_events_per_actor: 2,
+            bulk_file_threshold: 2,
+            credential_category_threshold: 2,
+            sensitive_window_ms: 10,
+            bulk_window_ms: 10,
+            dedup_window_ms: 10,
+            prune_interval_ms: 1,
+            ..Default::default()
+        };
+        let mut engine =
+            AnomalyEngine::configured(BaselineData::default(), Allowlist::default(), config);
+        for i in 1..10000 {
+            engine.observe(&write(i, i as u64, &format!("/home/review/.ssh/key-{i}")));
+            assert!(
+                engine.sensitive.len() <= 4
+                    && engine.mutations.len() <= 4
+                    && engine.dedup.len() <= 8
+            );
+        }
+        for i in 10000..10020 {
+            engine.observe(&write(10000, i, &format!("/home/review/.ssh/key-{i}")));
+        }
+        assert!(engine.sensitive.values().all(|w| w.len() <= 2));
+        assert!(engine.mutations.values().all(|w| w.len() <= 2));
+        engine.prune(11000);
+        assert_eq!(
+            (
+                engine.sensitive.len(),
+                engine.mutations.len(),
+                engine.dedup.len()
+            ),
+            (0, 0, 0)
+        );
+        let mut e = write(10000, 12000, "/home/review/.ssh/key");
+        engine.observe(&e);
+        e.event = ObservedEvent::Exit(electric_eye_core::ExitEvent {
+            pid: 10000,
+            uid: 1000,
+            comm: "writer".into(),
+        });
+        engine.observe(&e);
+        assert_eq!((engine.sensitive.len(), engine.mutations.len()), (0, 0));
+    }
+    #[test]
+    fn mapped_loopback_private_and_link_local_destinations_are_not_public() {
+        for address in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.1.2.3",
+            "::ffff:192.168.1.1",
+            "::ffff:169.254.1.1",
+            "::",
+            "ff02::1",
+        ] {
+            let net = NetEvent {
+                pid: 1,
+                uid: 1000,
+                comm: "test".into(),
+                family: 10,
+                addr: address.parse::<Ipv6Addr>().unwrap().octets(),
+                local_port: 12345,
+                remote_port: 443,
+                hostname: None,
+                fd: None,
+            };
+            assert!(!is_public_destination(&net), "{address}");
+        }
+    }
+    #[test]
+    fn configurable_policy_thresholds_allowlist_and_disable_switches_take_effect() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[rules]
+builtin_sensitive_paths = false
+bulk_file_threshold = 2
+credential_sweep = false
+[[rules.sensitive_paths]]
+prefix = "/work/private"
+category = "Project secrets"
+severity = "medium"
+[[rules.allowlist]]
+application = "/opt/allowed"
+subject_prefix = "/work/private"
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let allowlist = Allowlist::load(&config.rules);
+        let mut engine =
+            AnomalyEngine::configured(BaselineData::default(), allowlist, config.rules.clone());
+        let incidents = engine.observe(&write(1, 1000, "/work/private/key"));
+        assert!(
+            incidents
+                .iter()
+                .any(|i| i.title.ends_with("Project secrets") && i.severity == Severity::Medium)
+        );
+        let mut e = write(2, 1001, "/work/private/allowed");
+        e.exe = Some("/opt/allowed".into());
+        assert!(engine.observe(&e).is_empty());
+        assert!(
+            engine
+                .observe(&write(1, 1002, "/work/second"))
+                .iter()
+                .any(|i| i.details["rule"] == "bulk_mutation")
+        );
+        let mut disabled = config.rules;
+        disabled.sensitive_path = false;
+        disabled.bulk_mutation = false;
+        let mut engine =
+            AnomalyEngine::configured(BaselineData::default(), Allowlist::default(), disabled);
+        assert!(
+            engine
+                .observe(&write(1, 1000, "/work/private/key"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn listing_a_sensitive_directory_is_not_a_credential_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".aws");
+        std::fs::create_dir(&dir).unwrap();
+        let file_path = dir.join("credentials");
+        std::fs::write(&file_path, b"test").unwrap();
+        let dir_text = dir.to_string_lossy().into_owned();
+        let file_text = file_path.to_string_lossy().into_owned();
+
+        let mut rules = crate::config::RuleConfig {
+            builtin_sensitive_paths: false,
+            ..Default::default()
+        };
+        rules.sensitive_paths = vec![crate::config::SensitivePath {
+            prefix: dir_text.clone(),
+            category: "AWS credentials".into(),
+            severity: Severity::High,
+        }];
+        let mut engine =
+            AnomalyEngine::configured(BaselineData::default(), Allowlist::default(), rules);
+        assert!(
+            engine.observe(&read(1, &dir_text)).is_empty(),
+            "directory metadata was treated as a credential read"
+        );
+        assert!(
+            engine
+                .observe(&read(2, &file_text))
+                .iter()
+                .any(|incident| incident.title.contains("AWS credentials")),
+            "file access inside the directory was not classified"
+        );
+    }
+
+    fn identity(pid: u32) -> crate::api::ProcessIdentity {
+        crate::api::ProcessIdentity {
+            pid,
+            start_ns: pid as u64,
+            boot_id: "boot".into(),
+        }
+    }
+
+    fn trusted_ssh_exec(pid: u32, host: &str) -> ActivityEntry {
+        let mut entry = write(pid, 1_000_000, "");
+        entry.syscall_result = None;
+        entry.path_resolution = None;
+        entry.parent = Some("git".into());
+        entry.exe = Some("/usr/bin/ssh".into());
+        entry.process_info = Some(crate::process::ProcessRecord::synthetic(
+            identity(pid),
+            1_000_000,
+            "ssh",
+            &["ssh", &format!("git@{host}"), "git-upload-pack", "repo.git"],
+        ));
+        entry.event = ObservedEvent::Exec(ExecEvent {
+            pid,
+            ppid: 1,
+            uid: 1000,
+            comm: "ssh".into(),
+            exe: PathBuf::from("/usr/bin/ssh"),
+            start_ticks: pid as u64,
+        });
+        entry
+    }
+
+    fn known_host_ssh_exec(pid: u32, host: &str) -> ActivityEntry {
+        let mut entry = trusted_ssh_exec(pid, host);
+        entry.parent = None;
+        entry.event = ObservedEvent::Exec(ExecEvent {
+            pid,
+            ppid: 1,
+            uid: 1000,
+            comm: "ssh".into(),
+            exe: PathBuf::from("/usr/bin/ssh"),
+            start_ticks: pid as u64,
+        });
+        entry
+    }
+
+    fn ssh_read(pid: u32) -> ActivityEntry {
+        let mut entry = read(pid, "/home/alice/.ssh/id_ed25519");
+        entry.exe = Some("/usr/bin/ssh".into());
+        entry.parent = Some("git".into());
+        if let ObservedEvent::FileRead(event) = &mut entry.event {
+            event.comm = "ssh".into();
+        }
+        entry
+    }
+
+    #[test]
+    fn trusted_ssh_to_github_is_a_scoped_exception() {
+        let mut engine = AnomalyEngine::configured(
+            BaselineData::default(),
+            Allowlist::default(),
+            crate::config::RuleConfig::default(),
+        );
+        assert!(
+            engine
+                .observe(&trusted_ssh_exec(10, "github.com"))
+                .is_empty()
+        );
+        assert!(
+            engine.observe(&ssh_read(10)).is_empty(),
+            "git SSH read produced a credential incident"
+        );
+
+        let mut plain = AnomalyEngine::configured(
+            BaselineData::default(),
+            Allowlist::default(),
+            crate::config::RuleConfig::default(),
+        );
+        assert!(
+            plain
+                .observe(&ssh_read(20))
+                .iter()
+                .any(|incident| incident.title.contains("SSH")),
+            "untrusted SSH read was suppressed"
+        );
+
+        let mut other = AnomalyEngine::configured(
+            BaselineData::default(),
+            Allowlist::default(),
+            crate::config::RuleConfig::default(),
+        );
+        assert!(
+            other
+                .observe(&trusted_ssh_exec(30, "example.com"))
+                .is_empty()
+        );
+        assert!(
+            other
+                .observe(&ssh_read(30))
+                .iter()
+                .any(|incident| incident.title.contains("SSH")),
+            "git SSH to a non-approved host was suppressed"
+        );
+    }
+
+    #[test]
+    fn known_hosts_is_a_default_allow_for_ssh() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh_dir = temp.path().join(".ssh");
+        std::fs::create_dir(&ssh_dir).unwrap();
+        std::fs::write(
+            ssh_dir.join("known_hosts"),
+            "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest\n",
+        )
+        .unwrap();
+        let mut engine = AnomalyEngine::configured(
+            BaselineData::default(),
+            Allowlist::default(),
+            crate::config::RuleConfig::default(),
+        );
+        engine
+            .homes
+            .insert("1000".into(), 1_000_000, Some(temp.path().to_path_buf()));
+        let mut exec = known_host_ssh_exec(40, "github.com");
+        exec.process_info.as_mut().unwrap().argv = vec!["ssh".into(), "git@github.com".into()];
+        assert!(engine.observe(&exec).is_empty());
+        assert!(
+            engine.observe(&ssh_read(40)).is_empty(),
+            "known-host SSH read produced a credential incident"
+        );
+        assert!(
+            engine
+                .observe(&known_host_ssh_exec(41, "unknown.example"))
+                .is_empty(),
+            "exec event itself should not be a credential incident"
+        );
+        assert!(
+            engine
+                .observe(&ssh_read(41))
+                .iter()
+                .any(|incident| incident.title.contains("SSH")),
+            "unknown SSH host was suppressed"
+        );
+    }
+
+    fn incoming_ssh(pid: u32, source: [u8; 4]) -> ActivityEntry {
+        let mut entry = write(pid, 1_000_000, "");
+        entry.syscall_result = None;
+        entry.path_resolution = None;
+        entry.exe = Some("/usr/sbin/sshd".into());
+        let mut addr = [0u8; 16];
+        addr[..4].copy_from_slice(&source);
+        entry.event = ObservedEvent::Accept(NetEvent {
+            pid,
+            uid: 0,
+            comm: "sshd".into(),
+            family: 2,
+            addr,
+            local_port: 22,
+            remote_port: 55_555,
+            hostname: Some("client.example".into()),
+            fd: None,
+        });
+        entry
+    }
+
+    #[test]
+    fn incoming_connections_are_monitored_and_allowlisted_by_destination() {
+        let mut engine = AnomalyEngine::configured(
+            BaselineData::default(),
+            Allowlist::default(),
+            crate::config::RuleConfig::default(),
+        );
+        let incidents = engine.observe(&incoming_ssh(1, [203, 0, 113, 9]));
+        let remote = incidents
+            .iter()
+            .find(|incident| incident.title.starts_with("Incoming connection: SSH"))
+            .unwrap_or_else(|| panic!("{incidents:?}"));
+        assert_eq!(remote.severity, Severity::High);
+        assert_eq!(remote.details["source_scope"], "remote");
+
+        assert!(
+            engine
+                .observe(&incoming_ssh(2, [192, 168, 1, 20]))
+                .is_empty(),
+            "local-network incoming traffic produced an incident by default"
+        );
+        assert!(
+            engine.observe(&incoming_ssh(3, [127, 0, 0, 1])).is_empty(),
+            "same-machine incoming traffic produced an incident by default"
+        );
+
+        let local_rules = crate::config::RuleConfig {
+            incoming_local_connections: true,
+            ..Default::default()
+        };
+        let mut local_engine =
+            AnomalyEngine::configured(BaselineData::default(), Allowlist::default(), local_rules);
+        let local = local_engine.observe(&incoming_ssh(2, [192, 168, 1, 20]));
+        let local = local
+            .iter()
+            .find(|incident| incident.title.starts_with("Incoming connection: SSH"))
+            .unwrap_or_else(|| panic!("{local:?}"));
+        assert_eq!(local.severity, Severity::Medium);
+        assert_eq!(local.details["source_scope"], "local_network");
+        let same = local_engine.observe(&incoming_ssh(3, [127, 0, 0, 1]));
+        let same = same
+            .iter()
+            .find(|incident| incident.title.starts_with("Incoming connection: SSH"))
+            .unwrap_or_else(|| panic!("{same:?}"));
+        assert_eq!(same.severity, Severity::Medium);
+        assert_eq!(same.details["source_scope"], "same_machine");
+
+        let mut high_churn = incoming_ssh(4, [203, 0, 113, 10]);
+        high_churn.exe = Some("/usr/bin/transmission-gtk".into());
+        assert!(
+            engine.observe(&high_churn).is_empty(),
+            "high-churn peer traffic produced incoming incidents"
+        );
+
+        let rules = crate::config::RuleConfig {
+            network_allowlist: vec![crate::config::NetworkAllowRule {
+                application: "sshd".into(),
+                destination: "203.0.113.0/24".into(),
+                direction: crate::config::NetworkDirection::Inbound,
+            }],
+            ..Default::default()
+        };
+        let mut allowed =
+            AnomalyEngine::configured(BaselineData::default(), Allowlist::default(), rules);
+        assert!(
+            allowed
+                .observe(&incoming_ssh(2, [203, 0, 113, 9]))
+                .is_empty()
+        );
+        assert!(
+            !allowed
+                .observe(&incoming_ssh(3, [198, 51, 100, 7]))
+                .is_empty(),
+            "CIDR allowlist was too broad"
+        );
     }
 }

@@ -9,3 +9,5 @@
 /electric-eye.db
 /electric-eye.db-shm
 /electric-eye.db-wal
+__pycache__/
+*.pyc

@@ -1,13 +1,27 @@
 mod api;
 mod btf;
+mod cache;
 mod collector;
+mod config;
+mod container;
+mod correlation;
 mod dns;
 mod enrich;
+mod flows;
 mod format;
+mod grouping;
+mod investigate;
 mod journald;
+mod known_hosts;
+mod mcp;
+mod net_context;
+mod noise;
 mod probe;
+mod process;
+mod provenance;
 mod rules;
 mod store;
+mod vopono;
 #[path = "../../electric-eye-core/src/wire.rs"]
 mod wire;
 
@@ -27,11 +41,6 @@ use electric_eye_nix::ProvenanceRegistry;
 
 const DEFAULT_OBJECT: &str = "target/bpfel-unknown-none/release/electric-eye-ebpf";
 const INSTALLED_OBJECT: &str = "/usr/lib/electric-eye/electric-eye-ebpf";
-const TRAFFIC_WINDOW: Duration = Duration::from_secs(5);
-const TRAFFIC_TOP: usize = 8;
-const WRITE_TOP: usize = 32;
-const WRITE_WINDOW_LIMIT: usize = 4096;
-
 struct WriteStat {
     entry: ActivityEntry,
     count: u64,
@@ -68,10 +77,15 @@ struct Options {
     json: bool,
     no_bpf: bool,
     no_socket: bool,
+    no_mcp: bool,
     no_db: bool,
     socket: Option<PathBuf>,
+    mcp_socket: Option<PathBuf>,
+    mcp_tools: Option<String>,
     db: Option<PathBuf>,
     object_override: Option<PathBuf>,
+    config: Option<PathBuf>,
+    check_config: bool,
 }
 
 impl Options {
@@ -81,24 +95,50 @@ impl Options {
             json: false,
             no_bpf: false,
             no_socket: false,
+            no_mcp: false,
             no_db: false,
             socket: None,
+            mcp_socket: None,
+            mcp_tools: None,
             db: None,
             object_override: None,
+            config: None,
+            check_config: false,
         };
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--config" => {
+                    options.config = Some(PathBuf::from(
+                        iter.next().ok_or("--config requires a path")?,
+                    ));
+                }
                 "--stdout" => options.stdout = true,
                 "--json" => options.json = true,
+                "--check-config" => options.check_config = true,
                 "--no-bpf" => options.no_bpf = true,
                 "--no-socket" => options.no_socket = true,
+                "--no-mcp" => options.no_mcp = true,
                 "--no-db" => options.no_db = true,
                 "--socket" => {
                     let Some(value) = iter.next() else {
                         return Err("--socket requires a path".into());
                     };
                     options.socket = Some(PathBuf::from(value));
+                }
+                "--mcp-socket" => {
+                    let Some(value) = iter.next() else {
+                        return Err("--mcp-socket requires a path".into());
+                    };
+                    options.mcp_socket = Some(PathBuf::from(value));
+                }
+                "--mcp-tools" => {
+                    let Some(value) = iter.next() else {
+                        return Err(
+                            "--mcp-tools requires default, all, or a comma-separated list".into(),
+                        );
+                    };
+                    options.mcp_tools = Some(value.clone());
                 }
                 "--db" => {
                     let Some(value) = iter.next() else {
@@ -145,6 +185,16 @@ fn socket_path(override_path: Option<&Path>) -> PathBuf {
     PathBuf::from(api::DEFAULT_SOCKET)
 }
 
+fn mcp_socket_path(override_path: Option<&Path>) -> PathBuf {
+    if let Some(path) = override_path {
+        return path.to_path_buf();
+    }
+    if let Some(env_path) = std::env::var_os("ELECTRIC_EYE_MCP_SOCKET") {
+        return PathBuf::from(env_path);
+    }
+    PathBuf::from(mcp::DEFAULT_SOCKET)
+}
+
 fn database_path(override_path: Option<&Path>, disabled: bool) -> Option<PathBuf> {
     if disabled {
         return None;
@@ -166,12 +216,6 @@ fn database_path(override_path: Option<&Path>, disabled: bool) -> Option<PathBuf
         return Some(system_state.join("electric-eye.db"));
     }
     Some(PathBuf::from("electric-eye.db"))
-}
-
-fn is_noise_path(path: &str) -> bool {
-    ["/dev/", "/proc/", "/sys/", "/run/"]
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
 }
 
 fn classify_open(flags: u32) -> FileKind {
@@ -214,6 +258,7 @@ fn startup_line(json: bool, line: impl std::fmt::Display) {
 #[derive(Hash, PartialEq, Eq)]
 struct WriteKey {
     process: ProcessIdentity,
+    exec_id: u32,
     exe: Option<String>,
     path: String,
     kind: FileKind,
@@ -221,6 +266,7 @@ struct WriteKey {
 #[derive(Hash, PartialEq, Eq)]
 struct TrafficKey {
     process: ProcessIdentity,
+    exec_id: u32,
     exe: Option<String>,
 }
 struct Session {
@@ -235,38 +281,56 @@ struct Session {
     state: Arc<Mutex<api::SharedState>>,
     boot_id: String,
     boot_wall_ms: u64,
+    processes: process::Registry,
+    config: config::Config,
+    provenance: Option<provenance::Provider>,
+    groups: grouping::Groups,
+    flows: flows::Tracker,
+    correlation: correlation::Engine,
+    udp_peers: cache::Recent<()>,
 }
 impl Session {
-    fn entry(&mut self, raw: &wire::Record, event: ObservedEvent) -> ActivityEntry {
-        let exe = collector::cstr(&raw.exe);
-        let exe = (!exe.is_empty()).then_some(exe);
-        // /proc enrichment is optional and is used only if its generation
-        // matches the identity captured in the kernel. Executable identity
-        // itself always comes from the event, including short-lived tasks.
-        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
-        let same_process = enrich::process_stat(raw.pid)
-            .is_some_and(|s| s.start_ticks == raw.start_ns / (1_000_000_000 / ticks));
-        let unit = if same_process {
-            enrich::systemd_unit(raw.pid)
-        } else {
-            None
+    fn entry(&self, raw: &wire::Record, event: ObservedEvent) -> ActivityEntry {
+        let identity = ProcessIdentity {
+            boot_id: self.boot_id.clone(),
+            pid: raw.pid,
+            start_ns: raw.start_ns,
         };
+        let process = self.processes.get(&identity);
+        let exe = collector::cstr(&raw.exe);
+        let exe = (!exe.is_empty()).then_some(exe).or_else(|| {
+            process
+                .filter(|p| p.exec_id == raw.exec_id)
+                .and_then(|p| p.executable.clone())
+        });
+        // The process registry is populated by process::observe before file and
+        // network events are turned into ActivityEntry values. Avoid a
+        // /proc/<pid>/stat read on every captured event at high event rates.
+        let unit = process.and_then(|p| p.user_unit.clone().or_else(|| p.system_unit.clone()));
         let nix = exe
             .as_deref()
+            .filter(|path| path.starts_with("/nix/store"))
             .and_then(|path| self.registry.identify(Path::new(path)).ok().flatten())
             .map(|p| p.to_string());
         ActivityEntry {
             ts_ms: self.boot_wall_ms.saturating_add(raw.ts_ns / 1_000_000),
+            event_id: Some({
+                static SEQUENCE: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                format!(
+                    "{}:{}:{}:{}",
+                    self.boot_id,
+                    std::process::id(),
+                    raw.ts_ns,
+                    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                )
+            }),
             syscall_result: matches!(
                 raw.kind,
                 wire::OPEN | wire::READ | wire::WRITE | wire::MMAP | wire::UNLINK | wire::RENAME
             )
             .then_some(raw.result),
-            process: Some(ProcessIdentity {
-                pid: raw.pid,
-                start_ns: raw.start_ns,
-                boot_id: self.boot_id.clone(),
-            }),
+            process: Some(identity),
             path_resolution: matches!(
                 raw.kind,
                 wire::OPEN | wire::READ | wire::WRITE | wire::MMAP | wire::UNLINK | wire::RENAME
@@ -287,6 +351,12 @@ impl Session {
                 }
                 .into()
             }),
+            application: process.and_then(|p| p.application.clone()),
+            process_info: if matches!(raw.kind, wire::EXEC | wire::FORK | wire::EXIT) {
+                process.cloned()
+            } else {
+                None
+            },
             event,
             unit,
             nix,
@@ -335,7 +405,23 @@ impl Session {
         }
         self.state.lock().unwrap().record(entry);
     }
-    fn emit_incident(&mut self, incident: rules::Incident) {
+    fn emit_incident(&mut self, mut incident: rules::Incident) {
+        let actor = incident
+            .process
+            .as_ref()
+            .and_then(|id| self.processes.get(id));
+        let package_trust = actor
+            .and_then(|actor| actor.executable.as_deref())
+            .or(incident.exe.as_deref())
+            .and_then(|exe| self.provenance.as_ref().map(|provider| provider.trust(exe)));
+        if let Some(actor) = actor
+            && let Some(details) = incident.details.as_object_mut()
+        {
+            details.insert("actor".into(), serde_json::json!(actor));
+            if let Some(trust) = package_trust {
+                details.insert("package_trust".into(), serde_json::json!(trust));
+            }
+        }
         // Persist the complete base record before optional, asynchronous context.
         if let Some(store) = &self.store {
             store.record_incident(store::IncidentRow::from_incident(&incident));
@@ -359,7 +445,151 @@ impl Session {
             worker.enqueue(incident);
         }
     }
+    fn udp_observation(&mut self, raw: &wire::Record) {
+        if raw.remote_port == 0 || !matches!(raw.family, 2 | 10) {
+            return;
+        }
+        let key = format!(
+            "{}:{}:{}:{}:{}:{:?}:{}",
+            raw.pid, raw.start_ns, raw.exec_id, raw.netns, raw.socket_id, raw.addr, raw.remote_port
+        );
+        let first = self.udp_peers.get(&key).is_none();
+        self.udp_peers.insert(key, raw.ts_ns, ());
+        let event = ObservedEvent::Connect(NetEvent {
+            pid: raw.pid,
+            uid: raw.uid,
+            comm: collector::cstr(&raw.comm),
+            family: raw.family,
+            addr: raw.addr,
+            local_port: raw.local_port as u16,
+            remote_port: raw.remote_port as u16,
+            hostname: dns::ip_from_addr(raw.family, raw.addr).and_then(|ip| self.dns.lookup(ip)),
+            fd: None,
+        });
+        let entry = self.entry(raw, event);
+        if first {
+            self.emit(entry, true, true);
+        } else {
+            self.analyze(&entry);
+        }
+    }
     fn handle(&mut self, raw: wire::Record) {
+        let timestamp = self.boot_wall_ms.saturating_add(raw.ts_ns / 1_000_000);
+        if matches!(
+            raw.kind,
+            wire::READ | wire::OPEN | wire::WRITE | wire::MMAP | wire::UNLINK | wire::RENAME
+        ) {
+            let path = collector::cstr(&raw.path);
+            let ignored = |path: &str| {
+                self.config
+                    .ignore_paths
+                    .iter()
+                    .any(|prefix| Path::new(path).starts_with(prefix))
+            };
+            let noisy = |path: &str| {
+                self.config
+                    .capture
+                    .noise_paths
+                    .iter()
+                    .any(|prefix| Path::new(path).starts_with(prefix))
+            };
+            let drop_noise = raw.kind != wire::RENAME && noisy(&path);
+            if drop_noise
+                || (ignored(&path)
+                    && (raw.kind != wire::RENAME || ignored(&collector::cstr(&raw.path2))))
+            {
+                return;
+            }
+        }
+        if matches!(raw.kind, wire::NET_STATE | wire::NET_CLOSE) {
+            for f in self.flows.observe(&raw, &self.boot_id, timestamp, None) {
+                self.correlation.flow(&f);
+                self.state
+                    .lock()
+                    .unwrap()
+                    .record_document("flows", &f.id, timestamp, &f);
+                if let Some(store) = &self.store {
+                    store.document("flows", &f.id, timestamp, &f);
+                }
+            }
+            return;
+        }
+        let p = self
+            .processes
+            .observe(&raw, &self.boot_id, timestamp, &self.config);
+        let mut p = p;
+        if (p.package.is_none() || raw.kind == wire::EXEC)
+            && let (Some(provider), Some(exe)) = (&self.provenance, &p.executable)
+        {
+            p.package = Some(provider.identify_record(exe, &raw));
+            self.processes.set_package(&p.identity, p.package.clone());
+        }
+        let changed =
+            p.application.is_none() || matches!(raw.kind, wire::EXEC | wire::FORK | wire::EXIT);
+        if changed {
+            let parent = p.parent.as_ref().and_then(|id| self.processes.get(id));
+            let app = self.groups.assign(&p, parent, &self.config);
+            p.application = Some(app.clone());
+            self.processes.set_application(&p.identity, app.clone());
+            if let Some(group) = self.groups.applications.get(&app.task_id) {
+                self.state.lock().unwrap().record_document(
+                    "applications",
+                    &app.task_id,
+                    timestamp,
+                    group,
+                );
+                if let Some(store) = &self.store {
+                    store.document("applications", &app.task_id, timestamp, group);
+                }
+            }
+        }
+        self.state.lock().unwrap().record_process(p.clone());
+        if raw.kind == wire::EXEC {
+            self.state.lock().unwrap().record_document(
+                "execs",
+                &format!("{}:{}", p.id, p.exec_id),
+                timestamp,
+                &p,
+            );
+        }
+        if let Some(store) = &self.store
+            && (matches!(raw.kind, wire::EXEC | wire::FORK | wire::EXIT)
+                || p.first_seen_ms == timestamp)
+        {
+            store.document("processes", &p.id, timestamp, &p);
+            if raw.kind == wire::EXEC {
+                store.document("execs", &format!("{}:{}", p.id, p.exec_id), timestamp, &p);
+            }
+        }
+        for old in self.processes.drain_superseded() {
+            self.state.lock().unwrap().record_process(old.clone());
+            if let Some(store) = &self.store {
+                store.document("processes", &old.id, old.last_seen_ms, &old);
+            }
+        }
+        if raw.socket_id != 0 {
+            for f in self.flows.observe(&raw, &self.boot_id, timestamp, Some(&p)) {
+                self.correlation.flow(&f);
+                self.state
+                    .lock()
+                    .unwrap()
+                    .record_document("flows", &f.id, timestamp, &f);
+                if let Some(store) = &self.store {
+                    store.document("flows", &f.id, timestamp, &f);
+                }
+            }
+        }
+        if raw.protocol == 17
+            && (raw.kind == wire::SENT
+                || raw.kind == wire::NET_RESULT
+                    && raw.flags != wire::FLAG_SO_ERROR
+                    && raw.result == 0)
+        {
+            self.udp_observation(&raw);
+        }
+        if matches!(raw.kind, wire::SOCKET | wire::BIND | wire::NET_RESULT) {
+            return;
+        }
         let comm = collector::cstr(&raw.comm);
         let file_kind = match raw.kind {
             wire::READ => FileKind::Read,
@@ -369,15 +599,23 @@ impl Session {
             _ => classify_open(raw.flags),
         };
         let event = match raw.kind {
-            wire::EXEC => ObservedEvent::Exec(ExecEvent {
-                pid: raw.pid,
-                ppid: raw.ppid,
-                uid: raw.uid,
-                comm,
-                exe: PathBuf::from(collector::cstr(&raw.exe)),
-                start_ticks: raw.start_ns
-                    / (1_000_000_000 / (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64)),
-            }),
+            wire::EXEC | wire::FORK => {
+                let e = ExecEvent {
+                    pid: raw.pid,
+                    ppid: raw.ppid,
+                    uid: raw.uid,
+                    comm,
+                    exe: PathBuf::from(collector::cstr(&raw.exe)),
+                    start_ticks: raw.start_ns
+                        / (1_000_000_000
+                            / (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64)),
+                };
+                if raw.kind == wire::FORK {
+                    ObservedEvent::Fork(e)
+                } else {
+                    ObservedEvent::Exec(e)
+                }
+            }
             wire::EXIT => ObservedEvent::Exit(ExitEvent {
                 pid: raw.pid,
                 uid: raw.uid,
@@ -386,13 +624,28 @@ impl Session {
             wire::OPEN | wire::READ | wire::WRITE | wire::MMAP | wire::UNLINK => {
                 let mut path = collector::cstr(&raw.path);
                 if path.is_empty() {
-                    path = format!("unresolved:pid={}:fd={}", raw.pid, raw.fd);
+                    if raw.kind == wire::OPEN && raw.dirfd != -1 {
+                        let dirfd = if raw.dirfd == -100 {
+                            "AT_FDCWD".to_string()
+                        } else {
+                            raw.dirfd.to_string()
+                        };
+                        let cwd = p
+                            .cwd
+                            .as_deref()
+                            .filter(|cwd| !cwd.is_empty())
+                            .map(|cwd| format!(":cwd={cwd}"))
+                            .unwrap_or_default();
+                        path = format!("unresolved:pid={}:dirfd={dirfd}{cwd}", raw.pid);
+                    } else {
+                        path = format!("unresolved:pid={}:fd={}", raw.pid, raw.fd);
+                    }
+                }
+                if raw.path_resolution == wire::PATH_UNRESOLVED && raw.file_inode != 0 {
+                    path.push_str(&format!(":inode={}:dev={}", raw.file_inode, raw.file_dev));
                 }
                 if raw.path_resolution == wire::PATH_KERNEL {
                     path = normalize_path(&path);
-                }
-                if is_noise_path(&path) {
-                    return;
                 }
                 let file = FileEvent {
                     pid: raw.pid,
@@ -425,7 +678,11 @@ impl Session {
                     uid: raw.uid,
                     comm,
                     family: raw.family,
-                    addr: raw.addr,
+                    addr: if raw.kind == wire::LISTEN {
+                        raw.local_addr
+                    } else {
+                        raw.addr
+                    },
                     local_port: raw.local_port as u16,
                     remote_port: raw.remote_port as u16,
                     hostname: None,
@@ -474,6 +731,10 @@ impl Session {
             _ => return,
         };
         let entry = self.entry(&raw, event);
+        if self.correlation.needs_flush() {
+            self.flush_summaries();
+        }
+        self.correlation.observe(&entry, Some(&p));
         if raw.result < 0 {
             self.emit(entry, true, false);
             return;
@@ -481,7 +742,7 @@ impl Session {
         if matches!(raw.kind, wire::WRITE | wire::MMAP) {
             // Detection uses the original event time, before display aggregation.
             self.analyze(&entry);
-            if self.write_window.len() >= WRITE_WINDOW_LIMIT {
+            if self.write_window.len() >= self.config.limits.window_entries {
                 self.flush_write_window();
             }
             let ObservedEvent::FileWrite(file) = &entry.event else {
@@ -489,6 +750,7 @@ impl Session {
             };
             let key = WriteKey {
                 process: entry.process.clone().unwrap(),
+                exec_id: raw.exec_id,
                 exe: entry.exe.clone(),
                 path: file.path.clone(),
                 kind: file.kind,
@@ -501,11 +763,12 @@ impl Session {
             stat.count += 1;
             stat.bytes = stat.bytes.saturating_add(raw.count);
         } else if matches!(raw.kind, wire::SENT | wire::RECEIVED) {
-            if self.traffic_window.len() >= WRITE_WINDOW_LIMIT {
+            if self.traffic_window.len() >= self.config.limits.window_entries {
                 self.flush_traffic_window();
             }
             let key = TrafficKey {
                 process: entry.process.clone().unwrap(),
+                exec_id: raw.exec_id,
                 exe: entry.exe.clone(),
             };
             let stat = self
@@ -525,6 +788,19 @@ impl Session {
             self.emit(entry, true, true);
         }
     }
+    fn flush_summaries(&mut self) {
+        for summary in self.correlation.drain() {
+            self.state.lock().unwrap().record_document(
+                "summaries",
+                &summary.id,
+                summary.last_ms,
+                &summary,
+            );
+            if let Some(store) = &self.store {
+                store.document("summaries", &summary.id, summary.last_ms, &summary);
+            }
+        }
+    }
     fn flush_write_window(&mut self) {
         let mut writes: Vec<_> = self.write_window.drain().map(|(_, v)| v).collect();
         writes.sort_by_key(|s| std::cmp::Reverse(s.bytes));
@@ -533,7 +809,7 @@ impl Session {
                 file.bytes = Some(stat.bytes);
                 file.count = Some(stat.count);
             }
-            self.emit(stat.entry, rank < WRITE_TOP, false);
+            self.emit(stat.entry, rank < self.config.limits.write_top, false);
         }
     }
     fn flush_traffic_window(&mut self) {
@@ -544,7 +820,7 @@ impl Session {
                 summary.sent = stat.sent;
                 summary.recv = stat.recv;
             }
-            self.emit(stat.entry, rank < TRAFFIC_TOP, false);
+            self.emit(stat.entry, rank < self.config.limits.traffic_top, false);
         }
     }
 }
@@ -588,6 +864,23 @@ fn run() -> ExitCode {
     install_signal_handlers();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--help"] || args == ["-h"] {
+        println!(
+            "electric-eyed — kernel activity monitor\n\nUSAGE: electric-eyed [--stdout] [--json] [--no-bpf] [--no-socket] [--no-mcp] [--no-db] [--socket <path>] [--mcp-socket <path>] [--mcp-tools <default|all|list>] [--db <path>] [--config <path>] [--ebpf-object <path>] [--check-config]\n\nThe read-only query API and MCP server use Unix sockets under /run/electric-eye by default. Use --no-socket or --no-mcp to disable either. Connect MCP clients through: electric-eye mcp\n\nUse --print-default-config to print every supported setting.\nConfiguration: ~/.config/electriceye/config.toml (TOML), --config or ELECTRIC_EYE_CONFIG; system fallback /etc/electric-eye/config.toml.\nLive queries remain available with --no-db; restart history requires SQLite."
+        );
+        return ExitCode::SUCCESS;
+    }
+    if args == ["--print-default-config"] {
+        println!(
+            "{}",
+            toml::to_string_pretty(&config::Config::default()).expect("serializing default TOML")
+        );
+        return ExitCode::SUCCESS;
+    }
+    if args == ["--version"] {
+        println!("electric-eyed {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let options = match Options::parse(&args) {
         Ok(options) => options,
         Err(message) => {
@@ -595,8 +888,9 @@ fn run() -> ExitCode {
             eprintln!();
             eprintln!(
                 "USAGE: sudo electric-eyed [--stdout] [--json] [--no-bpf] \
-                 [--no-socket] [--no-db] [--socket <path>] [--db <path>] \
-                 [--ebpf-object <path>]"
+                 [--no-socket] [--no-mcp] [--no-db] [--socket <path>] \
+                 [--mcp-socket <path>] [--db <path>] [--config <path>] \
+                 [--ebpf-object <path>] [--check-config]"
             );
             eprintln!();
             eprintln!("error: {message}");
@@ -604,7 +898,25 @@ fn run() -> ExitCode {
         }
     };
 
+    let config_path = config::Config::discover(options.config.clone());
+    let config = match config_path.as_deref().map(config::Config::load).transpose() {
+        Ok(config) => config.unwrap_or_default(),
+        Err(err) => {
+            eprintln!("configuration error: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if options.check_config {
+        match config_path.as_deref() {
+            Some(path) => println!("configuration valid: {}", path.display()),
+            None => println!("configuration valid: built-in defaults"),
+        }
+        return ExitCode::SUCCESS;
+    }
     print_banner(options.json);
+    if let Some(path) = &config_path {
+        startup_line(options.json, format!("configuration: {}", path.display()));
+    }
     if options.stdout {
         log::debug!("stdout mode requested");
     }
@@ -643,6 +955,26 @@ fn run() -> ExitCode {
             }
         }
     };
+    let mcp_socket_path = mcp_socket_path(options.mcp_socket.as_deref());
+    let mcp_socket = if options.no_mcp {
+        startup_line(options.json, "MCP server: disabled");
+        None
+    } else {
+        match mcp::bind_socket(&mcp_socket_path) {
+            Ok(socket) => {
+                startup_line(
+                    options.json,
+                    format!("MCP socket: {}", mcp_socket_path.display()),
+                );
+                Some(socket)
+            }
+            Err(err) => {
+                eprintln!();
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
 
     let object = ebpf_object_path(options.object_override.as_deref());
     if !object.exists() {
@@ -654,7 +986,7 @@ fn run() -> ExitCode {
 
     let database = database_path(options.db.as_deref(), options.no_db);
     let store = match database.as_deref() {
-        Some(path) => match store::Store::open(path) {
+        Some(path) => match store::Store::open_with_config(path, config.clone()) {
             Ok(store) => {
                 startup_line(options.json, format!("database: {}", path.display()));
                 Some(store)
@@ -667,36 +999,25 @@ fn run() -> ExitCode {
         None => None,
     };
 
-    let (mut collector, report) = match Collector::load(&object) {
-        Ok(result) => result,
-        Err(err) => {
-            eprintln!();
-            eprintln!("error: {err:#}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    journald::startup(
-        &probe::kernel_release(),
-        database.as_deref().and_then(|path| path.to_str()),
-    );
-
-    for warning in &report.skipped {
-        log::warn!("probe skipped: {warning}");
-        eprintln!("note: probe skipped - {warning}");
+    let provenance = provenance::Provider::start();
+    let groups = grouping::Groups::load(&config.limits);
+    if config.journal.enabled {
+        journald::startup(
+            &probe::kernel_release(),
+            database.as_deref().and_then(|path| path.to_str()),
+        );
     }
-    startup_line(
-        options.json,
-        format!("attached probes: {}", report.attached.join(", ")),
-    );
-    startup_line(options.json, "streaming events:");
 
-    let state = Arc::new(Mutex::new(api::SharedState::new()));
+    let state = Arc::new(Mutex::new(api::SharedState::with_config(config.clone())));
     let store_client = store.as_ref().map(|store| store.client());
     {
         let mut state = state.lock().unwrap();
-        state.set_probes(report.attached.clone(), report.skipped.clone());
         state.set_store(store_client.clone());
+        state.set_mcp_socket(
+            mcp_socket
+                .as_ref()
+                .map(|_| mcp_socket_path.display().to_string()),
+        );
     }
 
     let baseline = store_client
@@ -709,7 +1030,7 @@ fn run() -> ExitCode {
             }
         })
         .unwrap_or_default();
-    let allowlist = rules::Allowlist::load_default();
+    let allowlist = rules::Allowlist::load(&config.rules);
 
     let api_server = match socket {
         Some(socket) => match api::ApiServer::start(socket, Arc::clone(&state)) {
@@ -721,20 +1042,51 @@ fn run() -> ExitCode {
         },
         None => None,
     };
-    let incident_worker =
-        match journald::IncidentWorker::start(Arc::clone(&state), store_client.clone()) {
-            Ok(worker) => Some(worker),
+    let tool_profile = match options.mcp_tools.as_deref() {
+        Some(value) => mcp::ToolProfile::parse(value),
+        None => mcp::ToolProfile::from_config(&config.mcp_tools),
+    };
+    let tool_profile = match tool_profile {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mcp_server = match mcp_socket {
+        Some(socket) => match mcp::Server::start(socket, Arc::clone(&state), tool_profile) {
+            Ok(server) => Some(server),
             Err(err) => {
-                eprintln!("error starting incident worker: {err}");
+                eprintln!("error starting MCP server: {err}");
                 return ExitCode::FAILURE;
             }
-        };
+        },
+        None => None,
+    };
+    let incident_worker = match config
+        .journal
+        .enabled
+        .then(|| {
+            journald::IncidentWorker::configured(
+                Arc::clone(&state),
+                store_client.clone(),
+                config.journal.clone(),
+            )
+        })
+        .transpose()
+    {
+        Ok(worker) => worker,
+        Err(err) => {
+            eprintln!("error starting incident worker: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut session = Session {
         registry: ProvenanceRegistry::new(),
         write_window: HashMap::new(),
         traffic_window: HashMap::new(),
-        dns: dns::DnsCache::new(),
-        anomalies: rules::AnomalyEngine::with_context(baseline, allowlist),
+        dns: dns::DnsCache::with_limits(&config.limits),
+        anomalies: rules::AnomalyEngine::configured(baseline, allowlist, config.rules.clone()),
         store: store_client,
         incidents: incident_worker,
         json: options.json,
@@ -744,7 +1096,69 @@ fn run() -> ExitCode {
             .trim()
             .into(),
         boot_wall_ms: boot_wall_ms(),
+        processes: process::Registry::with_limits(&config.limits),
+        config: config.clone(),
+        provenance: Some(provenance),
+        groups,
+        flows: flows::Tracker::with_limits(&config.limits),
+        correlation: correlation::Engine::configured(&config),
+        udp_peers: cache::Recent::new(config.limits.flow_entries),
     };
+    let mut inventory = session
+        .processes
+        .inventory(&session.boot_id, &session.config);
+    // Parents normally predate their children. Group this explicit inventory
+    // before capture so already-running applications have useful metadata too.
+    inventory.sort_by_key(|p| p.identity.start_ns);
+    for mut p in inventory {
+        if let (Some(provider), Some(exe)) = (&session.provenance, &p.executable) {
+            p.package = Some(provider.identify(exe));
+            session
+                .processes
+                .set_package(&p.identity, p.package.clone());
+        }
+        let parent = p.parent.as_ref().and_then(|id| session.processes.get(id));
+        let app = session.groups.assign(&p, parent, &session.config);
+        session.processes.set_application(&p.identity, app.clone());
+        p.application = Some(app.clone());
+        session.state.lock().unwrap().record_process(p.clone());
+        if let Some(group) = session.groups.applications.get(&app.task_id) {
+            session.state.lock().unwrap().record_document(
+                "applications",
+                &app.task_id,
+                p.last_seen_ms,
+                group,
+            );
+        }
+        if let Some(store) = &session.store {
+            store.document("processes", &p.id, p.last_seen_ms, &p);
+            if let Some(group) = session.groups.applications.get(&app.task_id) {
+                store.document("applications", &app.task_id, p.last_seen_ms, group);
+            }
+        }
+    }
+    let (mut collector, report) = match Collector::load(&object, &config) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!();
+            eprintln!("error: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for warning in &report.skipped {
+        log::warn!("probe skipped: {warning}");
+        eprintln!("note: probe skipped - {warning}");
+    }
+    startup_line(
+        options.json,
+        format!("attached probes: {}", report.attached.join(", ")),
+    );
+    {
+        let mut state = state.lock().unwrap();
+        state.set_probes(report.attached.clone(), report.skipped.clone());
+    }
+
+    startup_line(options.json, "streaming events:");
     let mut last_traffic = Instant::now();
 
     loop {
@@ -758,7 +1172,8 @@ fn run() -> ExitCode {
                 0
             });
         session.dns.poll();
-        if last_traffic.elapsed() >= TRAFFIC_WINDOW {
+        session.anomalies.prune(api::now_ms());
+        if last_traffic.elapsed() >= Duration::from_millis(session.config.limits.aggregation_ms) {
             last_traffic = Instant::now();
             session.flush_traffic_window();
             state
@@ -766,13 +1181,16 @@ fn run() -> ExitCode {
                 .unwrap()
                 .set_capture_loss(collector.loss_counts());
             session.flush_write_window();
+            session.flush_summaries();
         }
         if drained == 0 {
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(session.config.limits.idle_sleep_ms));
         }
     }
     session.flush_write_window();
     session.flush_traffic_window();
+    session.flush_summaries();
+    drop(mcp_server);
     drop(api_server);
     session.incidents.take();
     if let Some(store) = store {
@@ -811,6 +1229,24 @@ mod tests {
     #[test]
     fn accepts_no_bpf_flag() {
         assert!(opts(&["--no-bpf"]).no_bpf);
+    }
+
+    #[test]
+    fn accepts_check_config_flag() {
+        assert!(opts(&["--check-config"]).check_config);
+        assert!(!opts(&[]).check_config);
+    }
+
+    #[test]
+    fn accepts_mcp_flags() {
+        let parsed = opts(&["--no-mcp", "--mcp-socket", "/tmp/ee-mcp.sock"]);
+        assert!(parsed.no_mcp);
+        assert_eq!(parsed.mcp_socket, Some(PathBuf::from("/tmp/ee-mcp.sock")));
+        assert!(!opts(&[]).no_mcp);
+        assert_eq!(
+            opts(&["--mcp-tools", "all"]).mcp_tools.as_deref(),
+            Some("all")
+        );
     }
 
     #[test]
@@ -859,6 +1295,13 @@ mod regression_tests {
             state: Arc::new(Mutex::new(api::SharedState::new())),
             boot_id: "test-boot".into(),
             boot_wall_ms: 1_000_000,
+            processes: process::Registry::default(),
+            config: config::Config::default(),
+            provenance: None,
+            groups: grouping::Groups::default(),
+            flows: flows::Tracker::default(),
+            correlation: correlation::Engine::default(),
+            udp_peers: cache::Recent::new(config::Limits::default().flow_entries),
         }
     }
     fn record(kind: u32, pid: u32, start: u64, path: &str) -> wire::Record {
@@ -1024,5 +1467,206 @@ mod regression_tests {
                 .unwrap()
                 .knows_path("/opt/test-app", "/root/.ssh/test-key")
         );
+    }
+    #[test]
+    fn exclusions_use_path_boundaries_and_keep_crossing_renames() {
+        let mut s = session(None);
+        s.config.ignore_paths.push("/private".into());
+        s.handle(record(wire::WRITE, 4_000_000_000, 1, "/private/ignored"));
+        assert!(s.write_window.is_empty());
+        s.handle(record(
+            wire::WRITE,
+            4_000_000_000,
+            1,
+            "/private-other/visible",
+        ));
+        assert_eq!(s.write_window.len(), 1);
+        let mut rename = record(wire::RENAME, 4_000_000_000, 1, "/private/from");
+        rename.path2[..11].copy_from_slice(b"/public/out");
+        rename.path2_resolution = wire::PATH_KERNEL;
+        s.handle(rename);
+        assert_eq!(
+            s.state.lock().unwrap().activity_value(10)["activity"][0]["event"]["to_path"],
+            "/public/out"
+        );
+    }
+    #[test]
+    fn failed_openat_without_a_path_retains_dirfd_context() {
+        let mut s = session(None);
+        let mut r = record(wire::OPEN, 4_000_000_000, 1, "");
+        r.flags = 0o1;
+        r.dirfd = -100;
+        r.result = -libc::ENXIO as i64;
+        r.path_resolution = wire::PATH_UNRESOLVED;
+        s.handle(r);
+        let value = s.state.lock().unwrap().activity_value(10);
+        let path = value["activity"][0]["event"]["path"].as_str().unwrap();
+        assert!(
+            path.starts_with("unresolved:pid=4000000000:dirfd=AT_FDCWD"),
+            "{path}"
+        );
+        assert_eq!(value["activity"][0]["path_resolution"], "unresolved");
+    }
+
+    #[test]
+    fn pathless_fd_events_keep_inode_and_device_identity() {
+        let mut s = session(None);
+        let mut r = record(wire::MMAP, 4_000_000_000, 1, "");
+        r.result = 0;
+        r.count = 4096;
+        r.file_inode = 1234;
+        r.file_dev = 5678;
+        r.path_resolution = wire::PATH_UNRESOLVED;
+        s.handle(r);
+        s.flush_write_window();
+        let value = s.state.lock().unwrap().activity_value(10);
+        let path = value["activity"][0]["event"]["path"].as_str().unwrap();
+        assert!(path.contains("inode=1234"), "{path}");
+        assert!(path.contains("dev=5678"), "{path}");
+        assert_eq!(value["activity"][0]["path_resolution"], "unresolved");
+    }
+
+    #[test]
+    fn review_same_binary_reexec_keeps_write_and_traffic_generations_separate() {
+        let mut s = session(None);
+        let mut first = record(wire::WRITE, 4_000_000_000, 1, "/home/review/file");
+        first.exec_id = 1;
+        let mut second = first;
+        second.exec_id = 2;
+        s.handle(first);
+        let mut sent = first;
+        sent.kind = wire::SENT;
+        sent.count = 3;
+        s.handle(sent);
+        let mut exec = second;
+        exec.kind = wire::EXEC;
+        s.handle(exec);
+        s.handle(second);
+        sent.exec_id = 2;
+        sent.count = 5;
+        s.handle(sent);
+        s.flush_write_window();
+        s.flush_traffic_window();
+        let activity = s.state.lock().unwrap().activity_value(10);
+        let writes: Vec<_> = activity["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["event"]["event"] == "file_write")
+            .collect();
+        assert_eq!(
+            writes.len(),
+            2,
+            "writes across exec generations were merged: {activity}"
+        );
+
+        let traffic: Vec<_> = activity["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event"]["event"] == "traffic")
+            .collect();
+        assert_eq!(traffic.len(), 2);
+        assert!(traffic.iter().any(|e| {
+            e["event"]["sent"] == 3
+                && e["application"]["task_id"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("exec:1")
+        }));
+        assert!(traffic.iter().any(|e| {
+            e["event"]["sent"] == 5
+                && e["application"]["task_id"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("exec:2")
+        }));
+    }
+
+    #[test]
+    fn udp_connect_and_sendto_feed_history_and_egress_rules_without_duplicate_destinations() {
+        let mut s = session(None);
+        s.handle(record(
+            wire::READ,
+            4_000_000_000,
+            1,
+            "/home/review/.ssh/key",
+        ));
+        let mut net = record(wire::NET_RESULT, 4_000_000_000, 1, "");
+        net.protocol = 17;
+        net.family = 2;
+        net.socket_id = 10;
+        net.addr[..4].copy_from_slice(&[8, 8, 8, 8]);
+        net.remote_port = 53;
+        s.handle(net);
+        assert!(
+            s.state
+                .lock()
+                .unwrap()
+                .recent_incidents(10)
+                .iter()
+                .any(|i| i["details"]["rule"] == "sensitive_egress")
+        );
+        let before = s.state.lock().unwrap().activity_value(100)["activity"]
+            .as_array()
+            .unwrap()
+            .len();
+        net.kind = wire::SENT;
+        net.count = 4;
+        s.handle(net);
+        assert_eq!(
+            s.state.lock().unwrap().activity_value(100)["activity"]
+                .as_array()
+                .unwrap()
+                .len(),
+            before
+        );
+        net.addr[..4].copy_from_slice(&[1, 1, 1, 1]);
+        s.handle(net);
+        let activity = s.state.lock().unwrap().activity_value(100);
+        assert_eq!(
+            activity["activity"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["event"]["event"] == "connect")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn udp_novel_destination_rule_obeys_configured_baseline_threshold_and_switch() {
+        for enabled in [true, false] {
+            let mut s = session(None);
+            s.anomalies = rules::AnomalyEngine::configured(
+                rules::BaselineData::from_pairs(
+                    Vec::new(),
+                    vec![("/opt/test-app".into(), "1.1.1.1:443".into())],
+                ),
+                rules::Allowlist::default(),
+                config::RuleConfig {
+                    novel_network: enabled,
+                    novel_network_min_destinations: 1,
+                    ..Default::default()
+                },
+            );
+            let mut net = record(wire::SENT, 4_000_000_000, 1, "");
+            net.protocol = 17;
+            net.family = 2;
+            net.socket_id = 7;
+            net.addr[..4].copy_from_slice(&[8, 8, 8, 8]);
+            net.remote_port = 53;
+            s.handle(net);
+            assert_eq!(
+                s.state
+                    .lock()
+                    .unwrap()
+                    .recent_incidents(10)
+                    .iter()
+                    .any(|i| i["details"]["rule"] == "novel_network"),
+                enabled
+            );
+        }
     }
 }

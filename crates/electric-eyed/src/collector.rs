@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{HashMap, MapData, PerCpuArray, RingBuf};
 use aya::programs::{KProbe, TracePoint};
-use aya::{Ebpf, Pod};
+use aya::{Ebpf, EbpfLoader, Pod};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -28,7 +28,7 @@ pub fn decode(data: &[u8]) -> Option<Record> {
         return None;
     }
     let record = unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<Record>()) };
-    (record.version == ABI_VERSION && record.kind <= RECEIVED && record.start_ns != 0)
+    (record.version == ABI_VERSION && record.kind <= NET_CLOSE && record.start_ns != 0)
         .then_some(record)
 }
 #[derive(Debug, Default)]
@@ -49,20 +49,31 @@ pub struct Collector {
     ring: RingBuf<MapData>,
     dropped: PerCpuArray<MapData, u64>,
     _perf_links: Vec<OwnedFd>,
+    batch_limit: usize,
 }
 impl Collector {
-    pub fn load(path: &Path) -> Result<(Self, AttachReport)> {
+    pub fn load(path: &Path, config: &crate::config::Config) -> Result<(Self, AttachReport)> {
         anyhow::ensure!(
             probe::ringbuf_supported(),
             "kernel ring buffer support is required"
         );
-        let mut bpf =
-            Ebpf::load_file(path).with_context(|| format!("loading {}", path.display()))?;
+        let mut loader = EbpfLoader::new();
+        loader
+            .map_max_entries("EVENTS", config.capture.ring_bytes)
+            .map_max_entries("PENDING", config.capture.pending_entries)
+            .map_max_entries("SOCKETS", config.capture.socket_entries)
+            .map_max_entries("NET_PENDING", config.capture.network_pending_entries)
+            .map_max_entries("READ_PREFIXES", config.capture.read_prefix_entries)
+            .map_max_entries("IGNORE_PREFIXES", config.capture.read_prefix_entries);
+        let mut bpf = loader
+            .load_file(path)
+            .with_context(|| format!("loading {}", path.display()))?;
         let mut report = AttachReport::default();
         let mut links = Vec::new();
         publish_kernel_offsets(&mut bpf)?;
         publish_syscalls(&mut bpf)?;
-        fill_read_prefixes(&mut bpf)?;
+        fill_read_prefixes(&mut bpf, config)?;
+        fill_ignore_prefixes(&mut bpf, config)?;
         for (program, category, event) in [
             ("electric_eye_exec", "sched", "sched_process_exec"),
             ("electric_eye_exit", "sched", "sched_process_exit"),
@@ -90,10 +101,27 @@ impl Collector {
             true,
         )?;
         for (symbol, program, ret) in [
+            ("wake_up_new_task", "electric_eye_fork", false),
+            ("sk_destruct", "electric_eye_socket_free", false),
+            ("inet_release", "electric_eye_socket_release", false),
+            ("__skb_recv_udp", "electric_eye_udp_skb", true),
+            ("udpv6_sendmsg", "electric_eye_udp_sent_enter", false),
+            ("udpv6_recvmsg", "electric_eye_udp_recv_enter", false),
+            ("udpv6_sendmsg", "electric_eye_udp_sent", true),
+            ("udpv6_recvmsg", "electric_eye_udp_recv", true),
+            ("tcp_sendmsg", "electric_eye_tcp_sent_enter", false),
+            ("tcp_recvmsg", "electric_eye_tcp_recv_enter", false),
+            ("udp_sendmsg", "electric_eye_udp_sent_enter", false),
+            ("udp_recvmsg", "electric_eye_udp_recv_enter", false),
             ("tcp_sendmsg", "electric_eye_tcp_sent", true),
             ("tcp_recvmsg", "electric_eye_tcp_recv", true),
             ("udp_sendmsg", "electric_eye_udp_sent", true),
             ("udp_recvmsg", "electric_eye_udp_recv", true),
+            (
+                "security_path_truncate",
+                "electric_eye_path_truncate",
+                false,
+            ),
             ("security_path_unlink", "electric_eye_path_unlink", false),
             ("security_path_rmdir", "electric_eye_path_unlink", false),
             ("security_path_rename", "electric_eye_path_rename", false),
@@ -112,13 +140,14 @@ impl Collector {
                 ring,
                 dropped,
                 _perf_links: links,
+                batch_limit: config.limits.collector_batch,
             },
             report,
         ))
     }
     pub fn drain_once<F: FnMut(Record)>(&mut self, handler: &mut F) -> Result<usize> {
         let mut count = 0;
-        while count < 4096 {
+        while count < self.batch_limit {
             let Some(item) = self.ring.next() else {
                 break;
             };
@@ -147,6 +176,39 @@ fn publish_kernel_offsets(bpf: &mut Ebpf) -> Result<()> {
     let exit = TraceFormat::load("raw_syscalls", "sys_exit")?;
     let namespace = std::fs::metadata("/proc/self/ns/pid")?;
     let offsets = KernelOffsets {
+        skb_head: m("sk_buff", "head")?,
+        skb_network: m("sk_buff", "network_header")?,
+        skb_transport: m("sk_buff", "transport_header")?,
+        socket_type: m("socket", "type")?,
+        skc_net: m("sock_common", "skc_net")?,
+        net_inum: m("net", "ns")? + m("ns_common", "inum")?,
+        skc_rcv_saddr: m("sock_common", "skc_rcv_saddr")?,
+        skc_v6_rcv_saddr: m("sock_common", "skc_v6_rcv_saddr")?,
+        msg_name: m("msghdr", "msg_name")?,
+        inode_ino: m("inode", "i_ino")?,
+        inode_sb: m("inode", "i_sb")?,
+        sb_dev: m("super_block", "s_dev")?,
+        task_pid: m("task_struct", "pid")?,
+        task_thread_pid: m("task_struct", "thread_pid")?,
+        pid_level: m("pid", "level")?,
+        pid_numbers: m("pid", "numbers")?,
+        upid_ns: m("upid", "ns")?,
+        upid_nr: m("upid", "nr")?,
+        pid_ns_inum: m("pid_namespace", "ns")? + m("ns_common", "inum")?,
+        task_cred: m("task_struct", "cred")?,
+        cred_uid: m("cred", "uid")?,
+        cred_euid: m("cred", "euid")?,
+        task_exec_id: m("task_struct", "self_exec_id")?,
+        task_exit_code: m("task_struct", "exit_code")?,
+        task_signal: m("task_struct", "signal")?,
+        signal_live: m("signal_struct", "live")?,
+        mm_arg_start: m("mm_struct", "arg_start")?,
+        mm_arg_end: m("mm_struct", "arg_end")?,
+        task_cgroups: m("task_struct", "cgroups")?,
+        css_dfl_cgrp: m("css_set", "dfl_cgrp")?,
+        cgroup_kn: m("cgroup", "kn")?,
+        kn_parent: m("kernfs_node", "parent").or_else(|_| m("kernfs_node", "__parent"))?,
+        kn_name: m("kernfs_node", "name")?,
         task_comm: m("task_struct", "comm")?,
         task_group_leader: m("task_struct", "group_leader")?,
         task_start_boottime: m("task_struct", "start_boottime")?,
@@ -182,6 +244,7 @@ fn publish_kernel_offsets(bpf: &mut Ebpf) -> Result<()> {
         socket_sk: m("socket", "sk")?,
         sock_common: m("sock", "__sk_common")?,
         skc_family: m("sock_common", "skc_family")?,
+        skc_state: m("sock_common", "skc_state")?,
         skc_num: m("sock_common", "skc_num")?,
         skc_dport: m("sock_common", "skc_dport")?,
         skc_daddr: m("sock_common", "skc_daddr")?,
@@ -200,6 +263,7 @@ fn publish_sock_offsets(bpf: &mut Ebpf) -> Result<()> {
     let f = TraceFormat::load("sock", "inet_sock_set_state")?;
     let m = |name| field(&f, name);
     let o = SockOffsets {
+        skaddr: m("skaddr")?,
         newstate: m("newstate")?,
         sport: m("sport")?,
         dport: m("dport")?,
@@ -224,6 +288,9 @@ fn publish_syscalls(bpf: &mut Ebpf) -> Result<()> {
         .try_into()?;
     for (nr, op) in [
         (libc::SYS_open, OP_OPEN),
+        (libc::SYS_creat, OP_CREAT),
+        (libc::SYS_truncate, OP_TRUNCATE),
+        (libc::SYS_ftruncate, OP_FTRUNCATE),
         (libc::SYS_openat, OP_OPENAT),
         (libc::SYS_openat2, OP_OPENAT2),
         (libc::SYS_write, OP_WRITE),
@@ -240,6 +307,10 @@ fn publish_syscalls(bpf: &mut Ebpf) -> Result<()> {
         (libc::SYS_rename, OP_RENAME),
         (libc::SYS_renameat, OP_RENAMEAT),
         (libc::SYS_renameat2, OP_RENAMEAT),
+        (libc::SYS_getsockopt, OP_SOERROR),
+        (libc::SYS_socket, OP_SOCKET),
+        (libc::SYS_bind, OP_BIND),
+        (libc::SYS_connect, OP_CONNECT),
         (libc::SYS_accept, OP_ACCEPT),
         (libc::SYS_accept4, OP_ACCEPT),
     ] {
@@ -247,15 +318,52 @@ fn publish_syscalls(bpf: &mut Ebpf) -> Result<()> {
     }
     Ok(())
 }
-fn fill_read_prefixes(bpf: &mut Ebpf) -> Result<()> {
+fn fill_read_prefixes(bpf: &mut Ebpf, config: &crate::config::Config) -> Result<()> {
     let mut trie: LpmTrie<_, [u8; 128], u8> = bpf
         .map_mut("READ_PREFIXES")
         .context("READ_PREFIXES missing")?
         .try_into()?;
-    for prefix in sensitive_read_prefixes() {
+    let mut prefixes = if config.capture.builtin_read_prefixes {
+        sensitive_read_prefixes()
+    } else {
+        Vec::new()
+    };
+    prefixes.extend(config.capture.read_prefixes.clone());
+    prefixes.extend(
+        config
+            .rules
+            .sensitive_paths
+            .iter()
+            .map(|r| r.prefix.clone()),
+    );
+    prefixes.sort();
+    prefixes.dedup();
+    for prefix in prefixes {
         let bytes = prefix.as_bytes();
         if bytes.len() > 128 {
             log::warn!("read prefix too long: {prefix}");
+            continue;
+        }
+        let mut data = [0u8; 128];
+        data[..bytes.len()].copy_from_slice(bytes);
+        trie.insert(&Key::new((bytes.len() * 8) as u32, data), 1, 0)?;
+    }
+    Ok(())
+}
+
+fn fill_ignore_prefixes(bpf: &mut Ebpf, config: &crate::config::Config) -> Result<()> {
+    let mut trie: LpmTrie<_, [u8; 128], u8> = bpf
+        .map_mut("IGNORE_PREFIXES")
+        .context("IGNORE_PREFIXES missing")?
+        .try_into()?;
+    let mut prefixes = config.ignore_paths.clone();
+    prefixes.extend(config.capture.noise_paths.clone());
+    prefixes.sort();
+    prefixes.dedup();
+    for prefix in prefixes {
+        let bytes = prefix.as_bytes();
+        if bytes.len() > 128 {
+            log::warn!("ignore prefix too long: {prefix}");
             continue;
         }
         let mut data = [0u8; 128];

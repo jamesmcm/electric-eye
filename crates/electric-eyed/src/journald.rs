@@ -78,8 +78,12 @@ pub fn send_incident(incident: &crate::rules::Incident, journal: &[String]) -> b
 /// Fetch a small, bounded journal context around an incident. The caller
 /// should treat this as optional enrichment: journal permissions or a missing
 /// journalctl must never break event capture.
-pub fn nearby(unit: Option<&str>, ts_ms: u64, window_secs: u64, limit: usize) -> Vec<String> {
-    let (start, end) = context_window(ts_ms, window_secs);
+pub fn nearby(
+    unit: Option<&str>,
+    ts_ms: u64,
+    config: &crate::config::JournalConfig,
+) -> Vec<String> {
+    let (start, end) = context_window(ts_ms, config.context_window_secs);
     let mut command = Command::new("journalctl");
     command.args([
         "--since",
@@ -91,18 +95,22 @@ pub fn nearby(unit: Option<&str>, ts_ms: u64, window_secs: u64, limit: usize) ->
         "--no-pager",
         "-q",
         "-n",
-        &limit.to_string(),
+        &config.context_lines.to_string(),
     ]);
     if let Some(unit) = unit {
         command.args(["--unit", unit]);
     }
-    let Some(output) = bounded_output(&mut command, Duration::from_millis(200), 128 * 1024) else {
+    let Some(output) = bounded_output(
+        &mut command,
+        Duration::from_millis(config.timeout_ms),
+        config.max_output_bytes,
+    ) else {
         return Vec::new();
     };
     String::from_utf8_lossy(&output)
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| line.chars().take(500).collect())
+        .map(|line| line.chars().take(config.max_line_chars).collect())
         .collect()
 }
 
@@ -170,11 +178,12 @@ pub struct IncidentWorker {
     join: Option<std::thread::JoinHandle<()>>,
 }
 impl IncidentWorker {
-    pub fn start(
+    pub fn configured(
         state: Arc<Mutex<crate::api::SharedState>>,
         store: Option<crate::store::StoreClient>,
+        config: crate::config::JournalConfig,
     ) -> std::io::Result<Self> {
-        let (tx, rx) = sync_channel::<crate::rules::Incident>(128);
+        let (tx, rx) = sync_channel::<crate::rules::Incident>(config.queue_entries);
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let join = std::thread::Builder::new()
@@ -184,7 +193,7 @@ impl IncidentWorker {
                     if stopping.load(Ordering::Relaxed) {
                         continue;
                     }
-                    let journal = nearby(incident.unit.as_deref(), incident.ts_ms, 60, 20);
+                    let journal = nearby(incident.unit.as_deref(), incident.ts_ms, &config);
                     if let Some(details) = incident.details.as_object_mut() {
                         details.insert("journal".into(), serde_json::json!(&journal));
                     }

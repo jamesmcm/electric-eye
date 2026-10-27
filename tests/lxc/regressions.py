@@ -65,6 +65,25 @@ expected[str(root / "a/symlink-file")] = 7
 subprocess.run([sys.executable, "-c", "import os,sys; f=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT,0o600);os.write(f,b'child');os.close(f)", str(root / "short-child")], check=True)
 expected[str(root / "short-child")] = 5
 
+# Standalone truncation (including symlink traversal) and legacy creat.
+truncate_path=root/"truncate-target"
+write(truncate_path,b"original")
+os.symlink(truncate_path,root/"truncate-link")
+os.truncate(root/"truncate-link",3)
+truncate_fd=os.open(truncate_path,os.O_WRONLY)
+os.ftruncate(truncate_fd,2);os.close(truncate_fd)
+truncate_fd=os.open(truncate_path,os.O_RDONLY)
+try:
+    os.ftruncate(truncate_fd,0)
+    raise AssertionError("read-only ftruncate unexpectedly succeeded")
+except OSError: pass
+os.close(truncate_fd)
+legacy=root/"legacy-creat"
+legacy_fd=libc.creat(os.fsencode(legacy),0o600)
+assert legacy_fd>=0
+os.close(legacy_fd)
+expected[str(legacy)]=0
+
 # A dup2 from an untracked pipe must not retain the previous file target.
 stale = root / "stale-dup-target"
 fd = os.open(stale, os.O_WRONLY | os.O_CREAT, 0o600)
@@ -175,12 +194,73 @@ with socket.create_connection(("127.0.0.1", port)) as client:
     client.shutdown(socket.SHUT_WR)
     assert client.recv(100) == b"reply"
 thread.join()
+write(root / "network-received-file", b"download-like")
 listener.close()
 assert not errors, errors
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
     udp.bind(("127.0.0.1", 0))
     udp.sendto(b"udp", udp.getsockname())
     assert udp.recv(100) == b"udp"
+
+# The same lifecycle and byte attribution must work for IPv6.
+v6=socket.socket(socket.AF_INET6,socket.SOCK_STREAM);v6.bind(("::1",0));v6.listen();v6_port=v6.getsockname()[1]
+def v6_server():
+    with v6.accept()[0] as peer:
+        assert peer.recv(100)==b"v6";peer.sendall(b"six")
+v6_thread=threading.Thread(target=v6_server);v6_thread.start()
+with socket.socket(socket.AF_INET6,socket.SOCK_STREAM) as client:
+    client.connect(("::1",v6_port));client.sendall(b"v6");assert client.recv(100)==b"six"
+v6_thread.join();v6.close()
+with socket.socket(socket.AF_INET6,socket.SOCK_DGRAM) as v6_udp:
+    v6_udp.bind(("::1",0));v6_udp_port=v6_udp.getsockname()[1];v6_udp.sendto(b"uv6",("::1",v6_udp_port));assert v6_udp.recv(100)==b"uv6"
+
+# A fork-only child must retain exact ancestry and metadata after it exits.
+fork_child=os.fork()
+if fork_child==0:
+    fd=os.open(root/"fork-only",os.O_WRONLY|os.O_CREAT,0o600);os.write(fd,b"fork");os.close(fd);os._exit(23)
+os.waitpid(fork_child,0)
+expected[str(root/"fork-only")]=4
+secret="DO-NOT-PERSIST-THIS-TOKEN"
+exec_child=subprocess.Popen([sys.executable,"-c","pass","--token",secret]);exec_child.wait()
+
+# A shared UDP socket has one creator and separate contributing processes.
+shared=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);shared.bind(("127.0.0.1",0));shared_port=shared.getsockname()[1]
+shared_child=os.fork()
+if shared_child==0:
+    shared.sendto(b"share",("127.0.0.1",shared_port));os._exit(0)
+assert shared.recv(100)==b"share";os.waitpid(shared_child,0);shared.close()
+# A refused local connect must be represented as failure, not establishment.
+probe=socket.socket();probe.bind(("127.0.0.1",0));refused_port=probe.getsockname()[1];probe.close()
+refused = socket.socket()
+try:
+    refused.connect(("127.0.0.1", refused_port))
+    raise AssertionError("unused port unexpectedly accepted")
+except ConnectionRefusedError:
+    pass
+# The connect call consumed the error. Reading zero must retain the failure.
+assert refused.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0
+refused.close()
+
+# IPv4-mapped loopback remains local for detection, even after a credential read.
+with socket.socket(socket.AF_INET6) as mapped:
+    try:
+        mapped.connect(("::ffff:127.0.0.1", refused_port))
+        raise AssertionError("unused mapped port unexpectedly accepted")
+    except ConnectionRefusedError:
+        pass
+
+# Connecting UDP configures a peer without transmitting any external packets.
+# Its destination must nevertheless reach history and the egress rule.
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connected_udp:
+    connected_udp.connect(("8.8.8.8", 55443))
+
+# Real compiler workload for process-tree build correlation.
+source=root/"build-test.c"
+write(source,b"int answer(void) { return 42; }\n")
+subprocess.run(["cc","-c",str(source),"-o",str(root/"build-test.o")],check=True)
+# A complete write-then-rename sequence (same process and exec generation).
+write(root/"save-temporary",b"saved")
+os.rename(root/"save-temporary",root/"saved-config")
 
 # One idle API client must not hold capture or another API worker.
 with socket.socket(socket.AF_UNIX) as slow:
@@ -200,6 +280,12 @@ for path, count in expected.items():
         assert row["entry"]["process"]["start_ns"] > 0, row
         assert row["entry"]["path_resolution"] == "kernel", row
 
+truncations=request("why",path=str(truncate_path))["events"]
+assert sum(row["kind"]=="file.truncate" for row in truncations)>=3,truncations
+assert any(row["kind"]=="file.truncate.attempt" and row["entry"]["syscall_result"]<0 for row in truncations),truncations
+assert all(row["entry"]["path_resolution"]=="kernel" for row in truncations if row["kind"]=="file.truncate"),truncations
+assert any(row["kind"]=="file.truncate" for row in request("why",path=str(legacy))["events"])
+
 assert all(row["kind"].endswith(".attempt") and row["entry"]["syscall_result"] < 0 for row in request("why", path=str(missing))["events"])
 assert all(row["kind"].endswith(".attempt") for row in request("why", path=str(root / "never-renamed"))["events"])
 reads = request("why", path=str(sensitive))["events"]
@@ -211,15 +297,52 @@ assert any(row["kind"] == "file.rename" and row["from_path"] == str(root / "a/di
 assert any(row["kind"] == "file.unlink" for row in rename), rename
 incidents = request("incidents")["incidents"]
 assert any(row["details"]["rule"] == "bulk_mutation" for row in incidents), incidents
+assert not any(row["details"].get("rule")=="sensitive_egress" and "::ffff:127.0.0.1" in row["details"].get("destination", "") for row in incidents), incidents
+assert any(row["details"].get("rule")=="sensitive_egress" and row["details"].get("destination")=="8.8.8.8:55443" for row in incidents), incidents
 assert any(row.get("path") == str(sensitive) and row["process"]["start_ns"] > 0 and row["id"] for row in incidents), incidents
 network = request("network", limit=1000)["events"]
+assert any(row["kind"]=="net.connect" and row["addr"]=="8.8.8.8" and row["remote_port"]==55443 for row in network), network
 accepts = [row for row in network if row["kind"] == "net.accept" and row["local_port"] == port]
 assert accepts and accepts[0]["comm"] == "ee-regression", accepts
 traffic = [row["entry"]["event"] for row in network if row["kind"] == "net.traffic" and row["comm"] == "ee-regression" and row["pid"] == os.getpid()]
-assert sum(row["sent"] for row in traffic) == 15, traffic
-assert sum(row["recv"] for row in traffic) == 15, traffic
+assert sum(row["sent"] for row in traffic) == 23, traffic
+assert sum(row["recv"] for row in traffic) == 28, traffic
+fork_rows=request("process",process=str(fork_child))["processes"]
+assert fork_rows and fork_rows[0]["exit_code"]==23, fork_rows
+assert fork_rows[0]["parent"]["pid"]==os.getpid() and fork_rows[0]["parent"]["start_ns"]>0, fork_rows
+assert fork_rows[0]["cwd"]==str(root) and fork_rows[0]["cgroup"], fork_rows
+exec_rows=request("process",process=str(exec_child.pid))
+assert exec_rows["execs"] and "[redacted]" in exec_rows["processes"][0]["argv"],exec_rows
+assert secret not in json.dumps(exec_rows),exec_rows
+assert any(p["identity"]["pid"]==fork_child for p in request("tree",process=str(os.getpid()))["processes"])
+flows=request("flows",limit=1000)["flows"]
+tcp=[f for f in flows if f["protocol"]=="TCP" and (f["remote"].endswith(":"+str(port)) or f["local"].endswith(":"+str(port)))]
+assert any(f["sent"]==7 and f["received"]==5 for f in tcp),tcp
+assert any(f["sent"]==5 and f["received"]==7 for f in tcp),tcp
+assert all(f["closed_ms"] is not None for f in tcp),tcp
+assert any(f["state"]=="failed" and f["errno"]==errno.ECONNREFUSED and f["remote"].endswith(":"+str(refused_port)) for f in flows),flows
+assert any(f["remote"]=="[::1]:"+str(v6_port) and f["sent"]==2 and f["received"]==3 and f["closed_ms"] is not None for f in flows),flows
+assert any(f["remote"]=="[::1]:"+str(v6_udp_port) and f["sent"]==3 and f["received"]==3 and f["closed_ms"] is not None for f in flows),flows
+shared_rows=[f for f in flows if f["kind"]=="udp_peer" and f["remote"].endswith(":"+str(shared_port))]
+assert shared_rows and shared_rows[0]["sent"]==5 and shared_rows[0]["received"]==5,shared_rows
+assert len(shared_rows[0]["contributors"])==2 and shared_rows[0]["owner"]["pid"]==os.getpid(),shared_rows
+assert exec_rows["processes"][0]["package"]["package"]["name"]=="python",exec_rows
+assert exec_rows["processes"][0]["application"]["task_id"],exec_rows
+summaries=request("summaries",limit=1000)["summaries"]
+assert any(s["kind"]=="build_session" and str(root/"build-test.o") in s["files"] and s["root_exit_code"]==0 for s in summaries),summaries
+assert any(s["kind"]=="save_sequence" and str(root/"saved-config") in s["files"] and len(s["evidence"])==2 for s in summaries),summaries
+assert any(s["kind"]=="download_like" and str(root/"network-received-file") in s["files"] and s["confidence"]=="heuristic" for s in summaries),summaries
+assert any(s["kind"]=="application_start" for s in summaries),summaries
+cli=Path(__file__).parent/"electric-eye"
+human=subprocess.check_output([str(cli),"--socket",socket_path,"process",str(os.getpid())],text=True)
+assert "Package: python " in human and "Arguments:" in human,human
+structured=json.loads(subprocess.check_output([str(cli),"--json","--socket",socket_path,"flows"],text=True))
+assert structured["flows"],structured
+# CLI traffic uses a different process; query loss counters only after these finish.
 status = request("status")
 assert not any(status["capture_loss"]), status
+assert status["config"]["limits"]["aggregation_ms"] == 1000 and status["config"]["limits"]["api_workers"] == 3, status
+assert status["config"]["capture"]["ring_bytes"] == 33554432, status
 assert status["store"]["dropped"] == 0, status
-print(json.dumps({"result": "passed", "root": str(root), "verified_write_paths": len(expected), "capture_loss": status["capture_loss"]}))
+print(json.dumps({"result": "passed", "root": str(root), "verified_write_paths": len(expected), "capture_loss": status["capture_loss"], "pid": os.getpid()}))
 # Keep disposable artifacts for inspection; never touch unrelated files.

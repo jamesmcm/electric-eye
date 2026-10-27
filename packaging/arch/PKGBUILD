@@ -6,16 +6,17 @@ pkgdesc="Explain what applications are doing with eBPF-based Linux activity moni
 arch=('x86_64')
 url="https://github.com/jamesmcm/electric-eye"
 license=('MIT')
-depends=('gcc-libs' 'sqlite')
+depends=('gcc-libs' 'sqlite' 'systemd-libs' 'pacman')
 makedepends=('rustup' 'clang' 'llvm' 'lld' 'bpf-linker' 'pkgconf' 'systemd')
 install=electric-eye.install
 options=('!strip')
-backup=('etc/electric-eye/allowlist.conf')
-source=("$pkgname-$pkgver.tar.gz")
+backup=('etc/electric-eye/allowlist.conf' 'etc/electric-eye/config.toml')
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 build() {
   cd "$pkgname-$pkgver"
+  source scripts/arch-toolchain.sh
 
   # The eBPF crate is a separate workspace built for bpfel-unknown-none. It is
   # pinned to the nightly whose bundled LLVM matches bpf-linker; see
@@ -30,6 +31,7 @@ build() {
 
 check() {
   cd "$pkgname-$pkgver"
+  source scripts/arch-toolchain.sh
   cargo test --workspace --locked
 }
 
@@ -46,7 +48,15 @@ package() {
     "$pkgdir/usr/lib/sysusers.d/electric-eye.conf"
   install -Dm644 packaging/allowlist.conf \
     "$pkgdir/etc/electric-eye/allowlist.conf"
+  install -Dm644 config/default.toml "$pkgdir/etc/electric-eye/config.toml"
+  install -Dm644 .opencode/skills/electric-eye/SKILL.md \
+    "$pkgdir/usr/share/electric-eye/skills/electric-eye/SKILL.md"
+  install -Dm644 .opencode/skills/electric-eye/references/queries.md \
+    "$pkgdir/usr/share/electric-eye/skills/electric-eye/references/queries.md"
   install -Dm644 README.md "$pkgdir/usr/share/doc/electric-eye/README.md"
+  install -Dm644 docs/PERFORMANCE.md "$pkgdir/usr/share/doc/electric-eye/PERFORMANCE.md"
+  install -Dm644 packaging/man/electric-eye.1 "$pkgdir/usr/share/man/man1/electric-eye.1"
+  install -Dm644 packaging/man/electric-eyed.8 "$pkgdir/usr/share/man/man8/electric-eyed.8"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
 

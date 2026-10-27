@@ -1,0 +1,138 @@
+.TH ELECTRIC-EYED 8 "October 2026" "electric-eye 0.1.0" "System Administration"
+.SH NAME
+electric-eyed \- eBPF system activity monitor daemon
+.SH SYNOPSIS
+.B electric-eyed
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B electric-eyed
+observes process lifecycle, file activity, TCP/UDP flows and evidence-backed
+activity summaries using eBPF. It runs as an unprivileged system user with only
+the capabilities needed for BPF/perf attachment, tracefs reads and
+.B /proc/<pid>/exe
+access.
+.PP
+The daemon exposes a read-only query API and a read-only MCP server over Unix
+sockets. It does not freeze processes, block network traffic or modify package
+state.
+.SH RETENTION
+Retention is configured independently for raw events, general activity,
+process/exec history, flows, summaries and incidents. Heuristic summaries use
+a shorter noise window. Incidents are retained per severity; high-severity
+incident records retain their actor, journal and file evidence even after raw
+events expire. See
+.I config/default.toml
+for the fields and defaults.
+.SH OPTIONS
+.TP
+.B \-\-stdout
+Print observed events to stdout instead of only persisting them.
+.TP
+.B \-\-json
+Emit JSON Lines and send diagnostics to stderr.
+.TP
+.B \-\-no-bpf
+Run startup diagnostics and exit without loading BPF.
+.TP
+.B \-\-no-socket
+Do not start the query API.
+.TP
+.B \-\-no-mcp
+Do not start the MCP server.
+.TP
+.B \-\-no-db
+Disable SQLite persistence.
+.TP
+.BI \-\-socket " PATH"
+Override the query socket.
+.TP
+.BI \-\-mcp-socket " PATH"
+Override the MCP socket.
+.TP
+.BI \-\-mcp-tools " PROFILE"
+Select the MCP tool profile:
+.BR default ,
+.B all ,
+or a comma-separated tool list. The default profile is the compact core set.
+.TP
+.BI \-\-db " PATH"
+Override the SQLite database path.
+.TP
+.BI \-\-config " PATH"
+Load a TOML configuration file.
+.TP
+.BI \-\-ebpf-object " PATH"
+Override the compiled eBPF object.
+.TP
+.B \-\-check-config
+Validate configuration and exit without starting the daemon.
+.TP
+.B \-\-print-default-config
+Print every supported configuration setting.
+.SH CONFIGURATION
+The daemon searches, in order:
+.IP \(bu 2
+.BI \-\-config " PATH"
+.IP \(bu 2
+.B ELECTRIC_EYE_CONFIG
+.IP \(bu 2
+.I ~/.config/electric-eye/config.toml
+.IP \(bu 2
+.I ~/.config/electriceye/config.toml
+(legacy fallback)
+.IP \(bu 2
+.I /etc/electric-eye/config.toml
+.PP
+Explicitly selected files must exist. Unknown fields and invalid values fail
+startup. See the electric-eye README and
+.I config/default.toml
+for every setting.
+.SH FILES
+.TP
+.I /run/electric-eye/electric-eye.sock
+Read-only query socket.
+.TP
+.I /run/electric-eye/mcp.sock
+Read-only MCP socket.
+.TP
+.I /var/lib/electric-eye/electric-eye.db
+SQLite history.
+.TP
+.I /etc/electric-eye/config.toml
+System configuration.
+.TP
+.I /etc/electric-eye/allowlist.conf
+Legacy additional allowlist entries.
+.SH SYSTEMD
+The packaged unit is
+.BR electric-eye.service .
+Enable it with:
+.PP
+.nf
+sudo systemctl enable --now electric-eye.service
+.fi
+.PP
+Users who need CLI access must belong to the
+.B electric-eye
+group:
+.PP
+.nf
+sudo usermod -aG electric-eye "$USER"
+.fi
+.PP
+Log out and back in for the group change to take effect.
+.SH PERFORMANCE
+Ring loss, pending-syscall loss, identity loss and path uncertainty are reported
+by
+.BR "electric-eye status" .
+A path failure keeps the event but marks its path uncertain; it is not event
+loss. Use
+.BR "electric-eye noise" ,
+.B ignore_paths
+and careful ring sizing to tune a busy host. Retention and disk headroom are
+reported by
+.BR "electric-eye db status" .
+.SH SEE ALSO
+.BR electric-eye (1),
+.BR systemd.exec (5),
+.BR systemd.resource-control (5)

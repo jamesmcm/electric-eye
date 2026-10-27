@@ -1,0 +1,223 @@
+# electric-eye runtime settings. Copy to ~/.config/electric-eye/config.toml.
+# Every field is optional. Explicit files override discovery; restart to apply.
+# Regenerate defaults with: electric-eyed --print-default-config
+# See README.md for custom sensitive paths, allowlist entries, and validation.
+
+capture_argv = true
+max_argv_bytes = 512
+redact_arguments = [
+    "--password",
+    "--token",
+    "--secret",
+    "--api-key",
+    "--access-token",
+    "--authorization",
+]
+ignore_paths = []
+grouping = []
+focus = []
+mcp_tools = []  # empty/default = status, incidents, investigate, activity, apps, flows, focus
+# use ["all"] for every tool, or a list such as ["status","incidents","flows"]
+# [[focus]]
+# name = "codex-session"
+# applications = ["codex"]
+# paths = ["/home/you/work/project"]
+# log_paths = []  # empty = auto-detect Codex/OpenCode/Hermes/Omarchy logs
+raw_retention_minutes = 5
+activity_retention_days = 30
+process_retention_days = 30
+flow_retention_days = 30
+summary_retention_days = 30
+noise_retention_days = 7
+incident_high_retention_days = 365
+incident_medium_retention_days = 90
+incident_low_retention_days = 30
+
+[rules]
+sensitive_path = true
+credential_sweep = true
+bulk_mutation = true
+suspicious_execution = true
+sensitive_egress = true
+novel_network = true
+builtin_sensitive_paths = true
+builtin_auth_allowlist = true
+builtin_noise_allowlist = true
+known_hosts_allow = true
+incoming_connections = true
+incoming_local_connections = false
+sensitive_window_ms = 60000
+bulk_window_ms = 10000
+dedup_window_ms = 300000
+prune_interval_ms = 1000
+bulk_file_threshold = 50
+credential_category_threshold = 3
+novel_network_min_destinations = 5
+max_actors = 8192
+max_events_per_actor = 4096
+max_dedup_entries = 32768
+max_baseline_entries = 65536
+sensitive_paths = []
+allowlist = []
+network_allowlist = []
+browser_prefixes = [
+    "/usr/lib/firefox",
+    "/usr/bin/firefox",
+    "/opt/firefox",
+    "/usr/lib/chromium",
+    "/usr/bin/chromium",
+    "/opt/google/chrome",
+    "/opt/brave",
+    "/usr/bin/brave",
+    "/usr/lib/brave",
+]
+browser_nix_names = [
+    "-firefox",
+    "-chromium",
+    "-google-chrome",
+    "-brave",
+]
+high_churn_apps = [
+    "transmission",
+    "qbittorrent",
+    "deluge",
+    "ktorrent",
+    "aria2",
+    "rtorrent",
+    "thunar",
+    "tumblerd",
+    "tracker",
+    "baloo",
+    "cargo",
+    "rustc",
+    "nix-daemon",
+    "nix-store",
+    "node",
+    "bun",
+    "deno",
+    "opencode",
+    "tailscaled",
+    "Plex Media Server",
+]
+bulk_noise_paths = [
+    "/.cache/",
+    "/.thumbnails/",
+    "/cache/",
+    "/target/",
+    "/node_modules/",
+    "/.mozilla/",
+    "/.config/chromium/",
+    "/.config/google-chrome/",
+    "/.local/share/trash/",
+    "/tmp/",
+    "/var/tmp/",
+    "/var/cache/",
+]
+suspicious_prefixes = [
+    "/tmp/",
+    "/dev/shm/",
+    "/run/user/",
+]
+suspicious_home_paths = [
+    "Downloads",
+    ".cache",
+    ".local/share/Trash",
+]
+
+[limits]
+aggregation_ms = 5000
+write_top = 32
+traffic_top = 8
+window_entries = 4096
+activity_entries = 2048
+app_entries = 4096
+process_entries = 8192
+retired_process_entries = 32768
+document_entries = 2048
+application_entries = 4096
+application_members = 4096
+flow_entries = 32768
+flow_contributors = 1024
+summary_entries = 4096
+summary_files = 4096
+summary_evidence = 64
+correlation_writes = 8192
+correlation_processes = 32768
+summary_flush_entries = 512
+incident_entries = 200
+dns_entries = 4096
+dns_pending = 256
+dns_ttl_ms = 300000
+api_workers = 4
+api_queue = 1
+api_accept_batch = 16
+api_poll_ms = 10
+api_request_bytes = 16384
+api_timeout_ms = 500
+api_query_rows = 1000
+api_process_rows = 10000
+store_queue = 8192
+store_batch = 128
+store_flush_ms = 200
+store_maintenance_ms = 60000
+activity_bucket_ms = 300000
+collector_batch = 4096
+idle_sleep_ms = 20
+
+[capture]
+ring_bytes = 16777216
+pending_entries = 8192
+socket_entries = 32768
+network_pending_entries = 8192
+read_prefix_entries = 4096
+builtin_read_prefixes = true
+read_prefixes = []
+noise_paths = [
+    "/dev/",
+    "/proc/",
+    "/sys/",
+    "/run/",
+]
+
+[correlation]
+build_session = true
+application_start = true
+save_sequence = true
+download_like = true
+save_window_ms = 10000
+download_window_ms = 30000
+compiler_names = [
+    "rustc",
+    "gcc",
+    "g++",
+    "cc",
+    "c++",
+    "clang",
+    "clang++",
+    "make",
+    "ninja",
+]
+build_driver_names = [
+    "cargo",
+    "go",
+]
+build_subcommands = [
+    "build",
+    "check",
+    "test",
+    "run",
+    "clippy",
+    "bench",
+    "install",
+]
+cross_compiler_patterns = true
+
+[journal]
+enabled = true
+queue_entries = 128
+context_window_secs = 60
+context_lines = 20
+timeout_ms = 200
+max_output_bytes = 131072
+max_line_chars = 500
+

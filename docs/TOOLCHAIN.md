@@ -88,6 +88,23 @@ for the userspace/xtask crates and the pinned nightly for the eBPF object.
 Nixpkgs' LLVM 23.1.0-rc1 is the case that needs `--features llvm-21`, because
 the rc lacks `LLVMParseIRInContext2`.
 
+### Release binaries on Arch must not be built in the Nix shell
+
+The Nix dev shell is useful for the pinned LLVM/clang/bpf-linker toolchain, but
+a release built with it links Nix glibc, Nix sqlite and Nix libsystemd. On Arch,
+that binary cannot load the system `libalpm.so` used for package provenance
+(`libalpm unavailable`), even though the library is installed. The Nix RUNPATH
+takes precedence for `dlopen`, and mixing the Nix and Arch C runtimes is not a
+supported deployment.
+
+`just release` therefore detects `ID=arch` from `/etc/os-release`, switches to
+the system Rust/cargo/pkg-config toolchain, clears Nix library/search paths, and
+fails the build if either release binary still has a `/nix/store` dependency.
+The eBPF object is still built with the pinned nightly; only the userspace
+binary must use the system toolchain. `just build` uses the same sanitized
+environment, so the debug daemon also has working libalpm provenance.
+`just build-ebpf` remains usable on its own for the pinned BPF object.
+
 ## Known failure signatures
 
 | Symptom                                                             | Cause                                        |
@@ -120,7 +137,21 @@ the rc lacks `LLVMParseIRInContext2`.
 - Userspace dependencies live in `[workspace.dependencies]`; crates inherit
   with `.workspace = true`. Bump via plain `cargo update` (semver-safe).
 - Cross-semver bumps (`aya`, `aya-ebpf`) are deliberate events: do them as
-  their own jj commit, verified by a full `just check && just test` plus one
-  live `sudo ./target/debug/electric-eyed --stdout` run.
+  their own jj commit, verified by a full `just check && just test` plus the
+  isolated `EE_LXC_NAME=ee-arch ./tests/lxc/capture-test.sh` capture regression.
 - The eBPF crate keeps its own lockfile (it is a standalone workspace so the
   root workspace never tries to compile it for the host target).
+
+## Event ABI and provenance
+
+The shared event ABI is version 4. Rebuild and deploy the daemon and BPF object
+together; mixed versions are rejected. BTF-derived lifecycle offsets include
+credentials, process/parent identities, exec generation, cgroups and argv.
+Socket hooks use BTF-derived socket/netns fields and final socket-file release
+for shared-descriptor lifetimes. Per-CPU socket sequence counters do not require
+userspace resets or fetch-and-add return-value semantics.
+
+Arch provenance dynamically loads `libalpm.so` from the installed `pacman`
+package. It reads local package metadata without starting a transaction,
+creating a database lock, or changing packages. The daemon falls back to
+filesystem provenance when libalpm is unavailable; Nix is optional.

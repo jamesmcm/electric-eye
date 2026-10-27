@@ -15,11 +15,17 @@ env_logger.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml = "1.1"
 rusqlite.workspace = true
 dns-lookup.workspace = true
 aya = "0.14"
 electric-eye-core = { path = "../electric-eye-core" }
 electric-eye-nix = { path = "../electric-eye-nix" }
+base64 = "0.23.1"
+hmac = "0.13.0"
+sha1 = "0.11.0"
+sha2 = "0.10"
+flate2 = "1"
 
 [dev-dependencies]
 tempfile = "3"

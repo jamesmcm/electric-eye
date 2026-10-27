@@ -255,6 +255,7 @@ pub fn humanize_bytes(bytes: u64) -> String {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ObservedEvent {
     Exec(ExecEvent),
+    Fork(ExecEvent),
     Exit(ExitEvent),
     Connect(NetEvent),
     Accept(NetEvent),
@@ -270,6 +271,7 @@ pub enum ObservedEvent {
 impl ObservedEvent {
     pub fn label(&self) -> &'static str {
         match self {
+            ObservedEvent::Fork(_) => "FORK",
             ObservedEvent::Exec(event) => event.label(),
             ObservedEvent::Exit(event) => event.label(),
             ObservedEvent::Connect(_) => "CONNECT",
@@ -288,6 +290,13 @@ impl ObservedEvent {
 impl fmt::Display for ObservedEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let body = match self {
+            ObservedEvent::Fork(event) => {
+                return write!(
+                    f,
+                    "FORK      {} (pid {}, parent {})",
+                    event.comm, event.pid, event.ppid
+                );
+            }
             ObservedEvent::Exec(event) => return write!(f, "{}", event),
             ObservedEvent::Exit(event) => return write!(f, "{}", event),
             ObservedEvent::Connect(event) => format!("{} -> {}", event.comm, event.endpoint()),

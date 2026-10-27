@@ -44,20 +44,6 @@ pub fn parse_stat(raw: &str) -> Option<ProcessStat> {
     })
 }
 
-pub fn systemd_unit(pid: u32) -> Option<String> {
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    let line = cgroup.lines().find_map(|line| {
-        let (_, path) = line.split_once("::")?;
-        Some(path)
-    })?;
-    let unit = line.rsplit('/').next()?.to_string();
-    if (unit.ends_with(".scope") || unit.ends_with(".service")) && !unit.is_empty() {
-        Some(unit)
-    } else {
-        None
-    }
-}
-
 fn socket_inode(pid: u32, fd: u32) -> Option<u64> {
     let target = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
     let text = target.to_string_lossy();

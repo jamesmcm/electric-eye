@@ -1,3 +1,5 @@
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,18 +15,14 @@ use serde_json::{Value, json};
 use crate::api::ActivityEntry;
 use crate::rules::BaselineData;
 
+#[cfg(test)]
 pub const RAW_RETENTION_MS: i64 = 5 * 60 * 1000;
-pub const ACTIVITY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-pub const ACTIVITY_BUCKET_MS: i64 = 5 * 60 * 1000;
-
-const CHANNEL_CAPACITY: usize = 8192;
-const BATCH_SIZE: usize = 128;
-const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
-const MAX_QUERY_LIMIT: usize = 1000;
 
 enum StoreMsg {
     Event(Box<StoreEvent>),
     Incident(IncidentRow),
+    Document(String, String, u64, String),
+    Compact(SyncSender<Result<Value>>),
     Shutdown,
 }
 
@@ -87,10 +85,16 @@ pub struct StoreClient {
     tx: SyncSender<StoreMsg>,
     path: PathBuf,
     dropped: Arc<AtomicU64>,
+    limits: crate::config::Limits,
+    baseline_limit: usize,
 }
 
 impl Store {
+    #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_config(path, crate::config::Config::default())
+    }
+    pub fn open_with_config(path: &Path, config: crate::config::Config) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating state directory {}", parent.display()))?;
@@ -99,15 +103,19 @@ impl Store {
             .with_context(|| format!("opening SQLite database {}", path.display()))?;
         configure(&conn)?;
         init_schema(&conn)?;
+        conn.execute("UPDATE documents SET json=json_set(json,'$.last_known_state',json_extract(json,'$.state'),'$.state','observation_ended','$.observation_ended_ms',?1)
+            WHERE collection='flows' AND json_extract(json,'$.closed_ms') IS NULL AND COALESCE(json_extract(json,'$.state'),'')<>'observation_ended'",params![now_ms()])?;
         drop(conn);
 
-        let (tx, rx) = sync_channel(CHANNEL_CAPACITY);
+        let (tx, rx) = sync_channel(config.limits.store_queue);
         let dropped = Arc::new(AtomicU64::new(0));
         let path_owned = path.to_path_buf();
         let dropped_writer = Arc::clone(&dropped);
+        let limits = config.limits.clone();
+        let baseline_limit = config.rules.max_baseline_entries;
         let join = std::thread::Builder::new()
             .name("electric-eye-store".into())
-            .spawn(move || writer_loop(path_owned, rx, dropped_writer))
+            .spawn(move || writer_loop(path_owned, rx, dropped_writer, config))
             .context("spawning SQLite writer thread")?;
 
         Ok(Self {
@@ -117,6 +125,8 @@ impl Store {
                 tx,
                 path: path.to_path_buf(),
                 dropped,
+                limits,
+                baseline_limit,
             },
         })
     }
@@ -134,6 +144,103 @@ impl Store {
 }
 
 impl StoreClient {
+    pub fn document(&self, collection: &str, key: &str, ts: u64, value: &impl serde::Serialize) {
+        if let Ok(json) = serde_json::to_string(value)
+            && self
+                .tx
+                .try_send(StoreMsg::Document(collection.into(), key.into(), ts, json))
+                .is_err()
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn documents(&self, collection: &str, limit: usize) -> Result<Vec<Value>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT json FROM documents WHERE collection=?1 ORDER BY ts_ms DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![collection, limit.min(self.limits.api_process_rows) as i64],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.map(|s| Ok(serde_json::from_str(&s?)?)).collect()
+    }
+    /// Select before applying the history limit, so old actors remain queryable.
+    pub fn process_documents(
+        &self,
+        selector: &str,
+        tree: bool,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        let conn = self.read_connection()?;
+        let pid = selector.parse::<u32>().ok();
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE found(key,json) AS (
+                SELECT key,json FROM documents WHERE collection='processes'
+                  AND (?1='' OR key=?1 OR json_extract(json,'$.identity.pid')=?2)
+                UNION
+                SELECT d.key,d.json FROM documents d JOIN found p
+                  ON json_extract(d.json,'$.parent.pid')=json_extract(p.json,'$.identity.pid')
+                 AND json_extract(d.json,'$.parent.start_ns')=json_extract(p.json,'$.identity.start_ns')
+                 AND json_extract(d.json,'$.parent.boot_id')=json_extract(p.json,'$.identity.boot_id')
+                 WHERE d.collection='processes' AND ?3 AND ?1<>''
+                UNION
+                SELECT d.key,d.json FROM found p JOIN documents a
+                  ON a.collection='processes' AND json_extract(a.json,'$.superseded_by')=p.key
+                  JOIN documents d ON d.collection='processes'
+                 AND json_extract(d.json,'$.parent.pid')=json_extract(a.json,'$.identity.pid')
+                 AND json_extract(d.json,'$.parent.start_ns')=json_extract(a.json,'$.identity.start_ns')
+                 AND json_extract(d.json,'$.parent.boot_id')=json_extract(a.json,'$.identity.boot_id')
+                 WHERE ?3 AND ?1<>''
+            ) SELECT json FROM found WHERE json_extract(json,'$.superseded_by') IS NULL
+              ORDER BY json_extract(json,'$.last_seen_ms') DESC LIMIT ?4"
+        )?;
+        let rows = stmt.query_map(params![selector, pid, tree, limit as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut result: Vec<Value> = rows
+            .map(|r| Ok(serde_json::from_str(&r?)?))
+            .collect::<Result<_>>()?;
+        let mut parent = conn.prepare(
+            "SELECT json_extract(p.json,'$.identity') FROM documents a JOIN documents p
+            ON p.collection='processes' AND p.key=json_extract(a.json,'$.superseded_by')
+            WHERE a.collection='processes' AND a.key=?1",
+        )?;
+        for row in &mut result {
+            if let Ok(identity) =
+                serde_json::from_value::<crate::api::ProcessIdentity>(row["parent"].clone())
+            {
+                let value: rusqlite::Result<String> =
+                    parent.query_row(params![crate::process::key(&identity)], |r| r.get(0));
+                if let Ok(value) = value {
+                    row["parent"] = serde_json::from_str(&value)?;
+                }
+            }
+        }
+        Ok(result)
+    }
+    pub fn exec_history(&self, ids: &[String], limit: usize) -> Result<Vec<Value>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT json FROM documents WHERE collection='execs'
+            AND json_extract(json,'$.id') IN (SELECT value FROM json_each(?1))
+            ORDER BY ts_ms DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![serde_json::to_string(ids)?, limit as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
+        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
+    pub fn recent_events(&self, limit: usize) -> Result<Vec<Value>> {
+        let conn = self.read_connection()?;
+        let mut stmt =
+            conn.prepare("SELECT json FROM events ORDER BY ts_ms DESC,id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(
+            params![limit.clamp(1, self.limits.api_query_rows) as i64],
+            |r| r.get::<_, String>(0),
+        )?;
+        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -175,15 +282,32 @@ impl StoreClient {
         })
     }
 
+    pub fn db_status(&self, config: &crate::config::Config) -> Result<Value> {
+        let conn = self.read_connection()?;
+        let mut value = db_stats(&conn, &self.path, config)?;
+        value["dropped"] = json!(self.dropped());
+        Ok(value)
+    }
+
+    pub fn compact(&self) -> Result<Value> {
+        let (reply, response) = sync_channel(1);
+        self.tx
+            .send(StoreMsg::Compact(reply))
+            .context("store writer is not accepting maintenance requests")?;
+        response
+            .recv_timeout(Duration::from_secs(30))
+            .context("timed out waiting for database compaction")?
+    }
+
     pub fn baseline(&self) -> Result<BaselineData> {
         let conn = self.read_connection()?;
         let mut paths = Vec::new();
         let mut stmt = conn.prepare(
             "SELECT COALESCE(exe, nix, comm), subject FROM events WHERE kind LIKE 'file.%' AND kind NOT LIKE '%.attempt'
              UNION
-             SELECT COALESCE(exe, nix, app), subject FROM activities WHERE kind LIKE 'file.%' AND kind NOT LIKE '%.attempt'",
+             SELECT COALESCE(exe, nix, app), subject FROM activities WHERE kind LIKE 'file.%' AND kind NOT LIKE '%.attempt' LIMIT ?1",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![self.baseline_limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -196,9 +320,9 @@ impl StoreClient {
              WHERE kind LIKE 'net.%' AND kind NOT IN ('net.traffic', 'net.listen')
              UNION
              SELECT COALESCE(exe, nix, app), subject FROM activities
-             WHERE kind LIKE 'net.%' AND kind NOT IN ('net.traffic', 'net.listen')",
+             WHERE kind LIKE 'net.%' AND kind NOT IN ('net.traffic', 'net.listen') LIMIT ?1",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![self.baseline_limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
@@ -209,9 +333,9 @@ impl StoreClient {
 
     pub fn recent_activities(&self, limit: usize) -> Result<Value> {
         let conn = self.read_connection()?;
-        let limit = limit.clamp(1, MAX_QUERY_LIMIT);
+        let limit = limit.clamp(1, self.limits.api_query_rows);
         let mut stmt = conn.prepare(
-            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe
+            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe, app_name, task_id, comm
              FROM activities ORDER BY bucket_ms DESC, count DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], activity_row)?;
@@ -220,10 +344,10 @@ impl StoreClient {
 
     pub fn app_activities(&self, app: &str, limit: usize) -> Result<Value> {
         let conn = self.read_connection()?;
-        let limit = limit.clamp(1, MAX_QUERY_LIMIT);
+        let limit = limit.clamp(1, self.limits.api_query_rows);
         let mut stmt = conn.prepare(
-            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe
-             FROM activities WHERE app = ?1 ORDER BY bucket_ms DESC, count DESC LIMIT ?2",
+            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe, app_name, task_id, comm
+             FROM activities WHERE app = ?1 OR app_name = ?1 OR task_id = ?1 OR comm = ?1 ORDER BY bucket_ms DESC, count DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![app, limit as i64], activity_row)?;
         let activities = collect(rows)?;
@@ -231,7 +355,7 @@ impl StoreClient {
         let mut stmt = conn.prepare(
             "SELECT ts_ms, kind, comm, subject, path, from_path, to_path,
                     addr, local_port, remote_port, bytes, count, json
-             FROM events WHERE comm = ?1 ORDER BY ts_ms DESC LIMIT ?2",
+             FROM events WHERE comm = ?1 OR json_extract(json,'$.application.id')=?1 OR json_extract(json,'$.application.name')=?1 OR json_extract(json,'$.application.task_id')=?1 ORDER BY ts_ms DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![app, limit as i64], raw_row)?;
         Ok(json!({
@@ -247,9 +371,9 @@ impl StoreClient {
 
     pub fn network_activities(&self, limit: usize) -> Result<Value> {
         let conn = self.read_connection()?;
-        let limit = limit.clamp(1, MAX_QUERY_LIMIT);
+        let limit = limit.clamp(1, self.limits.api_query_rows);
         let mut stmt = conn.prepare(
-            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe
+            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe, app_name, task_id, comm
              FROM activities WHERE kind LIKE 'net.%'
              ORDER BY bucket_ms DESC, bytes DESC LIMIT ?1",
         )?;
@@ -270,9 +394,9 @@ impl StoreClient {
 
     pub fn why(&self, path: &str, limit: usize) -> Result<Value> {
         let conn = self.read_connection()?;
-        let limit = limit.clamp(1, MAX_QUERY_LIMIT);
+        let limit = limit.clamp(1, self.limits.api_query_rows);
         let mut stmt = conn.prepare(
-            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe
+            "SELECT bucket_ms, kind, app, subject, count, bytes, unit, nix, from_path, to_path, exe, app_name, task_id, comm
              FROM activities WHERE (subject = ?1 OR from_path = ?1 OR to_path = ?1) ORDER BY bucket_ms DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![path, limit as i64], activity_row)?;
@@ -295,7 +419,7 @@ impl StoreClient {
 
     pub fn incidents(&self, limit: usize) -> Result<Value> {
         let conn = self.read_connection()?;
-        let limit = limit.clamp(1, MAX_QUERY_LIMIT);
+        let limit = limit.clamp(1, self.limits.api_query_rows);
         let mut stmt = conn.prepare(
             "SELECT ts_ms, severity, title, details, incident_id, json, id
              FROM incidents ORDER BY ts_ms DESC LIMIT ?1",
@@ -337,6 +461,9 @@ fn activity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "from_path": row.get::<_, Option<String>>(8)?,
         "to_path": row.get::<_, Option<String>>(9)?,
         "exe": row.get::<_, Option<String>>(10)?,
+        "app_name": row.get::<_, Option<String>>(11)?,
+        "task_id": row.get::<_, Option<String>>(12)?,
+        "comm": row.get::<_, Option<String>>(13)?,
     }))
 }
 
@@ -409,7 +536,7 @@ impl StoreEvent {
             json,
         };
         match event {
-            ObservedEvent::Exec(event) => {
+            ObservedEvent::Exec(event) | ObservedEvent::Fork(event) => {
                 row.subject = event.exe.display().to_string();
             }
             ObservedEvent::Exit(event) => {
@@ -469,6 +596,9 @@ impl StoreEvent {
 
 fn identity(event: &ObservedEvent) -> (String, u32, u32, String) {
     match event {
+        ObservedEvent::Fork(event) => {
+            ("proc.fork".into(), event.pid, event.uid, event.comm.clone())
+        }
         ObservedEvent::Exec(event) => {
             ("proc.exec".into(), event.pid, event.uid, event.comm.clone())
         }
@@ -536,6 +666,92 @@ fn identity(event: &ObservedEvent) -> (String, u32, u32, String) {
     }
 }
 
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    let path = CString::new(parent.as_os_str().as_bytes()).ok()?;
+    let mut stat = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let block = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    };
+    Some((
+        stat.f_blocks.saturating_mul(block),
+        stat.f_bavail.saturating_mul(block),
+    ))
+}
+
+fn db_stats(conn: &Connection, path: &Path, config: &crate::config::Config) -> Result<Value> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    let mut documents = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT collection, COUNT(*) FROM documents GROUP BY collection ORDER BY collection",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(json!({
+                "collection": row.get::<_, String>(0)?,
+                "count": row.get::<_, i64>(1)?,
+            }))
+        })?;
+        for row in rows {
+            documents.push(row?);
+        }
+    }
+    let (oldest_activity_ms, newest_activity_ms) = conn.query_row(
+        "SELECT MIN(bucket_ms), MAX(bucket_ms) FROM activities",
+        [],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+    )?;
+    let (disk_total, disk_free) = disk_space(path).unzip();
+    let wal = sidecar(path, "-wal");
+    let shm = sidecar(path, "-shm");
+    Ok(json!({
+        "path": path.display().to_string(),
+        "db_bytes": file_size(path),
+        "wal_bytes": file_size(&wal),
+        "shm_bytes": file_size(&shm),
+        "page_size": page_size,
+        "page_count": page_count,
+        "free_pages": free_pages,
+        "raw_events": scalar(conn, "SELECT COUNT(*) FROM events"),
+        "activities": scalar(conn, "SELECT COUNT(*) FROM activities"),
+        "incidents": scalar(conn, "SELECT COUNT(*) FROM incidents"),
+        "documents": documents,
+        "documents_total": scalar(conn, "SELECT COUNT(*) FROM documents"),
+        "oldest_activity_ms": oldest_activity_ms,
+        "newest_activity_ms": newest_activity_ms,
+        "retention": {
+            "raw_retention_minutes": config.raw_retention_minutes,
+            "activity_retention_days": config.activity_retention_days,
+            "process_retention_days": config.process_retention_days,
+            "flow_retention_days": config.flow_retention_days,
+            "summary_retention_days": config.summary_retention_days,
+            "noise_retention_days": config.noise_retention_days,
+            "incident_high_retention_days": config.incident_high_retention_days,
+            "incident_medium_retention_days": config.incident_medium_retention_days,
+            "incident_low_retention_days": config.incident_low_retention_days,
+        },
+        "disk_total_bytes": disk_total,
+        "disk_free_bytes": disk_free,
+    }))
+}
+
 fn configure(conn: &Connection) -> Result<()> {
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(
@@ -548,7 +764,13 @@ fn configure(conn: &Connection) -> Result<()> {
 
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS events (
+        "CREATE TABLE IF NOT EXISTS documents(collection TEXT NOT NULL,key TEXT NOT NULL,ts_ms INTEGER NOT NULL,json TEXT NOT NULL,PRIMARY KEY(collection,key));
+        CREATE INDEX IF NOT EXISTS documents_time ON documents(collection,ts_ms);
+        CREATE INDEX IF NOT EXISTS documents_pid ON documents(collection,json_extract(json,'$.identity.pid'));
+        CREATE INDEX IF NOT EXISTS documents_parent ON documents(collection,json_extract(json,'$.parent.pid'),json_extract(json,'$.parent.start_ns'),json_extract(json,'$.parent.boot_id'));
+        CREATE INDEX IF NOT EXISTS documents_superseded ON documents(collection,json_extract(json,'$.superseded_by'));
+        CREATE INDEX IF NOT EXISTS documents_actor ON documents(collection,json_extract(json,'$.id'));
+        CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY,
             ts_ms INTEGER NOT NULL,
             kind TEXT NOT NULL,
@@ -603,11 +825,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
             incident_id TEXT,
             json TEXT
         );
-        CREATE INDEX IF NOT EXISTS incidents_ts ON incidents(ts_ms);",
+        CREATE INDEX IF NOT EXISTS incidents_ts ON incidents(ts_ms);
+        CREATE INDEX IF NOT EXISTS incidents_severity_ts ON incidents(severity,ts_ms);",
     )?;
     let _ = conn.execute("ALTER TABLE events ADD COLUMN exe TEXT", []);
     let _ = conn.execute("ALTER TABLE activities ADD COLUMN exe TEXT", []);
-    for column in ["from_path", "to_path"] {
+    for column in ["from_path", "to_path", "app_name", "task_id", "comm"] {
         ensure_column(conn, "activities", column, "TEXT")?;
     }
     ensure_column(conn, "incidents", "incident_id", "TEXT")?;
@@ -628,7 +851,12 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ty: &str) -> Resu
     Ok(())
 }
 
-fn writer_loop(path: PathBuf, rx: Receiver<StoreMsg>, dropped: Arc<AtomicU64>) {
+fn writer_loop(
+    path: PathBuf,
+    rx: Receiver<StoreMsg>,
+    dropped: Arc<AtomicU64>,
+    config: crate::config::Config,
+) {
     let mut conn = match Connection::open(&path).context("opening writer connection") {
         Ok(conn) => conn,
         Err(err) => {
@@ -642,28 +870,58 @@ fn writer_loop(path: PathBuf, rx: Receiver<StoreMsg>, dropped: Arc<AtomicU64>) {
     }
 
     let mut batch: Vec<StoreEvent> = Vec::new();
+    let mut documents: Vec<(String, String, u64, String)> = Vec::new();
     let mut last_maintenance = Instant::now();
+    let mut last_flush = Instant::now();
     loop {
-        match rx.recv_timeout(Duration::from_millis(200)) {
+        match rx.recv_timeout(Duration::from_millis(config.limits.store_flush_ms)) {
             Ok(StoreMsg::Event(event)) => {
                 batch.push(*event);
-                if batch.len() >= BATCH_SIZE
+                if batch.len() >= config.limits.store_batch
                     && let Err(err) = flush_events(&mut conn, &mut batch)
                 {
                     log::error!("store event flush failed: {err:#}");
+                }
+            }
+            Ok(StoreMsg::Document(collection, key, ts, json)) => {
+                documents.push((collection, key, ts, json));
+                if documents.len() >= config.limits.store_batch
+                    && let Err(err) = flush_documents(&mut conn, &mut documents, &dropped)
+                {
+                    log::error!("document persistence failed: {err:#}");
                 }
             }
             Ok(StoreMsg::Incident(incident)) => {
                 if let Err(err) = flush_events(&mut conn, &mut batch) {
                     log::error!("store event flush failed: {err:#}");
                 }
+                if let Err(err) = flush_documents(&mut conn, &mut documents, &dropped) {
+                    log::error!("document persistence failed: {err:#}");
+                }
                 if let Err(err) = insert_incident(&conn, &incident) {
                     log::error!("store incident insert failed: {err:#}");
                 }
             }
+            Ok(StoreMsg::Compact(reply)) => {
+                let result = (|| -> Result<Value> {
+                    flush_events(&mut conn, &mut batch)?;
+                    flush_documents(&mut conn, &mut documents, &dropped)?;
+                    // VACUUM itself writes a large WAL in WAL mode. Checkpoint
+                    // and truncate after it so compaction actually releases
+                    // disk space back to the filesystem.
+                    conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+                    let mut value = db_stats(&conn, &path, &config)?;
+                    value["dropped"] = json!(dropped.load(Ordering::Relaxed));
+                    Ok(value)
+                })();
+                let _ = reply.send(result);
+            }
             Ok(StoreMsg::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                 if let Err(err) = flush_events(&mut conn, &mut batch) {
                     log::error!("store final flush failed: {err:#}");
+                }
+                if let Err(err) = flush_documents(&mut conn, &mut documents, &dropped) {
+                    log::error!("store final document flush failed: {err:#}");
                 }
                 break;
             }
@@ -671,17 +929,59 @@ fn writer_loop(path: PathBuf, rx: Receiver<StoreMsg>, dropped: Arc<AtomicU64>) {
                 if let Err(err) = flush_events(&mut conn, &mut batch) {
                     log::error!("store timed flush failed: {err:#}");
                 }
+                if let Err(err) = flush_documents(&mut conn, &mut documents, &dropped) {
+                    log::error!("store timed document flush failed: {err:#}");
+                }
             }
         }
 
-        if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
+        if last_flush.elapsed() >= Duration::from_millis(config.limits.store_flush_ms) {
+            last_flush = Instant::now();
+            if let Err(err) = flush_events(&mut conn, &mut batch) {
+                log::error!("store timed flush failed: {err:#}");
+            }
+            if let Err(err) = flush_documents(&mut conn, &mut documents, &dropped) {
+                log::error!("store timed document flush failed: {err:#}");
+            }
+        }
+        if last_maintenance.elapsed() >= Duration::from_millis(config.limits.store_maintenance_ms) {
             last_maintenance = Instant::now();
-            if let Err(err) = maintain(&mut conn) {
+            if let Err(err) = maintain_with_config(&mut conn, &config) {
                 log::error!("store maintenance failed: {err:#}");
             }
         }
     }
     let _ = dropped;
+}
+
+fn flush_documents(
+    conn: &mut Connection,
+    documents: &mut Vec<(String, String, u64, String)>,
+    dropped: &AtomicU64,
+) -> Result<()> {
+    if documents.is_empty() {
+        return Ok(());
+    }
+    let result = (|| -> Result<()> {
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO documents VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(collection,key) DO UPDATE SET ts_ms=excluded.ts_ms,json=excluded.json",
+            )?;
+            for (collection, key, ts, json) in documents.iter() {
+                stmt.execute(params![collection, key, *ts as i64, json])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+    if let Err(err) = &result {
+        log::error!("document batch flush failed: {err:#}");
+        dropped.fetch_add(documents.len() as u64, Ordering::Relaxed);
+    }
+    documents.clear();
+    result
 }
 
 fn flush_events(conn: &mut Connection, batch: &mut Vec<StoreEvent>) -> Result<()> {
@@ -745,23 +1045,68 @@ fn insert_incident(conn: &Connection, incident: &IncidentRow) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn maintain(conn: &mut Connection) -> Result<()> {
+    maintain_with_config(conn, &crate::config::Config::default())
+}
+fn maintain_with_config(conn: &mut Connection, config: &crate::config::Config) -> Result<()> {
     let now = now_ms();
-    let raw_cutoff = now - RAW_RETENTION_MS;
-    let activity_cutoff = now - ACTIVITY_RETENTION_MS;
+    let raw_cutoff = now - config.raw_retention_minutes as i64 * 60_000;
+    let activity_cutoff = now - config.activity_retention_days as i64 * 86_400_000;
+    let process_cutoff = now - config.process_retention_days as i64 * 86_400_000;
+    let flow_cutoff = now - config.flow_retention_days as i64 * 86_400_000;
+    let summary_cutoff = now - config.summary_retention_days as i64 * 86_400_000;
+    let noise_cutoff = now - config.noise_retention_days as i64 * 86_400_000;
+    let high_incident_cutoff = now - config.incident_high_retention_days as i64 * 86_400_000;
+    let medium_incident_cutoff = now - config.incident_medium_retention_days as i64 * 86_400_000;
+    let low_incident_cutoff = now - config.incident_low_retention_days as i64 * 86_400_000;
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO activities (bucket_ms, kind, app, subject, count, bytes, unit, nix, exe, from_path, to_path)
-         SELECT (ts_ms / ?1) * ?1, kind, comm, subject, SUM(COALESCE(count, 1)),
-                COALESCE(SUM(bytes), 0), MAX(unit), MAX(nix), exe, from_path, to_path
+        "INSERT INTO activities (bucket_ms, kind, app, subject, count, bytes, unit, nix, exe, from_path, to_path, app_name, task_id, comm)
+         SELECT (ts_ms / ?1) * ?1, kind, COALESCE(json_extract(json,'$.application.id'),comm), subject, SUM(COALESCE(count, 1)),
+                COALESCE(SUM(bytes), 0), MAX(unit), MAX(nix), exe, from_path, to_path,
+                json_extract(json,'$.application.name'),json_extract(json,'$.application.task_id'),comm
          FROM events WHERE ts_ms < ?2
-         GROUP BY (ts_ms / ?1) * ?1, kind, comm, subject, exe, from_path, to_path",
-        params![ACTIVITY_BUCKET_MS, raw_cutoff],
+         GROUP BY (ts_ms / ?1) * ?1, kind, COALESCE(json_extract(json,'$.application.id'),comm), subject, exe, from_path, to_path,
+                  json_extract(json,'$.application.name'),json_extract(json,'$.application.task_id'),comm",
+        params![config.limits.activity_bucket_ms, raw_cutoff],
     )?;
     tx.execute("DELETE FROM events WHERE ts_ms < ?1", params![raw_cutoff])?;
     tx.execute(
         "DELETE FROM activities WHERE bucket_ms < ?1",
         params![activity_cutoff],
+    )?;
+    tx.execute(
+        "DELETE FROM documents WHERE collection IN ('processes','execs') AND ts_ms < ?1",
+        params![process_cutoff],
+    )?;
+    tx.execute(
+        "DELETE FROM documents WHERE collection='applications' AND ts_ms < ?1",
+        params![activity_cutoff],
+    )?;
+    tx.execute(
+        "DELETE FROM documents WHERE collection='flows' AND ts_ms < ?1",
+        params![flow_cutoff],
+    )?;
+    tx.execute(
+        "DELETE FROM documents WHERE collection='summaries'
+         AND json_extract(json,'$.confidence')='heuristic' AND ts_ms < ?1",
+        params![noise_cutoff],
+    )?;
+    tx.execute(
+        "DELETE FROM documents WHERE collection='summaries' AND ts_ms < ?1",
+        params![summary_cutoff],
+    )?;
+    tx.execute(
+        "DELETE FROM incidents
+         WHERE (severity='high' AND ts_ms < ?1)
+            OR (severity='medium' AND ts_ms < ?2)
+            OR (severity='low' AND ts_ms < ?3)",
+        params![
+            high_incident_cutoff,
+            medium_incident_cutoff,
+            low_incident_cutoff
+        ],
     )?;
     tx.commit()?;
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE); PRAGMA optimize;");
@@ -786,6 +1131,9 @@ mod tests {
         ActivityEntry {
             ts_ms: now_ms() as u64,
             syscall_result: None,
+            event_id: None,
+            process_info: None,
+            application: None,
             process: None,
             path_resolution: None,
             event,
@@ -911,6 +1259,9 @@ mod persistence_regressions {
         let entry = ActivityEntry {
             ts_ms: (now_ms() - RAW_RETENTION_MS - 1000) as u64,
             syscall_result: None,
+            event_id: None,
+            process_info: None,
+            application: None,
             process: None,
             path_resolution: Some("kernel".into()),
             event: ObservedEvent::FileRename(RenameEvent {
@@ -947,6 +1298,9 @@ mod persistence_regressions {
         let entry = ActivityEntry {
             ts_ms: now_ms() as u64,
             syscall_result: None,
+            event_id: None,
+            process_info: None,
+            application: None,
             process: Some(crate::api::ProcessIdentity {
                 pid: 7,
                 start_ns: 123,
@@ -999,6 +1353,274 @@ mod persistence_regressions {
         let result = store.client().incidents(10).unwrap();
         assert_eq!(result["incidents"][0]["id"], "legacy-1");
         assert_eq!(result["incidents"][0]["title"], "legacy");
+        store.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod retention_regressions {
+    use super::*;
+    #[test]
+    fn configurable_document_retention_is_independent_of_raw_window() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let now = now_ms();
+        for (collection, age) in [
+            ("processes", 2 * 86_400_000),
+            ("execs", 30 * 60_000),
+            ("summaries", 2 * 86_400_000),
+            ("flows", 30 * 60_000),
+        ] {
+            conn.execute(
+                "INSERT INTO documents VALUES(?1,?1,?2,'{}')",
+                params![collection, now - age],
+            )
+            .unwrap();
+        }
+        let config = crate::config::Config {
+            process_retention_days: 1,
+            activity_retention_days: 1,
+            summary_retention_days: 1,
+            ..Default::default()
+        };
+        maintain_with_config(&mut conn, &config).unwrap();
+        assert_eq!(scalar(&conn, "SELECT count(*) FROM documents"), 2);
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT count(*) FROM documents WHERE collection='execs'"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn incidents_and_noise_summaries_use_independent_retention() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let now = now_ms();
+        let day = 86_400_000;
+        for (severity, age, id) in [
+            ("high", 40 * day, "high-old"),
+            ("medium", 20 * day, "medium-old"),
+            ("low", 5 * day, "low-old"),
+            ("high", 5 * day, "high-new"),
+            ("medium", 5 * day, "medium-new"),
+            ("low", day, "low-new"),
+        ] {
+            conn.execute(
+                "INSERT INTO incidents (ts_ms,severity,title,details,incident_id,json)
+                 VALUES (?1,?2,'test','{}',?3,'{}')",
+                params![now - age, severity, id],
+            )
+            .unwrap();
+        }
+        for (confidence, age, key) in [
+            ("heuristic", 10 * day, "noise-old"),
+            ("correlated", 10 * day, "general-old"),
+            ("heuristic", day, "noise-new"),
+            ("correlated", day, "general-new"),
+        ] {
+            conn.execute(
+                "INSERT INTO documents VALUES('summaries',?1,?2,?3)",
+                params![
+                    key,
+                    now - age,
+                    serde_json::json!({"confidence": confidence}).to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let config = crate::config::Config {
+            incident_high_retention_days: 30,
+            incident_medium_retention_days: 10,
+            incident_low_retention_days: 3,
+            noise_retention_days: 3,
+            summary_retention_days: 30,
+            ..Default::default()
+        };
+        maintain_with_config(&mut conn, &config).unwrap();
+        assert_eq!(scalar(&conn, "SELECT count(*) FROM incidents"), 3);
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT count(*) FROM incidents WHERE severity='high' AND incident_id='high-new'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT count(*) FROM documents WHERE collection='summaries'"
+            ),
+            3
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT count(*) FROM documents WHERE collection='summaries' AND key='noise-old'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT count(*) FROM documents WHERE collection='summaries' AND key='general-old'"
+            ),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod usability_regressions {
+    use super::*;
+    fn fixture() -> (tempfile::TempDir, Connection, StoreClient) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        let (tx, _) = sync_channel(1);
+        let client = StoreClient {
+            tx,
+            path,
+            dropped: Arc::new(AtomicU64::new(0)),
+            limits: crate::config::Limits::default(),
+            baseline_limit: crate::config::RuleConfig::default().max_baseline_entries,
+        };
+        (dir, conn, client)
+    }
+    fn document(conn: &Connection, collection: &str, key: &str, ts: u64, value: Value) {
+        conn.execute(
+            "INSERT INTO documents VALUES(?1,?2,?3,?4)",
+            params![collection, key, ts as i64, value.to_string()],
+        )
+        .unwrap();
+    }
+    #[test]
+    fn actors_and_execs_older_than_ten_thousand_documents_remain_queryable() {
+        let (_dir, conn, client) = fixture();
+        document(
+            &conn,
+            "processes",
+            "boot:42:123",
+            1,
+            json!({"id":"boot:42:123","identity":{"pid":42,"start_ns":123,"boot_id":"boot"},"last_seen_ms":1}),
+        );
+        document(
+            &conn,
+            "execs",
+            "boot:42:123:1",
+            1,
+            json!({"id":"boot:42:123","exec_id":1}),
+        );
+        conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(100) UNION ALL SELECT x+1 FROM n WHERE x<10200)
+            INSERT INTO documents SELECT 'processes','new:'||x,x,json_object('id','new:'||x,'identity',json_object('pid',x,'start_ns',x,'boot_id','boot'),'last_seen_ms',x) FROM n;
+            INSERT INTO documents SELECT 'execs',key||':1',ts_ms,json FROM documents WHERE collection='processes' AND ts_ms>1;").unwrap();
+        assert_eq!(
+            client.process_documents("42", false, 100).unwrap()[0]["id"],
+            "boot:42:123"
+        );
+        assert_eq!(
+            client
+                .process_documents("boot:42:123", false, 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            client
+                .exec_history(&["boot:42:123".into()], 100)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn application_names_and_tasks_survive_raw_compaction() {
+        let (_dir, mut conn, client) = fixture();
+        let ts = now_ms() - RAW_RETENTION_MS - 1000;
+        conn.execute("INSERT INTO events(ts_ms,kind,pid,uid,comm,subject,json) VALUES(?1,'file.write',1,1000,'helper','/work/output',?2)",params![ts,json!({"application":{"id":"desktop:editor.desktop","name":"Editor","task_id":"task:1"}}).to_string()]).unwrap();
+        maintain(&mut conn).unwrap();
+        for selector in ["Editor", "desktop:editor.desktop", "task:1", "helper"] {
+            let result = client.app_activities(selector, 10).unwrap();
+            assert_eq!(
+                result["activities"].as_array().unwrap().len(),
+                1,
+                "{selector}: {result}"
+            );
+            assert_eq!(result["activities"][0]["app_name"], "Editor");
+        }
+    }
+    #[test]
+    fn inventory_parent_links_resolve_to_exact_identities_in_trees() {
+        let (_dir, conn, client) = fixture();
+        document(
+            &conn,
+            "processes",
+            "boot:1:10",
+            1,
+            json!({"id":"boot:1:10","identity":{"pid":1,"start_ns":10,"boot_id":"boot"},"superseded_by":"boot:1:11"}),
+        );
+        document(
+            &conn,
+            "processes",
+            "boot:1:11",
+            2,
+            json!({"id":"boot:1:11","identity":{"pid":1,"start_ns":11,"boot_id":"boot"}}),
+        );
+        document(
+            &conn,
+            "processes",
+            "boot:2:20",
+            3,
+            json!({"id":"boot:2:20","identity":{"pid":2,"start_ns":20,"boot_id":"boot"},"parent":{"pid":1,"start_ns":10,"boot_id":"boot"}}),
+        );
+        let rows = client.process_documents("boot:1:11", true, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().find(|p| p["id"] == "boot:2:20").unwrap()["parent"]["start_ns"],
+            11
+        );
+    }
+    #[test]
+    fn documents_are_written_in_batches() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let dropped = AtomicU64::new(0);
+        let mut documents: Vec<_> = (0..200)
+            .map(|i| {
+                (
+                    "test".to_string(),
+                    format!("key-{i}"),
+                    i,
+                    json!({"id": i}).to_string(),
+                )
+            })
+            .collect();
+        flush_documents(&mut conn, &mut documents, &dropped).unwrap();
+        assert!(documents.is_empty());
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM documents"), 200);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn restarted_observer_does_not_claim_old_flows_are_still_connected() {
+        let (dir, conn, _) = fixture();
+        document(
+            &conn,
+            "flows",
+            "old",
+            1,
+            json!({"id":"old","state":"established","closed_ms":null,"sent":9}),
+        );
+        drop(conn);
+        let store = Store::open(&dir.path().join("history.db")).unwrap();
+        let flow = &store.client().documents("flows", 10).unwrap()[0];
+        assert_eq!(flow["state"], "observation_ended");
+        assert_eq!(flow["last_known_state"], "established");
+        assert!(flow["closed_ms"].is_null());
+        assert_eq!(flow["sent"], 9);
         store.shutdown();
     }
 }

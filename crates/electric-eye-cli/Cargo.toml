@@ -11,3 +11,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
+electric-eye-core = { path = "../electric-eye-core" }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29.0"
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

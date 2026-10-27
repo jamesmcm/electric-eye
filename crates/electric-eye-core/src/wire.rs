@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 //! Versioned kernel/userspace ABI. This file is also compiled directly by the
 //! no_std BPF crate; keep it independent of serde and operating-system crates.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 4;
 pub const PATH_LEN: usize = 512;
 pub const EXEC: u32 = 0;
 pub const EXIT: u32 = 1;
@@ -16,6 +16,21 @@ pub const UNLINK: u32 = 9;
 pub const RENAME: u32 = 10;
 pub const SENT: u32 = 11;
 pub const RECEIVED: u32 = 12;
+pub const FORK: u32 = 13;
+pub const SOCKET: u32 = 14;
+pub const BIND: u32 = 15;
+pub const NET_RESULT: u32 = 16;
+pub const NET_STATE: u32 = 17;
+pub const NET_CLOSE: u32 = 18;
+pub const OP_SOCKET: u32 = 13;
+pub const OP_BIND: u32 = 14;
+pub const OP_CONNECT: u32 = 15;
+pub const OP_SOERROR: u32 = 16;
+pub const OP_TRUNCATE: u32 = 17;
+pub const OP_FTRUNCATE: u32 = 18;
+pub const OP_CREAT: u32 = 19;
+pub const FLAG_TRUNCATE_SYSCALL: u32 = 1 << 31;
+pub const FLAG_SO_ERROR: u32 = 1;
 pub const PATH_KERNEL: u32 = 1;
 pub const PATH_LEXICAL: u32 = 2;
 pub const PATH_UNRESOLVED: u32 = 0;
@@ -40,6 +55,11 @@ pub const DROP_COUNT: u32 = 4;
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Record {
+    pub socket_id: u64,
+    pub netns: u64,
+    pub protocol: u32,
+    pub state: u32,
+    pub local_addr: [u8; 16],
     pub version: u32,
     pub kind: u32,
     pub pid: u32,
@@ -50,21 +70,38 @@ pub struct Record {
     pub ts_ns: u64,
     pub count: u64,
     pub result: i64,
+    pub exe_inode: u64,
+    pub exe_dev: u32,
+    pub parent_start_ns: u64,
+    pub euid: u32,
+    pub exec_id: u32,
+    pub exit_code: i32,
+    pub metadata_flags: u32,
     pub fd: u32,
+    pub dirfd: i32,
+    pub file_dev: u32,
     pub family: u32,
     pub local_port: u32,
     pub remote_port: u32,
     pub path_resolution: u32,
     pub path2_resolution: u32,
+    pub path_ptr: u64,
+    pub file_inode: u64,
     pub addr: [u8; 16],
     pub comm: [u8; 16],
     pub parent_comm: [u8; 16],
+    pub cgroup: [u8; 256],
     pub exe: [u8; PATH_LEN],
     pub path: [u8; PATH_LEN],
     pub path2: [u8; PATH_LEN],
 }
 impl Record {
     pub const ZERO: Self = Self {
+        socket_id: 0,
+        netns: 0,
+        protocol: 0,
+        state: 0,
+        local_addr: [0; 16],
         version: ABI_VERSION,
         kind: 0,
         pid: 0,
@@ -75,15 +112,27 @@ impl Record {
         ts_ns: 0,
         count: 0,
         result: 0,
+        exe_inode: 0,
+        exe_dev: 0,
+        parent_start_ns: 0,
+        euid: 0,
+        exec_id: 0,
+        exit_code: 0,
+        metadata_flags: 0,
         fd: 0,
+        dirfd: 0,
+        file_dev: 0,
         family: 0,
         local_port: 0,
         remote_port: 0,
         path_resolution: 0,
         path2_resolution: 0,
+        path_ptr: 0,
+        file_inode: 0,
         addr: [0; 16],
         comm: [0; 16],
         parent_comm: [0; 16],
+        cgroup: [0; 256],
         exe: [0; PATH_LEN],
         path: [0; PATH_LEN],
         path2: [0; PATH_LEN],
@@ -93,6 +142,39 @@ impl Record {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KernelOffsets {
+    pub skb_head: u32,
+    pub skb_network: u32,
+    pub skb_transport: u32,
+    pub socket_type: u32,
+    pub skc_net: u32,
+    pub net_inum: u32,
+    pub skc_rcv_saddr: u32,
+    pub skc_v6_rcv_saddr: u32,
+    pub msg_name: u32,
+    pub inode_ino: u32,
+    pub inode_sb: u32,
+    pub sb_dev: u32,
+    pub task_pid: u32,
+    pub task_thread_pid: u32,
+    pub pid_level: u32,
+    pub pid_numbers: u32,
+    pub upid_ns: u32,
+    pub upid_nr: u32,
+    pub pid_ns_inum: u32,
+    pub task_cred: u32,
+    pub cred_uid: u32,
+    pub cred_euid: u32,
+    pub task_exec_id: u32,
+    pub task_exit_code: u32,
+    pub task_signal: u32,
+    pub signal_live: u32,
+    pub mm_arg_start: u32,
+    pub mm_arg_end: u32,
+    pub task_cgroups: u32,
+    pub css_dfl_cgrp: u32,
+    pub cgroup_kn: u32,
+    pub kn_parent: u32,
+    pub kn_name: u32,
     pub task_comm: u32,
     pub task_group_leader: u32,
     pub task_start_boottime: u32,
@@ -128,6 +210,7 @@ pub struct KernelOffsets {
     pub socket_sk: u32,
     pub sock_common: u32,
     pub skc_family: u32,
+    pub skc_state: u32,
     pub skc_num: u32,
     pub skc_dport: u32,
     pub skc_daddr: u32,
@@ -138,6 +221,7 @@ pub struct KernelOffsets {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SockOffsets {
+    pub skaddr: u32,
     pub newstate: u32,
     pub sport: u32,
     pub dport: u32,

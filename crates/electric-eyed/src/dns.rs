@@ -4,10 +4,11 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use electric_eye_core::event::{AF_INET, AF_INET6};
 
-const MAX_PENDING: usize = 256;
-
 pub struct DnsCache {
-    cache: HashMap<IpAddr, String>,
+    hosts: HashMap<IpAddr, String>,
+    cache: crate::cache::Recent<Option<String>>,
+    max_pending: usize,
+    ttl_ms: u64,
     pending: HashSet<IpAddr>,
     tx: Sender<(IpAddr, Option<String>)>,
     rx: Receiver<(IpAddr, Option<String>)>,
@@ -15,13 +16,19 @@ pub struct DnsCache {
 
 impl DnsCache {
     pub fn new() -> Self {
+        Self::with_limits(&crate::config::Limits::default())
+    }
+    pub fn with_limits(limits: &crate::config::Limits) -> Self {
         let mut cache = HashMap::new();
         if let Ok(text) = std::fs::read_to_string("/etc/hosts") {
             parse_hosts(&text, &mut cache);
         }
         let (tx, rx) = channel();
         Self {
-            cache,
+            hosts: cache,
+            cache: crate::cache::Recent::new(limits.dns_entries),
+            max_pending: limits.dns_pending,
+            ttl_ms: limits.dns_ttl_ms,
             pending: HashSet::new(),
             tx,
             rx,
@@ -29,22 +36,26 @@ impl DnsCache {
     }
 
     pub fn poll(&mut self) {
+        self.cache
+            .expire_before(crate::api::now_ms().saturating_sub(self.ttl_ms));
         while let Ok((ip, name)) = self.rx.try_recv() {
             self.pending.remove(&ip);
-            if let Some(name) = name {
-                self.cache.insert(ip, name);
-            }
+            self.cache
+                .insert(ip.to_string(), crate::api::now_ms(), name);
         }
     }
 
     pub fn lookup(&mut self, ip: IpAddr) -> Option<String> {
-        if let Some(name) = self.cache.get(&ip) {
+        if let Some(name) = self.hosts.get(&ip) {
             return Some(name.clone());
+        }
+        if let Some(name) = self.cache.get(&ip.to_string()) {
+            return name.clone();
         }
         if ip.is_unspecified() {
             return None;
         }
-        if self.pending.len() < MAX_PENDING && self.pending.insert(ip) {
+        if self.pending.len() < self.max_pending && self.pending.insert(ip) {
             let tx = self.tx.clone();
             std::thread::spawn(move || {
                 let name = dns_lookup::lookup_addr(&ip)
