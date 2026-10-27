@@ -399,6 +399,14 @@ mod tests {
             make(FileKind::Write, Some(2048), Some(3)).to_string(),
             "WRITE     test -> /tmp/x (3 writes, 2.0 KiB)"
         );
+        assert_eq!(
+            make(FileKind::Mmap, Some(4096), Some(1)).to_string(),
+            "MMAP      test -> /tmp/x (4.0 KiB)"
+        );
+        assert_eq!(
+            make(FileKind::Read, None, None).to_string(),
+            "READ      test -> /tmp/x"
+        );
     }
 
     #[test]
