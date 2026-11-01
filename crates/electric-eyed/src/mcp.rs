@@ -116,11 +116,13 @@ impl ToolProfile {
 
 const INSTRUCTIONS: &str = "Electric Eye is a read-only Linux activity monitor. \
 Call status first to check capture health, then incidents and activity for recent \
-observations. Use process, tree, file, app, flows, network, why, and summaries to \
-drill into evidence. Flow records include network_context (host, vopono, container \
-or namespace), role, direction and exposure; roles are heuristics and payloads are \
-not inspected. Paths and process identities can have uncertainty labels; prefer \
---json-equivalent structured results and do not claim events that were not observed.";
+observations. The default profile exposes status, activity, apps, flows, incidents, \
+focus and investigate; when the full profile is enabled, process, tree, file, app, \
+network, why, summaries and noise are also available. Flow records include \
+network_context (host, vopono, container or namespace), role, direction and \
+exposure; roles are heuristics and payloads are not inspected. Paths and process \
+identities can have uncertainty labels; prefer --json-equivalent structured \
+results and do not claim events that were not observed.";
 
 pub fn bind_socket(path: &Path) -> io::Result<api::SocketGuard> {
     api::bind_socket(path)
@@ -724,6 +726,12 @@ mod tests {
         assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(response["result"]["serverInfo"]["name"], SERVER_NAME);
         assert!(response["result"]["capabilities"]["tools"].is_object());
+        assert!(
+            response["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("default profile")
+        );
     }
 
     #[test]
