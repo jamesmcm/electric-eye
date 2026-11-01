@@ -12,6 +12,9 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/jamesmcm/electric-eye"
+homepage = "https://github.com/jamesmcm/electric-eye"
+publish = ["crates-io"]
 
 [workspace.dependencies]
 anyhow = "1"

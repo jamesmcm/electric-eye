@@ -68,6 +68,18 @@ sudo usermod -aG electric-eye "$USER"
 See [Operations](docs/OPERATIONS.md) for build dependencies, daemon flags,
 hardening scores and package details.
 
+## Install with Cargo
+
+```bash
+cargo install --locked electric-eye-cli
+```
+
+This installs the `electric-eye` client, TUI, and MCP bridge. It connects to an
+existing daemon; the Arch package above supplies the complete service and BPF
+object. `cargo install --locked electric-eyed` installs the userspace daemon
+only, and requires a separately built matching BPF object and the runtime setup
+in [Operations](docs/OPERATIONS.md).
+
 ## Quick start
 
 ```bash

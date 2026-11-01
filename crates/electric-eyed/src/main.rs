@@ -24,7 +24,6 @@ mod provenance;
 mod rules;
 mod store;
 mod vopono;
-#[path = "../../electric-eye-core/src/wire.rs"]
 mod wire;
 
 use std::collections::HashMap;

@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn shipped_toml_lists_every_default_setting() {
-        let source = include_str!("../../../config/default.toml");
+        let source = include_str!("../config/default.toml");
         let shipped: toml::Value = toml::from_str(source).unwrap();
         let generated: toml::Value =
             toml::from_str(&toml::to_string_pretty(&Config::default()).unwrap()).unwrap();

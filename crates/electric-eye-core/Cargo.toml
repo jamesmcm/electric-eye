@@ -3,6 +3,11 @@ name = "electric-eye-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+readme = "README.md"
+description = "Shared event types for Electric Eye Linux activity monitoring"
 
 [dependencies]
 serde.workspace = true

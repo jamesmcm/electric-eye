@@ -3,6 +3,11 @@ name = "electric-eye-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+readme = "README.md"
+description = "Read-only Linux activity CLI, TUI, and MCP bridge for Electric Eye"
 
 [[bin]]
 name = "electric-eye"
@@ -11,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
-electric-eye-core = { path = "../electric-eye-core" }
+electric-eye-core = { version = "0.1.0", path = "../electric-eye-core" }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 crossterm = "0.29.0"
 libc.workspace = true

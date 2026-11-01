@@ -87,6 +87,24 @@ The service uses its systemd state directory. Direct root launches default to
 select an explicit path. A persistence startup error is reported on stderr;
 live monitoring continues with persistence disabled.
 
+## Cargo packages
+
+The crates.io packages are `electric-eye-cli` (the `electric-eye` binary),
+`electric-eyed` (the userspace daemon), and the `electric-eye-core` and
+`electric-eye-nix` support libraries. Install the CLI with
+`cargo install --locked electric-eye-cli`. Installing the daemon from Cargo
+does not install its BPF object, service unit, or system configuration; use the
+Arch package for a complete installation, or build the BPF object from the
+matching source and configure the runtime explicitly.
+
+Maintainers validate distributable archives with
+`cargo publish --workspace --registry crates-io --dry-run --locked`, inspect
+the generated `.crate` files below `target/package`, and publish with
+`cargo publish --workspace --registry crates-io --locked`. The build helper and
+BPF crate are not published. Package-local symlinks keep the ABI, default config,
+and license synchronized with the repository; Cargo flattens those files into
+the published archives.
+
 ## TUI and operations
 
 `electric-eye tui` is a capture-read-only terminal client with Overview,

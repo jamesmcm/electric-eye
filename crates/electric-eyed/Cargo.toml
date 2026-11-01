@@ -3,6 +3,11 @@ name = "electric-eyed"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+readme = "README.md"
+description = "eBPF-based Linux activity monitoring daemon for Electric Eye"
 
 [[bin]]
 name = "electric-eyed"
@@ -19,8 +24,8 @@ toml = "1.1"
 rusqlite.workspace = true
 dns-lookup.workspace = true
 aya = "0.14"
-electric-eye-core = { path = "../electric-eye-core" }
-electric-eye-nix = { path = "../electric-eye-nix" }
+electric-eye-core = { version = "0.1.0", path = "../electric-eye-core" }
+electric-eye-nix = { version = "0.1.0", path = "../electric-eye-nix" }
 base64 = "0.23.1"
 hmac = "0.13.0"
 sha1 = "0.11.0"
