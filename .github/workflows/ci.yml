@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Arch Linux build and tests
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    timeout-minutes: 45
+    steps:
+      - name: Bootstrap git for checkout
+        run: pacman -Syu --noconfirm --needed git
+
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          pacman -S --noconfirm --needed \
+            base-devel \
+            rustup \
+            clang \
+            llvm \
+            lld \
+            bpf-linker \
+            pkgconf \
+            systemd \
+            sqlite \
+            pacman \
+            git
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustup toolchain install nightly-2026-01-20 --profile minimal --component rust-src
+
+      - name: Build the eBPF object
+        run: cargo xtask build-ebpf
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Release build
+        run: |
+          cargo build --release --locked -p electric-eyed -p electric-eye-cli
+          source scripts/arch-toolchain.sh
+          verify_arch_binaries target/release/electric-eyed target/release/electric-eye
+
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: electric-eye-arch-x86_64
+          if-no-files-found: error
+          path: |
+            target/release/electric-eye
+            target/release/electric-eyed
+            target/bpfel-unknown-none/release/electric-eye-ebpf

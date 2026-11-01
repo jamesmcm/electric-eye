@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn rejects_non_store_paths() {
         assert!(provenance("/usr/bin/firefox").is_none());
-        assert!(provenance("/home/archie/.cargo/bin/cargo").is_none());
+        assert!(provenance("/home/user/.cargo/bin/cargo").is_none());
     }
 
     #[test]
