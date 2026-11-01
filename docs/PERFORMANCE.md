@@ -6,14 +6,13 @@ sustained system-wide throughput benchmark.
 
 ## Test environment
 
-- Arch Linux, kernel `7.2.11-zen1-1-zen`, x86_64
-- 62 GiB RAM
+- Arch Linux, x86_64, with the required BPF and tracefs support
+- A desktop with sufficient memory for the tested ring sizes
 - `electric-eye.service` running as the unprivileged `electric-eye` user
 - Event ABI v4
 - `capture.ring_bytes = 268435456` (256 MiB) for the final run
 - SQLite persistence enabled; raw retention 5 minutes, activity retention 30 days
-- Busy desktop at the time: Firefox/WebExtensions, Plex, Transmission,
-  FreeOrion, OpenCode, Python/Steam workloads, and build/test activity
+- Concurrent interactive, network, and build workloads
 
 The host was deliberately not quiesced. Results therefore show burst behavior
 under real background load, not a clean-room maximum.
@@ -141,7 +140,7 @@ not classify, and it preserves the same rename rule.
 
 The ring is allocated as BPF map memory. A 256 MiB ring increased service
 memory substantially (roughly 0.5–0.7 GiB resident including caches in this
-run), which is acceptable on a 62 GiB host but should be an explicit choice on
+run), which may be acceptable on a high-memory host but should be an explicit choice on
 smaller machines.
 
 ### 4. The next bottleneck: storage

@@ -10,8 +10,9 @@
 
 use crate::process::ProcessRecord;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Serialize)]
@@ -111,10 +112,15 @@ struct VoponoEnv {
     published_ports: Vec<u16>,
 }
 
+type ContextRequest = (u64, Option<ProcessRecord>);
+type ContextResult = (u64, NetworkContext);
+
 pub struct Resolver {
     cache: HashMap<u64, (Instant, NetworkContext)>,
     ttl: Duration,
     host_inode: u64,
+    worker: Option<(SyncSender<ContextRequest>, Receiver<ContextResult>)>,
+    pending: HashSet<u64>,
 }
 
 impl Default for Resolver {
@@ -133,6 +139,8 @@ impl Resolver {
             cache: HashMap::new(),
             ttl,
             host_inode,
+            worker: None,
+            pending: HashSet::new(),
         }
     }
 
@@ -142,6 +150,12 @@ impl Resolver {
         }
         if inode == self.host_inode {
             return NetworkContext::host(inode);
+        }
+        if let Some((_, rx)) = &self.worker {
+            while let Ok((loaded, context)) = rx.try_recv() {
+                self.pending.remove(&loaded);
+                self.cache.insert(loaded, (Instant::now(), context));
+            }
         }
         if let Some((at, context)) = self.cache.get(&inode)
             && at.elapsed() < self.ttl
@@ -154,9 +168,37 @@ impl Resolver {
                 self.cache.clear();
             }
         }
-        let context = self.build(inode, process);
-        self.cache.insert(inode, (Instant::now(), context.clone()));
-        context
+        if self.worker.is_none() {
+            let (tx, requests) = sync_channel::<ContextRequest>(32);
+            let (results, rx) = sync_channel(32);
+            let ttl = self.ttl;
+            if std::thread::Builder::new()
+                .name("electric-eye-net-context".into())
+                .spawn(move || {
+                    let mut builder = Self::new(ttl);
+                    while let Ok((inode, process)) = requests.recv() {
+                        let context = builder.build(inode, process.as_ref());
+                        if results.send((inode, context)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .is_err()
+            {
+                return NetworkContext::fallback(inode);
+            }
+            self.worker = Some((tx, rx));
+        }
+        let (tx, _) = self.worker.as_ref().unwrap();
+        if self.pending.len() < 32
+            && !self.pending.contains(&inode)
+            && tx.try_send((inode, process.cloned())).is_ok()
+        {
+            self.pending.insert(inode);
+        }
+        // Runtime/user metadata is optional enrichment. Never wait on a remote
+        // filesystem or a user-controlled file while draining kernel events.
+        NetworkContext::fallback(inode)
     }
 
     fn build(&mut self, inode: u64, process: Option<&ProcessRecord>) -> NetworkContext {
@@ -171,7 +213,7 @@ impl Resolver {
         if let Some(process) = process {
             context.unit = process.system_unit.clone();
             context.cgroup = process.cgroup.clone();
-            if let Some(env) = read_vopono_env(process.identity.pid) {
+            if let Some(env) = read_vopono_env(&process.identity) {
                 apply_vopono(&mut context, env);
             }
             if process.system_unit.as_deref() == Some("vopono.service")
@@ -275,8 +317,23 @@ pub(crate) fn home_for_uid(uid: u32) -> Option<std::path::PathBuf> {
     None
 }
 
-fn read_vopono_env(pid: u32) -> Option<VoponoEnv> {
-    let bytes = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+fn read_vopono_env(identity: &crate::api::ProcessIdentity) -> Option<VoponoEnv> {
+    use std::io::Read;
+    let pid = identity.pid;
+    let ticks = (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as u64;
+    let expected = identity.start_ns / (1_000_000_000 / ticks);
+    if crate::enrich::process_stat(pid)?.start_ticks != expected {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(format!("/proc/{pid}/environ"))
+        .ok()?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 1024 * 1024 || crate::enrich::process_stat(pid)?.start_ticks != expected {
+        return None;
+    }
     if bytes.is_empty() {
         return None;
     }

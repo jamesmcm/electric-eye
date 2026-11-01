@@ -76,6 +76,8 @@ impl BaselineData {
 #[derive(Debug, Clone, Default)]
 pub struct Allowlist {
     rules: Vec<(String, String)>,
+    identities: HashMap<String, crate::provenance::FileIdentity>,
+    aliases: HashMap<String, Vec<String>>,
 }
 
 impl Allowlist {
@@ -158,20 +160,86 @@ impl Allowlist {
         }
     }
 
-    pub fn add(&mut self, comm: &str, prefix: &str) {
-        self.rules.push((comm.to_string(), prefix.to_string()));
+    fn register(&mut self, name: &str) -> Vec<String> {
+        let candidates = if Path::new(name).is_absolute() {
+            vec![PathBuf::from(name)]
+        } else {
+            vec![
+                Path::new("/usr/bin").join(name),
+                Path::new("/usr/lib").join(name),
+                Path::new("/usr/lib/ssh").join(name),
+            ]
+        };
+        let mut paths = Vec::new();
+        for path in candidates {
+            let Ok(path) = path.canonicalize() else {
+                continue;
+            };
+            if !path.ancestors().all(|ancestor| {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(ancestor)
+                    .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
+            }) {
+                continue;
+            }
+            let Ok(file) = crate::metadata::open_regular(&path, 512 * 1024 * 1024) else {
+                continue;
+            };
+            let Ok(metadata) = file.metadata() else {
+                continue;
+            };
+            let path = path.to_string_lossy().into_owned();
+            self.identities.insert(
+                path.clone(),
+                crate::provenance::FileIdentity::from_metadata(&metadata),
+            );
+            paths.push(path);
+        }
+        self.aliases.insert(name.to_string(), paths.clone());
+        paths
     }
-
+    pub fn add(&mut self, application: &str, prefix: &str) {
+        for path in self.register(application) {
+            self.rules.push((path, prefix.to_string()));
+        }
+    }
+    fn executable<'a>(&self, entry: &'a ActivityEntry) -> Option<&'a str> {
+        let path = entry.exe.as_deref()?;
+        let observed = entry.executable_identity?;
+        (self.identities.get(path) == Some(&observed)).then_some(path)
+    }
+    fn matches_application(&self, application: &str, entry: &ActivityEntry) -> bool {
+        let Some(path) = self.executable(entry) else {
+            return false;
+        };
+        self.aliases
+            .get(application)
+            .is_some_and(|paths| paths.iter().any(|candidate| candidate == path))
+    }
     #[cfg(test)]
-    pub fn allows(&self, comm: &str, subject: &str) -> bool {
-        self.rules.iter().any(|(allowed_comm, prefix)| {
-            allowed_comm == comm && (prefix == "*" || subject.starts_with(prefix))
-        })
+    fn trust_fixture(&mut self, path: &str) -> crate::provenance::FileIdentity {
+        let identity = crate::provenance::FileIdentity {
+            device: 1,
+            inode: 2,
+        };
+        self.identities.insert(path.into(), identity);
+        self.aliases.insert(path.into(), vec![path.into()]);
+        self.aliases.insert(
+            Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            vec![path.into()],
+        );
+        identity
     }
-
-    pub fn allows_identity(&self, comm: &str, app: &str, subject: &str) -> bool {
+    fn allows_entry(&self, entry: &ActivityEntry, subject: &str) -> bool {
+        let Some(path) = self.executable(entry) else {
+            return false;
+        };
         self.rules.iter().any(|(allowed, prefix)| {
-            (allowed == comm || allowed == app) && (prefix == "*" || subject.starts_with(prefix))
+            allowed == path && (prefix == "*" || Path::new(subject).starts_with(prefix))
         })
     }
 }
@@ -200,6 +268,7 @@ pub struct AnomalyEngine {
     sensitive: crate::cache::Recent<VecDeque<(u64, String)>>,
     mutations: crate::cache::Recent<VecDeque<(u64, String)>>,
     trusted_ssh: crate::cache::Recent<Vec<String>>,
+    known_hosts: crate::known_hosts::Cache,
     dedup: crate::cache::Recent<u64>,
     baseline: BaselineData,
     allowlist: Allowlist,
@@ -221,7 +290,7 @@ impl AnomalyEngine {
     }
     pub fn configured(
         mut baseline: BaselineData,
-        allowlist: Allowlist,
+        mut allowlist: Allowlist,
         config: crate::config::RuleConfig,
     ) -> Self {
         baseline.paths = baseline
@@ -238,11 +307,35 @@ impl AnomalyEngine {
         for (app, _) in &baseline.network {
             *baseline.network_counts.entry(app.clone()).or_default() += 1;
         }
+        for application in config
+            .high_churn_apps
+            .iter()
+            .map(String::as_str)
+            .chain(
+                config
+                    .network_allowlist
+                    .iter()
+                    .map(|rule| rule.application.as_str()),
+            )
+            .chain([
+                "ssh",
+                "/usr/lib/firefox/firefox",
+                "/usr/lib/chromium/chromium",
+                "/opt/google/chrome/chrome",
+                "/opt/brave.com/brave/brave",
+            ])
+            .chain(config.browser_prefixes.iter().map(String::as_str))
+        {
+            if application != "*" {
+                allowlist.register(application);
+            }
+        }
         Self {
             homes: crate::cache::Recent::new(config.max_actors),
             sensitive: crate::cache::Recent::new(config.max_actors),
             mutations: crate::cache::Recent::new(config.max_actors),
             trusted_ssh: crate::cache::Recent::new(config.max_actors),
+            known_hosts: crate::known_hosts::Cache::default(),
             dedup: crate::cache::Recent::new(config.max_dedup_entries),
             baseline,
             allowlist,
@@ -292,28 +385,17 @@ impl AnomalyEngine {
             self.sensitive.remove(&actor);
             self.mutations.remove(&actor);
         }
-        if let ObservedEvent::Exec(event) = &entry.event
-            && event.comm == "ssh"
+        if let ObservedEvent::Exec(_) = &entry.event
+            && self.allowlist.matches_application("ssh", entry)
             && let Some(info) = &entry.process_info
         {
             let mut hosts: Vec<String> = Vec::new();
-            if entry
-                .parent
-                .as_deref()
-                .is_some_and(|parent| parent == "git" || parent.starts_with("git-remote"))
-            {
-                hosts.extend(
-                    info.argv
-                        .iter()
-                        .filter_map(|arg| allowed_trusted_ssh_host(arg)),
-                );
-            }
             if self.config.known_hosts_allow
                 && let Some((host, port)) = crate::known_hosts::destination(&info.argv)
             {
                 let (_, uid, _) = event_identity(&entry.event);
                 let home = self.home_for(uid);
-                if crate::known_hosts::KnownHosts::load(home.as_deref()).is_known(&host, port) {
+                if self.known_hosts.is_known(home.as_deref(), &host, port) {
                     hosts.push(host);
                 }
             }
@@ -380,7 +462,9 @@ impl AnomalyEngine {
         let (pid, uid, comm) = event_identity(&entry.event);
         let app = app_key(entry);
         let actor = timeline_key(entry);
-        if comm == "ssh" && self.trusted_ssh.get(&actor).is_some() {
+        if self.allowlist.matches_application("ssh", entry)
+            && self.trusted_ssh.get(&actor).is_some()
+        {
             return;
         }
         let home = self.home_for(uid);
@@ -400,7 +484,7 @@ impl AnomalyEngine {
             );
 
         for path in &paths {
-            if self.allowlist.allows_identity(&comm, &app, path) {
+            if self.allowlist.allows_entry(entry, path) {
                 continue;
             }
             let known = self.baseline.knows_path(&app, path);
@@ -420,7 +504,12 @@ impl AnomalyEngine {
                 if directory_listing && path_is_directory(path) {
                     continue;
                 }
-                if category == "Browser credentials" && is_browser_app(&app, &self.config) {
+                if category == "Browser credentials"
+                    && self
+                        .allowlist
+                        .executable(entry)
+                        .is_some_and(|path| is_browser_app(path, &self.config))
+                {
                     continue;
                 }
                 categories.push(category.clone());
@@ -510,7 +599,12 @@ impl AnomalyEngine {
         let (pid, _, comm) = event_identity(&entry.event);
         let now = entry.ts_ms;
         let unit = entry.unit.as_deref();
-        if !self.config.bulk_mutation || is_high_churn_app(app, &self.config) {
+        if !self.config.bulk_mutation
+            || self
+                .allowlist
+                .executable(entry)
+                .is_some_and(|path| is_high_churn_app(path, &self.config))
+        {
             return;
         }
         let (unique_count, files, files_truncated, scope, severity) = {
@@ -566,7 +660,7 @@ impl AnomalyEngine {
             return;
         };
         let exe = event.exe.display().to_string();
-        if self.allowlist.allows_identity(&event.comm, &exe, &exe) {
+        if self.allowlist.allows_entry(entry, &exe) {
             return;
         }
         let Some(reason) =
@@ -600,18 +694,14 @@ impl AnomalyEngine {
 
     fn network_allowed(
         &self,
-        comm: &str,
-        app: &str,
+        entry: &ActivityEntry,
         net: &NetEvent,
         direction: crate::config::NetworkDirection,
     ) -> bool {
-        let basename = app.rsplit('/').next().unwrap_or(app);
         self.network_allowlist.iter().any(|rule| {
             (rule.direction == crate::config::NetworkDirection::Both || rule.direction == direction)
                 && (rule.application == "*"
-                    || rule.application.eq_ignore_ascii_case(comm)
-                    || rule.application.eq_ignore_ascii_case(app)
-                    || rule.application.eq_ignore_ascii_case(basename))
+                    || self.allowlist.matches_application(&rule.application, entry))
                 && destination_matches(&rule.destination, net)
         })
     }
@@ -626,7 +716,10 @@ impl AnomalyEngine {
         if !self.config.incoming_connections
             || net.local_port == 0
             || net.addr == [0; 16]
-            || is_high_churn_app(app, &self.config)
+            || self
+                .allowlist
+                .executable(entry)
+                .is_some_and(|path| is_high_churn_app(path, &self.config))
         {
             return;
         }
@@ -695,11 +788,11 @@ impl AnomalyEngine {
             _ => return,
         };
         let actor = timeline_key(entry);
-        if net.comm == "ssh"
+        if self.allowlist.matches_application("ssh", entry)
             && self.trusted_ssh.get(&actor).is_some_and(|hosts| {
                 net.hostname.as_deref().is_some_and(|hostname| {
                     let hostname = hostname.to_ascii_lowercase();
-                    hosts.iter().any(|host| hostname.contains(host))
+                    hosts.contains(&hostname)
                 })
             })
         {
@@ -712,18 +805,14 @@ impl AnomalyEngine {
         } else {
             crate::config::NetworkDirection::Outbound
         };
-        if self.network_allowed(&net.comm, &app, net, direction) {
+        if self.network_allowed(entry, net, direction) {
             return;
         }
         if matches!(&entry.event, ObservedEvent::Accept(_)) {
             self.observe_incoming(entry, net, &app, incidents);
             return;
         }
-        if self
-            .allowlist
-            .allows_identity(&net.comm, &app, &destination)
-            || !is_public_destination(net)
-        {
+        if self.allowlist.allows_entry(entry, &destination) || !is_public_destination(net) {
             return;
         }
         let is_connect = matches!(&entry.event, ObservedEvent::Connect(_));
@@ -779,7 +868,12 @@ impl AnomalyEngine {
         destination: &str,
         incidents: &mut Vec<Incident>,
     ) {
-        if !self.config.novel_network || is_high_churn_app(app, &self.config) {
+        if !self.config.novel_network
+            || self
+                .allowlist
+                .executable(entry)
+                .is_some_and(|path| is_high_churn_app(path, &self.config))
+        {
             return;
         }
         let known = self.baseline.knows_network(app, destination);
@@ -877,24 +971,11 @@ fn app_key(entry: &ActivityEntry) -> String {
         .unwrap_or_else(|| event_identity(&entry.event).2)
 }
 
-fn allowed_trusted_ssh_host(argument: &str) -> Option<String> {
-    let argument = argument.to_ascii_lowercase();
-    [
-        "ssh.github.com",
-        "github.com",
-        "altssh.gitlab.com",
-        "gitlab.com",
-    ]
-    .iter()
-    .find(|host| argument.contains(**host))
-    .map(|host| (*host).to_string())
-}
-
 pub(crate) fn is_browser_app(app: &str, config: &crate::config::RuleConfig) -> bool {
     config
         .browser_prefixes
         .iter()
-        .any(|prefix| app.starts_with(prefix))
+        .any(|prefix| Path::new(app).starts_with(prefix))
         || app.starts_with("/nix/store/")
             && config
                 .browser_nix_names
@@ -968,8 +1049,9 @@ fn common_parent(paths: &[std::path::PathBuf]) -> std::path::PathBuf {
 pub(crate) fn is_high_churn_app(app: &str, config: &crate::config::RuleConfig) -> bool {
     is_browser_app(app, config)
         || config.high_churn_apps.iter().any(|name| {
-            app.to_ascii_lowercase()
-                .contains(&name.to_ascii_lowercase())
+            let executable = app.rsplit('/').next().unwrap_or(app).to_ascii_lowercase();
+            let name = name.to_ascii_lowercase();
+            executable == name || executable.starts_with(&format!("{name}-"))
         })
 }
 fn push_bounded<T>(window: &mut VecDeque<T>, value: T, limit: usize) {
@@ -1036,21 +1118,26 @@ fn classify_with_home(path: &str, home: Option<&Path>) -> Option<(&'static str, 
         return None;
     }
     let path = Path::new(path);
+    let cross_home = path
+        .strip_prefix("/home")
+        .ok()
+        .and_then(|rest| {
+            let mut components = rest.components();
+            components.next()?;
+            Some(components.as_path())
+        })
+        .or_else(|| path.strip_prefix("/root").ok());
     let home_relative = |relative: &str| {
         home.is_some_and(|home| path.starts_with(home.join(relative)))
-            // Cross-user home paths are still meaningful, but arbitrary
-            // temporary directories containing `.aws`/`.ssh` components are
-            // not credential stores.
-            || ((path.starts_with("/home/") || path.starts_with("/root/"))
-                && path.to_string_lossy().contains(&format!("/{relative}/")))
+            || cross_home.is_some_and(|rest| rest.starts_with(relative))
     };
 
     if path.starts_with("/nix/store") {
         return Some(("Nix store", Severity::High));
     }
-    if path.starts_with("/etc/shadow")
-        || path.starts_with("/etc/sudoers")
-        || path.starts_with("/etc/passwd")
+    if crate::credentials::SYSTEM
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
     {
         return Some(("System credentials", Severity::High));
     }
@@ -1085,28 +1172,13 @@ fn classify_with_home(path: &str, home: Option<&Path>) -> Option<(&'static str, 
         }
         return Some(("SSH", Severity::High));
     }
-    if home_relative(".gnupg") {
-        return Some(("GnuPG", Severity::High));
+    if let Some((_, category)) = crate::credentials::HOME
+        .iter()
+        .find(|(relative, _)| home_relative(relative))
+    {
+        return Some((category, Severity::High));
     }
-    if home_relative(".aws") {
-        return Some(("AWS credentials", Severity::High));
-    }
-    if home_relative(".azure") {
-        return Some(("Azure credentials", Severity::High));
-    }
-    if home_relative(".config/gcloud") {
-        return Some(("GCloud credentials", Severity::High));
-    }
-    if home_relative(".kube") {
-        return Some(("Kubernetes credentials", Severity::High));
-    }
-    if home_relative(".config/gh") {
-        return Some(("GitHub CLI credentials", Severity::High));
-    }
-    if home_relative(".git-credentials") || home_relative(".netrc") {
-        return Some(("Git credentials", Severity::High));
-    }
-    if home_relative(".password-store") || path.extension().is_some_and(|ext| ext == "kdbx") {
+    if path.extension().is_some_and(|ext| ext == "kdbx") {
         return Some(("Password manager", Severity::High));
     }
     if home_relative(".config/autostart") || path.ends_with("authorized_keys") {
@@ -1126,11 +1198,10 @@ fn classify_with_home(path: &str, home: Option<&Path>) -> Option<(&'static str, 
         .and_then(|name| name.to_str())
         .unwrap_or("");
     let text = path.to_string_lossy();
-    if (text.contains("/.mozilla/firefox/") || text.contains("/.config/google-chrome/"))
-        && matches!(
-            name,
-            "logins.json" | "key4.db" | "key3.db" | "cookies.sqlite" | "Login Data" | "Cookies"
-        )
+    if crate::credentials::BROWSERS
+        .iter()
+        .any(|browser| text.contains(&format!("/{browser}/")))
+        && crate::credentials::BROWSER_FILES.contains(&name)
     {
         return Some(("Browser credentials", Severity::High));
     }
@@ -1370,35 +1441,23 @@ mod tests {
     }
 
     #[test]
-    fn builtin_allowlist_covers_system_auth_reads() {
+    fn builtin_exemptions_are_bound_to_protected_executable_files() {
         let allowlist = Allowlist::load_default();
-        assert!(allowlist.allows("sudo", "/etc/shadow"));
-        assert!(allowlist.allows("unix_chkpwd", "/etc/passwd"));
-        assert!(allowlist.allows("pwck", "/etc/shadow"));
-        assert!(allowlist.allows("systemd-tmpfiles", "/etc/shadow"));
-        assert!(allowlist.allows("systemd-tmpfile", "/etc/shadow"));
-        assert!(allowlist.allows("systemd-sysuser", "/etc/passwd"));
-        assert!(!allowlist.allows("bash", "/etc/shadow"));
-        assert!(!allowlist.allows("sudo", "/home/alice/.ssh/id_rsa"));
-    }
-
-    #[test]
-    fn builtin_noise_allowlist_covers_tailscaled_and_thunar_and_can_be_disabled() {
-        let allowlist = Allowlist::load_default();
-        assert!(allowlist.allows("tailscaled", "/var/lib/tailscale/tailscaled.state"));
-        assert!(allowlist.allows("thunar", "/home/alice/.ssh"));
-        assert!(allowlist.allows("git", "/home/alice/.ssh/id_ed25519"));
-        assert!(allowlist.allows("cargo", "/home/alice/.cargo/credentials"));
-        assert!(!allowlist.allows("ssh", "/home/alice/.ssh/config"));
-        let config = crate::config::RuleConfig {
+        for (path, prefix) in &allowlist.rules {
+            assert!(Path::new(path).is_absolute());
+            assert!(allowlist.identities.contains_key(path));
+            let identity =
+                crate::provenance::FileIdentity::from_metadata(&std::fs::metadata(path).unwrap());
+            assert_eq!(allowlist.identities[path], identity);
+            assert!(!prefix.is_empty());
+        }
+        let disabled = crate::config::RuleConfig {
+            builtin_auth_allowlist: false,
             builtin_noise_allowlist: false,
             ..Default::default()
         };
-        let allowlist = Allowlist::load(&config);
-        assert!(!allowlist.allows("tailscaled", "/var/lib/tailscale/tailscaled.state"));
-        assert!(!allowlist.allows("thunar", "/home/alice/.ssh"));
-        assert!(!allowlist.allows("git", "/home/alice/.ssh/id_ed25519"));
-        assert!(!allowlist.allows("ssh", "/home/alice/.ssh/config"));
+        let allowlist = Allowlist::load(&disabled);
+        assert!(allowlist.rules.is_empty());
     }
 
     #[test]
@@ -1424,6 +1483,7 @@ mod tests {
         let mut engine =
             AnomalyEngine::with_context(BaselineData::default(), Allowlist::load_default());
         let entry = ActivityEntry {
+            executable_identity: None,
             ts_ms: 1_000,
             syscall_result: None,
             event_id: None,
@@ -1445,6 +1505,13 @@ mod tests {
             parent: None,
             exe: None,
         };
+        let mut entry = entry;
+        entry.exe = Some("/usr/bin/sudo".into());
+        entry.executable_identity = Some(engine.allowlist.trust_fixture("/usr/bin/sudo"));
+        engine
+            .allowlist
+            .rules
+            .push(("/usr/bin/sudo".into(), "/etc/shadow".into()));
         assert!(engine.observe(&entry).is_empty());
     }
 
@@ -1453,6 +1520,7 @@ mod tests {
         let mut engine =
             AnomalyEngine::with_context(BaselineData::default(), Allowlist::load_default());
         let entry = ActivityEntry {
+            executable_identity: None,
             ts_ms: 1_000,
             syscall_result: None,
             event_id: None,
@@ -1481,6 +1549,7 @@ mod tests {
     fn browser_credential_writes_are_not_incidents() {
         let mut engine = AnomalyEngine::new();
         let entry = ActivityEntry {
+            executable_identity: None,
             ts_ms: 1_000,
             syscall_result: None,
             event_id: None,
@@ -1502,6 +1571,9 @@ mod tests {
             parent: None,
             exe: Some("/usr/lib/firefox/firefox".into()),
         };
+        let mut entry = entry;
+        entry.executable_identity =
+            Some(engine.allowlist.trust_fixture("/usr/lib/firefox/firefox"));
         assert!(engine.observe(&entry).is_empty());
     }
 
@@ -1545,6 +1617,7 @@ mod correlation_regressions {
             count: Some(1),
         };
         ActivityEntry {
+            executable_identity: None,
             ts_ms: 1_000_000,
             syscall_result: None,
             event_id: None,
@@ -1749,6 +1822,7 @@ mod review_regressions {
     use electric_eye_core::ExecEvent;
     fn write(pid: u32, ts_ms: u64, path: &str) -> ActivityEntry {
         ActivityEntry {
+            executable_identity: None,
             ts_ms,
             event_id: None,
             syscall_result: Some(1),
@@ -1891,6 +1965,11 @@ subject_prefix = "/work/private"
         );
         let mut e = write(2, 1001, "/work/private/allowed");
         e.exe = Some("/opt/allowed".into());
+        e.executable_identity = Some(engine.allowlist.trust_fixture("/opt/allowed"));
+        engine
+            .allowlist
+            .rules
+            .push(("/opt/allowed".into(), "/work/private".into()));
         assert!(engine.observe(&e).is_empty());
         assert!(
             engine
@@ -1958,6 +2037,10 @@ subject_prefix = "/work/private"
         entry.path_resolution = None;
         entry.parent = Some("git".into());
         entry.exe = Some("/usr/bin/ssh".into());
+        entry.executable_identity = Some(crate::provenance::FileIdentity {
+            device: 1,
+            inode: 2,
+        });
         entry.process_info = Some(crate::process::ProcessRecord::synthetic(
             identity(pid),
             1_000_000,
@@ -1992,6 +2075,10 @@ subject_prefix = "/work/private"
     fn ssh_read(pid: u32) -> ActivityEntry {
         let mut entry = read(pid, "/home/alice/.ssh/id_ed25519");
         entry.exe = Some("/usr/bin/ssh".into());
+        entry.executable_identity = Some(crate::provenance::FileIdentity {
+            device: 1,
+            inode: 2,
+        });
         entry.parent = Some("git".into());
         if let ObservedEvent::FileRead(event) = &mut entry.event {
             event.comm = "ssh".into();
@@ -2000,51 +2087,14 @@ subject_prefix = "/work/private"
     }
 
     #[test]
-    fn trusted_ssh_to_github_is_a_scoped_exception() {
-        let mut engine = AnomalyEngine::configured(
-            BaselineData::default(),
-            Allowlist::default(),
-            crate::config::RuleConfig::default(),
-        );
+    fn parent_process_name_does_not_grant_ssh_trust() {
+        let mut engine = AnomalyEngine::new();
+        engine.observe(&trusted_ssh_exec(10, "github.com"));
         assert!(
             engine
-                .observe(&trusted_ssh_exec(10, "github.com"))
-                .is_empty()
-        );
-        assert!(
-            engine.observe(&ssh_read(10)).is_empty(),
-            "git SSH read produced a credential incident"
-        );
-
-        let mut plain = AnomalyEngine::configured(
-            BaselineData::default(),
-            Allowlist::default(),
-            crate::config::RuleConfig::default(),
-        );
-        assert!(
-            plain
-                .observe(&ssh_read(20))
+                .observe(&ssh_read(10))
                 .iter()
-                .any(|incident| incident.title.contains("SSH")),
-            "untrusted SSH read was suppressed"
-        );
-
-        let mut other = AnomalyEngine::configured(
-            BaselineData::default(),
-            Allowlist::default(),
-            crate::config::RuleConfig::default(),
-        );
-        assert!(
-            other
-                .observe(&trusted_ssh_exec(30, "example.com"))
-                .is_empty()
-        );
-        assert!(
-            other
-                .observe(&ssh_read(30))
-                .iter()
-                .any(|incident| incident.title.contains("SSH")),
-            "git SSH to a non-approved host was suppressed"
+                .any(|incident| incident.title.contains("SSH"))
         );
     }
 
@@ -2066,6 +2116,15 @@ subject_prefix = "/work/private"
         engine
             .homes
             .insert("1000".into(), 1_000_000, Some(temp.path().to_path_buf()));
+        engine.allowlist.trust_fixture("/usr/bin/ssh");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !engine
+            .known_hosts
+            .is_known(Some(temp.path()), "github.com", 22)
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let mut exec = known_host_ssh_exec(40, "github.com");
         exec.process_info.as_mut().unwrap().argv = vec!["ssh".into(), "git@github.com".into()];
         assert!(engine.observe(&exec).is_empty());
@@ -2086,6 +2145,59 @@ subject_prefix = "/work/private"
                 .any(|incident| incident.title.contains("SSH")),
             "unknown SSH host was suppressed"
         );
+    }
+
+    #[test]
+    fn spoofed_names_paths_and_inodes_do_not_grant_exemptions() {
+        for comm in ["git", "cargo", "tailscaled", "sudo", "ssh", "firefox"] {
+            let mut engine =
+                AnomalyEngine::with_context(BaselineData::default(), Allowlist::load_default());
+            let mut entry = read(70, "/etc/gshadow");
+            entry.exe = Some("/tmp/payload".into());
+            if let ObservedEvent::FileRead(event) = &mut entry.event {
+                event.comm = comm.into();
+            }
+            assert!(!engine.observe(&entry).is_empty(), "spoofed {comm}");
+        }
+        for observed in [
+            None,
+            Some(crate::provenance::FileIdentity {
+                device: 1,
+                inode: 99,
+            }),
+        ] {
+            let mut engine = AnomalyEngine::new();
+            engine.allowlist.trust_fixture("/usr/bin/git");
+            engine
+                .allowlist
+                .rules
+                .push(("/usr/bin/git".into(), "*".into()));
+            let mut entry = read(71, "/etc/shadow");
+            entry.exe = Some("/usr/bin/git".into());
+            entry.executable_identity = observed;
+            assert!(!engine.observe(&entry).is_empty());
+        }
+    }
+
+    #[test]
+    fn all_supported_credential_families_feed_sensitive_detection() {
+        for path in [
+            "/etc/gshadow",
+            "/etc/sudoers.d/fixture",
+            "/home/review/.config/chromium/Default/Login Data",
+            "/home/review/.config/BraveSoftware/Brave-Browser/Default/Login Data",
+            "/home/review/.local/share/keyrings/login.keyring",
+            "/home/review/.git-credentials",
+        ] {
+            let mut engine = AnomalyEngine::new();
+            let incidents = engine.observe(&read(72, path));
+            assert!(
+                incidents
+                    .iter()
+                    .any(|incident| incident.details["rule"] == "sensitive_path"),
+                "{path}"
+            );
+        }
     }
 
     fn incoming_ssh(pid: u32, source: [u8; 4]) -> ActivityEntry {
@@ -2158,6 +2270,8 @@ subject_prefix = "/work/private"
 
         let mut high_churn = incoming_ssh(4, [203, 0, 113, 10]);
         high_churn.exe = Some("/usr/bin/transmission-gtk".into());
+        high_churn.executable_identity =
+            Some(engine.allowlist.trust_fixture("/usr/bin/transmission-gtk"));
         assert!(
             engine.observe(&high_churn).is_empty(),
             "high-churn peer traffic produced incoming incidents"
@@ -2173,11 +2287,9 @@ subject_prefix = "/work/private"
         };
         let mut allowed =
             AnomalyEngine::configured(BaselineData::default(), Allowlist::default(), rules);
-        assert!(
-            allowed
-                .observe(&incoming_ssh(2, [203, 0, 113, 9]))
-                .is_empty()
-        );
+        let mut incoming = incoming_ssh(2, [203, 0, 113, 9]);
+        incoming.executable_identity = Some(allowed.allowlist.trust_fixture("/usr/sbin/sshd"));
+        assert!(allowed.observe(&incoming).is_empty());
         assert!(
             !allowed
                 .observe(&incoming_ssh(3, [198, 51, 100, 7]))

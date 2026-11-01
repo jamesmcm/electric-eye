@@ -96,7 +96,10 @@ Read-only query socket.
 Read-only MCP socket.
 .TP
 .I /var/lib/electric-eye/electric-eye.db
-SQLite history.
+SQLite history. Database and WAL/SHM files are private (0600), including direct
+launches. Unsafe existing files are refused without changing them. Non-root
+standalone launches default to $XDG_STATE_HOME/electric-eye/electric-eye.db or
+~/.local/state/electric-eye/electric-eye.db.
 .TP
 .I /etc/electric-eye/config.toml
 System configuration.

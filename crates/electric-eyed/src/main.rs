@@ -5,6 +5,7 @@ mod collector;
 mod config;
 mod container;
 mod correlation;
+mod credentials;
 mod dns;
 mod enrich;
 mod flows;
@@ -14,6 +15,7 @@ mod investigate;
 mod journald;
 mod known_hosts;
 mod mcp;
+mod metadata;
 mod net_context;
 mod noise;
 mod probe;
@@ -222,10 +224,19 @@ fn database_path(override_path: Option<&Path>, disabled: bool) -> Option<PathBuf
         }
     }
     let system_state = Path::new("/var/lib/electric-eye");
-    if system_state.is_dir() {
+    if std::fs::metadata(system_state).is_ok_and(|metadata| {
+        use std::os::unix::fs::MetadataExt;
+        metadata.uid() == unsafe { libc::geteuid() }
+    }) {
         return Some(system_state.join("electric-eye.db"));
     }
-    Some(PathBuf::from("electric-eye.db"))
+    if unsafe { libc::geteuid() } == 0 {
+        return Some(system_state.join("electric-eye.db"));
+    }
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .map(|root| root.join("electric-eye/electric-eye.db"))
 }
 
 fn classify_open(flags: u32) -> FileKind {
@@ -323,6 +334,7 @@ impl Session {
             .and_then(|path| self.registry.identify(Path::new(path)).ok().flatten())
             .map(|p| p.to_string());
         ActivityEntry {
+            executable_identity: provenance::FileIdentity::from_record(raw),
             ts_ms: self.boot_wall_ms.saturating_add(raw.ts_ns / 1_000_000),
             event_id: Some({
                 static SEQUENCE: std::sync::atomic::AtomicU64 =
@@ -423,7 +435,16 @@ impl Session {
         let package_trust = actor
             .and_then(|actor| actor.executable.as_deref())
             .or(incident.exe.as_deref())
-            .and_then(|exe| self.provenance.as_ref().map(|provider| provider.trust(exe)));
+            .and_then(|exe| {
+                self.provenance.as_ref().map(|provider| {
+                    provider.trust_observed(
+                        exe,
+                        actor
+                            .and_then(|actor| actor.package.as_ref())
+                            .and_then(|package| package.identity()),
+                    )
+                })
+            });
         if let Some(actor) = actor
             && let Some(details) = incident.details.as_object_mut()
         {
@@ -528,7 +549,10 @@ impl Session {
             .processes
             .observe(&raw, &self.boot_id, timestamp, &self.config);
         let mut p = p;
-        if (p.package.is_none() || raw.kind == wire::EXEC)
+        if (p.package.is_none()
+            || raw.kind == wire::EXEC
+            || p.package.as_ref().and_then(|package| package.identity())
+                != provenance::FileIdentity::from_record(&raw))
             && let (Some(provider), Some(exe)) = (&self.provenance, &p.executable)
         {
             p.package = Some(provider.identify_record(exe, &raw));
@@ -1681,5 +1705,44 @@ mod regression_tests {
                 enabled
             );
         }
+    }
+    #[test]
+    fn mismatched_actor_inode_does_not_receive_host_binary_trust() {
+        let path = "/usr/bin/pacman";
+        if !Path::new(path).exists() {
+            return;
+        }
+        let mut s = session(None);
+        s.provenance = Some(provenance::Provider::start());
+        let mut raw = record(wire::EXEC, 4_000_000_000, 1, "");
+        raw.exe.fill(0);
+        raw.exe[..path.len()].copy_from_slice(path.as_bytes());
+        raw.exe_inode = 1;
+        raw.exe_dev = 0;
+        let actor = s.processes.observe(&raw, &s.boot_id, 1, &s.config);
+        let package = s.provenance.as_ref().unwrap().identify_record(path, &raw);
+        assert!(package.package.is_none());
+        s.processes.set_package(&actor.identity, Some(package));
+        s.emit_incident(rules::Incident {
+            ts_ms: 1,
+            id: "fixture".into(),
+            process: Some(actor.identity),
+            exe: Some(path.into()),
+            severity: rules::Severity::High,
+            title: "fixture".into(),
+            pid: raw.pid,
+            comm: "fixture".into(),
+            path: None,
+            unit: None,
+            details: serde_json::json!({}),
+        });
+        let incidents = s.state.lock().unwrap().recent_incidents(1);
+        let trust = &incidents[0]["details"]["package_trust"];
+        assert_eq!(
+            trust["status"],
+            "file_replaced_deleted_or_other_mount_namespace"
+        );
+        assert!(trust["hash_match"].is_null());
+        assert!(trust["package"].is_null());
     }
 }

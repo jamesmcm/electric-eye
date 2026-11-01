@@ -4,7 +4,10 @@
 //! system known_hosts is a normal, user-approved connection. We use that as a
 //! default exception for SSH credential reads and network alerts.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -36,7 +39,7 @@ impl KnownHosts {
     }
 
     fn read(&mut self, path: &Path) {
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Ok(text) = crate::metadata::read_text(path, 256 * 1024) else {
             return;
         };
         for line in text.lines() {
@@ -71,6 +74,70 @@ impl KnownHosts {
             .iter()
             .any(|entry| entry_matches(entry, &host, port))
     }
+}
+
+type Home = Option<PathBuf>;
+type Loaded = (Home, KnownHosts);
+
+/// A stalled filesystem may delay enrichment, but cannot stall event capture.
+/// One worker, bounded queues and a bounded cache also cap outstanding work.
+#[derive(Default)]
+pub struct Cache {
+    worker: Option<(SyncSender<Home>, Receiver<Loaded>)>,
+    entries: Option<crate::cache::Recent<(Instant, KnownHosts)>>,
+    pending: HashSet<Home>,
+}
+
+impl Cache {
+    pub fn is_known(&mut self, home: Option<&Path>, host: &str, port: u16) -> bool {
+        if self.worker.is_none() {
+            let (tx, requests) = sync_channel::<Home>(32);
+            let (results, rx) = sync_channel(32);
+            if std::thread::Builder::new()
+                .name("electric-eye-known-hosts".into())
+                .spawn(move || {
+                    while let Ok(home) = requests.recv() {
+                        let hosts = KnownHosts::load(home.as_deref());
+                        if results.send((home, hosts)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .is_err()
+            {
+                return false;
+            }
+            self.worker = Some((tx, rx));
+            self.entries = Some(crate::cache::Recent::new(128));
+        }
+        let (tx, rx) = self.worker.as_ref().unwrap();
+        let entries = self.entries.as_mut().unwrap();
+        while let Ok((home, hosts)) = rx.try_recv() {
+            self.pending.remove(&home);
+            let key = home_key(home.as_deref());
+            entries.insert(key, crate::api::now_ms(), (Instant::now(), hosts));
+        }
+        let key = home_key(home);
+        if let Some((at, hosts)) = entries.get(&key)
+            && at.elapsed() < Duration::from_secs(60)
+        {
+            return hosts.is_known(host, port);
+        }
+        let home = home.map(Path::to_path_buf);
+        if self.pending.len() < 32
+            && !self.pending.contains(&home)
+            && tx.try_send(home.clone()).is_ok()
+        {
+            self.pending.insert(home);
+        }
+        // A cache miss fails closed: the observation remains eligible for alerts.
+        false
+    }
+}
+
+fn home_key(home: Option<&Path>) -> String {
+    home.map(|home| home.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn parse_entry(pattern: &str) -> Option<Entry> {

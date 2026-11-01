@@ -1,5 +1,7 @@
 use std::ffi::CString;
+use std::fs::{DirBuilder, OpenOptions};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -95,11 +97,8 @@ impl Store {
         Self::open_with_config(path, crate::config::Config::default())
     }
     pub fn open_with_config(path: &Path, config: crate::config::Config) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating state directory {}", parent.display()))?;
-        }
-        let conn = Connection::open(path)
+        prepare_database(path)?;
+        let conn = Connection::open_with_flags(path, writer_flags())
             .with_context(|| format!("opening SQLite database {}", path.display()))?;
         configure(&conn)?;
         init_schema(&conn)?;
@@ -141,6 +140,63 @@ impl Store {
             let _ = join.join();
         }
     }
+}
+
+fn writer_flags() -> OpenFlags {
+    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW
+}
+
+// SQLite derives WAL/SHM permissions from the main database. Create that file
+// privately before SQLite opens it; never chmod an arbitrary existing path.
+fn prepare_database(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
+    let directory = std::fs::metadata(parent)?;
+    let uid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        directory.uid() == uid && directory.mode() & 0o022 == 0,
+        "state directory must be owned by the daemon user and not writable by group/others: {}",
+        parent.display()
+    );
+    let check = |file: std::fs::File, name: &Path| -> Result<()> {
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file()
+                && metadata.uid() == uid
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o077 == 0,
+            "database files must be regular, privately owned (0600), and not hard-linked: {}",
+            name.display()
+        );
+        Ok(())
+    };
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = match options.clone().create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => options.open(path)?,
+        Err(error) => return Err(error.into()),
+    };
+    check(file, path)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let name = sidecar(path, suffix);
+        match options.open(&name) {
+            Ok(file) => check(file, &name)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 impl StoreClient {
@@ -231,15 +287,39 @@ impl StoreClient {
         })?;
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
     }
-    pub fn recent_events(&self, limit: usize) -> Result<Vec<Value>> {
+    pub fn events_page(
+        &self,
+        history: &crate::api::HistoryQuery,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
         let conn = self.read_connection()?;
-        let mut stmt =
-            conn.prepare("SELECT json FROM events ORDER BY ts_ms DESC,id DESC LIMIT ?1")?;
-        let rows = stmt.query_map(
-            params![limit.clamp(1, self.limits.api_query_rows) as i64],
-            |r| r.get::<_, String>(0),
+        let mut stmt = conn.prepare(
+            "SELECT json,COALESCE(json_extract(json,'$.event_id'),'legacy-event-'||id) AS event_key
+             FROM events WHERE (?1 IS NULL OR ts_ms >= ?1) AND (?2 IS NULL OR ts_ms < ?2)
+             AND (?3 IS NULL OR ts_ms < ?3 OR (ts_ms = ?3 AND event_key < ?4))
+             ORDER BY ts_ms DESC,event_key DESC LIMIT ?5",
         )?;
-        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+        let rows = stmt.query_map(
+            params![
+                history.since_ms.map(sql_timestamp),
+                history.before_ms.map(sql_timestamp),
+                history.cursor.as_ref().map(|c| sql_timestamp(c.0)),
+                history.cursor.as_ref().map(|c| c.1.as_str()),
+                limit.clamp(1, self.limits.api_query_rows.saturating_add(1)) as i64,
+            ],
+            |row| {
+                let raw: String = row.get(0)?;
+                let id: String = row.get(1)?;
+                Ok((raw, id))
+            },
+        )?;
+        rows.map(|row| {
+            let (raw, id) = row?;
+            let mut value: Value = serde_json::from_str(&raw)?;
+            value["event_id"] = json!(id);
+            Ok(value)
+        })
+        .collect()
     }
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
@@ -418,34 +498,78 @@ impl StoreClient {
     }
 
     pub fn incidents(&self, limit: usize) -> Result<Value> {
+        Ok(json!({"incidents":self.incidents_page(&crate::api::HistoryQuery::default(),limit)?}))
+    }
+    pub fn incidents_page(
+        &self,
+        history: &crate::api::HistoryQuery,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
         let conn = self.read_connection()?;
-        let limit = limit.clamp(1, self.limits.api_query_rows);
         let mut stmt = conn.prepare(
-            "SELECT ts_ms, severity, title, details, incident_id, json, id
-             FROM incidents ORDER BY ts_ms DESC LIMIT ?1",
+            "SELECT ts_ms,severity,title,details,COALESCE(incident_id,'legacy-'||id) AS incident_key,json
+             FROM incidents WHERE (?1 IS NULL OR ts_ms >= ?1) AND (?2 IS NULL OR ts_ms < ?2)
+             AND (?3 IS NULL OR ts_ms < ?3 OR (ts_ms = ?3 AND incident_key < ?4))
+             ORDER BY ts_ms DESC,incident_key DESC LIMIT ?5")?;
+        let rows = stmt.query_map(
+            params![
+                history.since_ms.map(sql_timestamp),
+                history.before_ms.map(sql_timestamp),
+                history.cursor.as_ref().map(|c| sql_timestamp(c.0)),
+                history.cursor.as_ref().map(|c| c.1.as_str()),
+                limit.clamp(1, self.limits.api_query_rows.saturating_add(1)) as i64,
+            ],
+            incident_value,
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            let full:Option<String>=row.get(5)?;
-            if let Some(full)=full && let Ok(value)=serde_json::from_str::<Value>(&full) {return Ok(value);}
-            let details:String=row.get(3)?;
-            Ok(json!({
-                "id":row.get::<_,Option<String>>(4)?.unwrap_or_else(||format!("legacy-{}",row.get::<_,i64>(6).unwrap_or(0))),
-                "ts_ms":row.get::<_,i64>(0)?,"severity":row.get::<_,String>(1)?,"title":row.get::<_,String>(2)?,
-                "details":serde_json::from_str::<Value>(&details).unwrap_or(Value::String(details)),
-            }))
-        })?;
-        Ok(json!({ "incidents": collect(rows)? }))
+        rows.map(|row| Ok(row?)).collect()
+    }
+    pub fn incident(&self, id: &str) -> Result<Option<Value>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.read_connection()?;
+        Ok(conn
+            .query_row(
+                "SELECT ts_ms,severity,title,details,COALESCE(incident_id,'legacy-'||id),json
+             FROM incidents WHERE incident_id=?1 OR (incident_id IS NULL AND 'legacy-'||id=?1)",
+                params![id],
+                incident_value,
+            )
+            .optional()?)
     }
 
     fn read_connection(&self) -> Result<Connection> {
         let conn = Connection::open_with_flags(
             &self.path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .with_context(|| format!("opening database {} read-only", self.path.display()))?;
         conn.busy_timeout(Duration::from_millis(2000))?;
         Ok(conn)
     }
+}
+
+fn sql_timestamp(timestamp: u64) -> i64 {
+    i64::try_from(timestamp).unwrap_or(i64::MAX)
+}
+
+fn incident_value(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let id: String = row.get(4)?;
+    let ts: i64 = row.get(0)?;
+    if let Some(full) = row.get::<_, Option<String>>(5)?
+        && let Ok(mut value) = serde_json::from_str::<Value>(&full)
+        && value.is_object()
+    {
+        value["id"] = json!(id);
+        value["ts_ms"] = json!(ts);
+        return Ok(value);
+    }
+    let details: String = row.get(3)?;
+    Ok(
+        json!({"id":id,"ts_ms":ts,"severity":row.get::<_,String>(1)?,
+        "title":row.get::<_,String>(2)?,
+        "details":serde_json::from_str::<Value>(&details).unwrap_or(Value::String(details))}),
+    )
 }
 
 fn activity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
@@ -857,7 +981,9 @@ fn writer_loop(
     dropped: Arc<AtomicU64>,
     config: crate::config::Config,
 ) {
-    let mut conn = match Connection::open(&path).context("opening writer connection") {
+    let mut conn = match Connection::open_with_flags(&path, writer_flags())
+        .context("opening writer connection")
+    {
         Ok(conn) => conn,
         Err(err) => {
             log::error!("store writer could not open {}: {err:#}", path.display());
@@ -1129,6 +1255,7 @@ mod tests {
 
     fn entry(_comm: &str, event: ObservedEvent) -> ActivityEntry {
         ActivityEntry {
+            executable_identity: None,
             ts_ms: now_ms() as u64,
             syscall_result: None,
             event_id: None,
@@ -1257,6 +1384,7 @@ mod persistence_regressions {
         store.shutdown();
         let mut conn = Connection::open(&path).unwrap();
         let entry = ActivityEntry {
+            executable_identity: None,
             ts_ms: (now_ms() - RAW_RETENTION_MS - 1000) as u64,
             syscall_result: None,
             event_id: None,
@@ -1296,6 +1424,7 @@ mod persistence_regressions {
         let path = temp.path().join("test.db");
         let mut engine = crate::rules::AnomalyEngine::new();
         let entry = ActivityEntry {
+            executable_identity: None,
             ts_ms: now_ms() as u64,
             syscall_result: None,
             event_id: None,
@@ -1346,6 +1475,7 @@ mod persistence_regressions {
     fn legacy_incident_schema_migrates_without_losing_existing_rows() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("test.db");
+        prepare_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("CREATE TABLE incidents(id INTEGER PRIMARY KEY,ts_ms INTEGER NOT NULL,severity TEXT NOT NULL,title TEXT NOT NULL,details TEXT NOT NULL);INSERT INTO incidents VALUES(1,1,'high','legacy','{}');").unwrap();
         drop(conn);
@@ -1353,6 +1483,10 @@ mod persistence_regressions {
         let result = store.client().incidents(10).unwrap();
         assert_eq!(result["incidents"][0]["id"], "legacy-1");
         assert_eq!(result["incidents"][0]["title"], "legacy");
+        assert_eq!(
+            store.client().incident("legacy-1").unwrap().unwrap()["title"],
+            "legacy"
+        );
         store.shutdown();
     }
 }
@@ -1478,6 +1612,7 @@ mod usability_regressions {
     fn fixture() -> (tempfile::TempDir, Connection, StoreClient) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
+        prepare_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
         init_schema(&conn).unwrap();
         let (tx, _) = sync_channel(1);
@@ -1622,5 +1757,54 @@ mod usability_regressions {
         assert!(flow["closed_ms"].is_null());
         assert_eq!(flow["sent"], 9);
         store.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod privacy_regressions {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn database_directory_and_sidecars_are_private_without_a_service_umask() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state/eye.db");
+        let store = Store::open(&path).unwrap();
+        store.client().compact().unwrap();
+        for name in [path.clone(), sidecar(&path, "-wal"), sidecar(&path, "-shm")] {
+            let mode = std::fs::metadata(&name).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", name.display());
+        }
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap()).unwrap().mode() & 0o777,
+            0o700
+        );
+        store.shutdown();
+    }
+    #[test]
+    fn refuses_insecure_existing_files_links_and_shared_directories_without_modifying_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("unrelated");
+        std::fs::write(&target, b"keep").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(prepare_database(&target).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o644);
+        let link = temp.path().join("symlink.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(prepare_database(&link).is_err());
+        let hard = temp.path().join("hardlink.db");
+        std::fs::hard_link(&target, &hard).unwrap();
+        assert!(prepare_database(&hard).is_err());
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_database(&shared.join("eye.db")).is_err());
+        assert!(!shared.join("eye.db").exists());
+        assert_eq!(std::fs::metadata(&shared).unwrap().mode() & 0o777, 0o777);
+        let database = temp.path().join("safe.db");
+        let wal = sidecar(&database, "-wal");
+        std::os::unix::fs::symlink(&target, &wal).unwrap();
+        assert!(prepare_database(&database).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     }
 }

@@ -72,6 +72,21 @@ Useful daemon flags:
 --no-bpf               startup diagnostics only
 ```
 
+SQLite databases and their WAL/SHM files are created with private permissions
+independently of the caller's umask. New state directories use mode `0700`.
+Existing database files must be owned by the daemon user, private (`0600`),
+regular files without hard links; their directory must be owned by that user
+and must not be writable by group or others. Unsafe files are refused without
+changing their permissions. Correct existing ownership/permissions explicitly
+before restarting if needed.
+
+The service uses its systemd state directory. Direct root launches default to
+`/var/lib/electric-eye/electric-eye.db`; other direct launches use
+`$XDG_STATE_HOME/electric-eye/electric-eye.db`, or
+`~/.local/state/electric-eye/electric-eye.db`. `--db` and `ELECTRIC_EYE_DB`
+select an explicit path. A persistence startup error is reported on stderr;
+live monitoring continues with persistence disabled.
+
 ## TUI and operations
 
 `electric-eye tui` is a capture-read-only terminal client with Overview,

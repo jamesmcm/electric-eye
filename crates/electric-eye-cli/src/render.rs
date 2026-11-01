@@ -948,11 +948,11 @@ mod tests {
     fn renders_noise_candidates_and_suggested_config() {
         let text = noise(&json!({
             "candidates": [
-                {"kind":"path","value":"/home/a/dom6bot_runs","events":1200,"bytes":5000,"files":12},
+                {"kind":"path","value":"/home/a/workload_runs","events":1200,"bytes":5000,"files":12},
                 {"kind":"application","value":"hermes","incidents":92,"top_rules":[{"title":"Novel network destination","count":90}]},
                 {"kind":"correlation","value":"download_like","summaries":4}
             ],
-            "suggested_config": "ignore_paths = [\"/home/a/dom6bot_runs\"]",
+            "suggested_config": "ignore_paths = [\"/home/a/workload_runs\"]",
             "window": {"activity_rows": 100, "incidents": 10, "summaries": 5},
             "history": "persisted and recent"
         }));

@@ -39,6 +39,8 @@ pub struct ActivityEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_info: Option<crate::process::ProcessRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable_identity: Option<crate::provenance::FileIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub application: Option<crate::grouping::Attribution>,
     pub event: ObservedEvent,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,10 +186,6 @@ impl SharedState {
         self.store.clone()
     }
 
-    pub(crate) fn max_request_bytes(&self) -> usize {
-        self.config.limits.api_request_bytes
-    }
-
     pub(crate) fn config_snapshot(&self) -> crate::config::Config {
         self.config.clone()
     }
@@ -250,31 +248,11 @@ impl SharedState {
 
     pub fn activity_value(&self, limit: usize) -> Value {
         let entries: Vec<&ActivityEntry> = self.activity.iter().rev().take(limit).collect();
-        let mut groups: std::collections::BTreeMap<
-            (String, String),
-            std::collections::BTreeSet<String>,
-        > = std::collections::BTreeMap::new();
-        for entry in &entries {
-            if let ObservedEvent::FileWrite(file) = &entry.event
-                && file.kind == electric_eye_core::FileKind::Write
-                && entry.syscall_result.is_none_or(|r| r >= 0)
-            {
-                let name = entry
-                    .application
-                    .as_ref()
-                    .map(|a| a.name.clone())
-                    .unwrap_or_else(|| file.comm.clone());
-                let dir = std::path::Path::new(&file.path)
-                    .parent()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                groups
-                    .entry((name, dir))
-                    .or_default()
-                    .insert(file.path.clone());
-            }
-        }
-        let overview:Vec<_>=groups.into_iter().map(|((name,dir),files)|json!({"text":format!("{name} modified {} observed files under {dir}",files.len()),"files":files,"confidence":"observed"})).collect();
+        let rows: Vec<Value> = entries
+            .iter()
+            .map(|entry| serde_json::to_value(entry).unwrap())
+            .collect();
+        let overview = activity_overview(&rows);
         json!({ "activity": entries,"overview":overview })
     }
 
@@ -336,6 +314,39 @@ impl SharedState {
             .collect();
         json!({ "apps": apps })
     }
+}
+
+fn activity_overview(entries: &[Value]) -> Value {
+    let mut groups: std::collections::BTreeMap<(String, String), BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        let event = &entry["event"];
+        if event["event"] != "file_write"
+            || event["kind"] != "write"
+            || entry["syscall_result"]
+                .as_i64()
+                .is_some_and(|result| result < 0)
+        {
+            continue;
+        }
+        let Some(path) = event["path"].as_str() else {
+            continue;
+        };
+        let name = entry["application"]["name"]
+            .as_str()
+            .or_else(|| event["comm"].as_str())
+            .unwrap_or("unknown");
+        let directory = Path::new(path)
+            .parent()
+            .unwrap_or(Path::new(""))
+            .display()
+            .to_string();
+        groups
+            .entry((name.into(), directory))
+            .or_default()
+            .insert(path.into());
+    }
+    json!(groups.into_iter().map(|((name,dir),files)| json!({"text":format!("{name} modified {} observed files under {dir}",files.len()),"files":files,"confidence":"observed"})).collect::<Vec<_>>())
 }
 
 fn event_comm(event: &ObservedEvent) -> String {
@@ -603,10 +614,7 @@ pub(crate) fn in_window(value: &Value, since: Option<u64>, before: Option<u64>) 
     let ts = value["ts_ms"].as_u64().unwrap_or(0);
     since.is_none_or(|since| ts >= since) && before.is_none_or(|before| ts < before)
 }
-fn trim_window(values: &mut Vec<Value>, since: Option<u64>, before: Option<u64>) {
-    values.retain(|value| in_window(value, since, before));
-}
-fn cursor_key(value: &Value, kind: &str) -> (u64, String) {
+pub(crate) fn cursor_key(value: &Value, kind: &str) -> (u64, String) {
     let id = if kind == "activity" {
         value["event_id"].as_str()
     } else {
@@ -623,8 +631,8 @@ fn parse_cursor(cursor: &str) -> Option<(u64, String)> {
     let (ts, id) = cursor.split_once('|')?;
     Some((ts.parse().ok()?, id.to_string()))
 }
-fn next_cursor(values: &[Value], limit: usize, kind: &str) -> Value {
-    if values.len() < limit {
+fn next_cursor(values: &[Value], has_more: bool, kind: &str) -> Value {
+    if !has_more {
         return Value::Null;
     }
     values
@@ -634,6 +642,23 @@ fn next_cursor(values: &[Value], limit: usize, kind: &str) -> Value {
             Value::String(format!("{ts}|{id}"))
         })
         .unwrap_or(Value::Null)
+}
+
+#[derive(Default)]
+pub(crate) struct HistoryQuery {
+    pub since_ms: Option<u64>,
+    pub before_ms: Option<u64>,
+    pub cursor: Option<(u64, String)>,
+}
+
+impl HistoryQuery {
+    pub fn matches(&self, value: &Value, kind: &str) -> bool {
+        in_window(value, self.since_ms, self.before_ms)
+            && self
+                .cursor
+                .as_ref()
+                .is_none_or(|cursor| cursor_key(value, kind) < *cursor)
+    }
 }
 
 fn focus_value_matches(rule: &crate::config::FocusRule, value: &Value) -> bool {
@@ -786,30 +811,41 @@ pub(crate) fn response_for(request: &Value, state: &Arc<Mutex<SharedState>>) -> 
             value
         }
         "activity" => {
-            let fetch_limit = if since_ms.is_some()
-                || before_ms.is_some()
-                || request["before_cursor"].is_string()
-            {
-                limits.api_query_rows
-            } else {
-                limit
+            let history = HistoryQuery {
+                since_ms,
+                before_ms,
+                cursor: request["before_cursor"].as_str().and_then(parse_cursor),
             };
-            let mut value = state.lock().unwrap().activity_value(fetch_limit);
-            if let Some(store) = &store
-                && let Ok(saved) = store.recent_events(fetch_limit)
-            {
-                let live = value["activity"].as_array().cloned().unwrap_or_default();
-                value["activity"] = json!(merge_events(saved, live, fetch_limit));
+            if request["before_cursor"].is_string() && history.cursor.is_none() {
+                return json!({"error":"invalid history cursor"});
             }
-            let mut rows = value["activity"].as_array().cloned().unwrap_or_default();
-            trim_window(&mut rows, since_ms, before_ms);
+            let mut value = {
+                let state = state.lock().unwrap();
+                state.activity_value(state.activity.len())
+            };
+            let live = value["activity"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|row| history.matches(row, "activity"))
+                .collect();
+            let saved = match &store {
+                Some(store) => match store.events_page(&history, limit + 1) {
+                    Ok(rows) => rows,
+                    Err(error) => return json!({"error":format!("{error:#}")}),
+                },
+                None => Vec::new(),
+            };
+            let mut rows = merge_events(saved, live, usize::MAX);
             sort_rows(&mut rows, "activity");
-            if let Some(cursor) = request["before_cursor"].as_str().and_then(parse_cursor) {
-                rows.retain(|row| cursor_key(row, "activity") < cursor);
-            }
+            let has_more = rows.len() > limit;
             rows.truncate(limit);
-            value["next_cursor"] = next_cursor(&rows, limit, "activity");
+            value["next_cursor"] = next_cursor(&rows, has_more, "activity");
             value["activity"] = json!(rows);
+            // The overview must describe the selected page, rather than newer
+            // observations outside the requested window.
+            value["overview"] = activity_overview(&rows);
             if let Some(store) = &store
                 && let Ok(persisted) = store.recent_activities(20)
             {
@@ -828,51 +864,58 @@ pub(crate) fn response_for(request: &Value, state: &Arc<Mutex<SharedState>>) -> 
             value
         }
         "incidents" => {
-            let fetch_limit = if since_ms.is_some()
-                || before_ms.is_some()
-                || request["before_cursor"].is_string()
-            {
-                limits.api_query_rows
-            } else {
-                limit
+            let history = HistoryQuery {
+                since_ms,
+                before_ms,
+                cursor: request["before_cursor"].as_str().and_then(parse_cursor),
             };
-            let recent = state.lock().unwrap().recent_incidents(fetch_limit);
-            let mut value = match &store {
-                Some(store) => {
-                    let mut value = query(store.incidents(fetch_limit));
-                    let saved = value["incidents"].as_array().cloned().unwrap_or_default();
-                    value["incidents"] =
-                        json!(merge_documents(saved, recent, "incidents", fetch_limit));
-                    value
-                }
-                None => json!({ "incidents": recent }),
-            };
-            let mut rows = value["incidents"].as_array().cloned().unwrap_or_default();
-            trim_window(&mut rows, since_ms, before_ms);
-            sort_rows(&mut rows, "incidents");
-            if let Some(cursor) = request["before_cursor"].as_str().and_then(parse_cursor) {
-                rows.retain(|row| cursor_key(row, "incidents") < cursor);
+            if request["before_cursor"].is_string() && history.cursor.is_none() {
+                return json!({"error":"invalid history cursor"});
             }
+            let live = {
+                let state = state.lock().unwrap();
+                state.recent_incidents(state.incidents.len())
+            }
+            .into_iter()
+            .filter(|row| history.matches(row, "incidents"))
+            .collect();
+            let saved = match &store {
+                Some(store) => match store.incidents_page(&history, limit + 1) {
+                    Ok(rows) => rows,
+                    Err(error) => return json!({"error":format!("{error:#}")}),
+                },
+                None => Vec::new(),
+            };
+            let mut rows = merge_documents(saved, live, "incidents", usize::MAX);
+            sort_rows(&mut rows, "incidents");
+            let has_more = rows.len() > limit;
             rows.truncate(limit);
-            value["next_cursor"] = next_cursor(&rows, limit, "incidents");
-            value["incidents"] = json!(rows);
-            value
+            json!({"incidents":rows,"next_cursor":next_cursor(&rows,has_more,"incidents")})
         }
         "investigate" => {
             let id = request["id"].as_str().unwrap_or_default();
             if id.is_empty() {
                 return json!({"error":"investigate requires an incident id"});
             }
-            let mut rows = state
-                .lock()
-                .unwrap()
-                .recent_incidents(limits.api_query_rows);
-            if let Some(store) = &store
-                && let Ok(value) = store.incidents(limits.api_query_rows)
-            {
-                rows.extend(value["incidents"].as_array().cloned().unwrap_or_default());
-            }
-            let Some(incident) = rows.into_iter().find(|row| row["id"].as_str() == Some(id)) else {
+            let recent = {
+                let state = state.lock().unwrap();
+                state
+                    .incidents
+                    .iter()
+                    .find(|row| row["id"].as_str() == Some(id))
+                    .cloned()
+            };
+            let incident = match recent {
+                Some(incident) => Some(incident),
+                None => match &store {
+                    Some(store) => match store.incident(id) {
+                        Ok(incident) => incident,
+                        Err(error) => return json!({"error":format!("{error:#}")}),
+                    },
+                    None => None,
+                },
+            };
+            let Some(incident) = incident else {
                 return json!({"error":format!("incident {id} not found in retained history")});
             };
             let config = state.lock().unwrap().config_snapshot();
@@ -1047,6 +1090,7 @@ mod tests {
 
     fn entry(pid: u32, comm: &str) -> ActivityEntry {
         ActivityEntry {
+            executable_identity: None,
             ts_ms: now_ms(),
             syscall_result: None,
             event_id: None,
@@ -1086,6 +1130,7 @@ mod tests {
         let mut state = SharedState::new();
         state.record(entry(1, "curl"));
         state.record(ActivityEntry {
+            executable_identity: None,
             ts_ms: now_ms(),
             syscall_result: None,
             event_id: None,
@@ -1250,5 +1295,131 @@ mod usability_regressions {
             merge_events(vec![old.clone()], vec![old, fresh.clone()], 10),
             vec![fresh, json!({"event_id":"same","ts_ms":1})]
         );
+    }
+}
+
+#[cfg(test)]
+mod history_regressions {
+    use super::*;
+    fn populate(state: &Arc<Mutex<SharedState>>, store: Option<&StoreClient>) -> u64 {
+        let timestamp = now_ms();
+        for index in 0..10 {
+            let ts_ms = timestamp + index / 2;
+            let entry = ActivityEntry {
+                executable_identity: None,
+                ts_ms,
+                event_id: (index != 0).then(|| format!("event-{index:02}")),
+                syscall_result: None,
+                process: None,
+                path_resolution: None,
+                process_info: None,
+                application: None,
+                unit: None,
+                nix: None,
+                parent: None,
+                exe: None,
+                event: ObservedEvent::Exit(electric_eye_core::ExitEvent {
+                    pid: index as u32,
+                    uid: 1000,
+                    comm: "fixture".into(),
+                }),
+            };
+            let id = format!("incident-{index:02}");
+            let incident =
+                json!({"id":id,"ts_ms":ts_ms,"severity":"high","title":"fixture","details":{}});
+            if let Some(store) = store {
+                store.record(&entry);
+                store.record_incident(crate::store::IncidentRow {
+                    ts_ms: ts_ms as i64,
+                    id: id.clone(),
+                    json: incident.to_string(),
+                    severity: "high".into(),
+                    title: "fixture".into(),
+                    details: "{}".into(),
+                });
+            }
+            if store.is_none() || index >= 7 {
+                state.lock().unwrap().record(entry);
+                state.lock().unwrap().record_incident(incident);
+            }
+        }
+        timestamp
+    }
+    fn pages(state: &Arc<Mutex<SharedState>>, op: &str, timestamp: Option<u64>) -> Vec<Value> {
+        let mut cursor = Value::Null;
+        let mut all = Vec::new();
+        for _ in 0..20 {
+            let mut request = json!({"op":op,"limit":2});
+            if cursor.is_string() {
+                request["before_cursor"] = cursor;
+            }
+            if let Some(timestamp) = timestamp {
+                request["since_ms"] = json!(timestamp + 1);
+                request["before_ms"] = json!(timestamp + 3);
+            }
+            let response = response_for(&request, state);
+            assert!(response["error"].is_null(), "{response}");
+            let rows = response[op].as_array().unwrap();
+            all.extend(rows.iter().cloned());
+            cursor = response["next_cursor"].clone();
+            if cursor.is_null() {
+                return all;
+            }
+            assert!(!rows.is_empty());
+        }
+        panic!("pagination did not terminate");
+    }
+    #[test]
+    fn filters_and_cursors_reach_all_retained_rows_with_and_without_sqlite() {
+        for persisted in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = crate::config::Config::default();
+            config.limits.api_query_rows = 3;
+            let state = Arc::new(Mutex::new(SharedState::with_config(config.clone())));
+            let store = persisted.then(|| {
+                crate::store::Store::open_with_config(&temp.path().join("history.db"), config)
+                    .unwrap()
+            });
+            let client = store.as_ref().map(|store| store.client());
+            let timestamp = populate(&state, client.as_ref());
+            if let Some(store) = store {
+                store.shutdown();
+            }
+            state.lock().unwrap().set_store(client);
+            for op in ["activity", "incidents"] {
+                let rows = pages(&state, op, None);
+                assert_eq!(rows.len(), 10, "{op}, persisted={persisted}");
+                let keys: BTreeSet<_> = rows.iter().map(|row| cursor_key(row, op)).collect();
+                assert_eq!(keys.len(), 10);
+                assert!(
+                    rows.windows(2)
+                        .all(|pair| cursor_key(&pair[0], op) > cursor_key(&pair[1], op))
+                );
+                let filtered = pages(&state, op, Some(timestamp));
+                assert_eq!(filtered.len(), 4);
+                assert!(filtered.iter().all(|row| in_window(
+                    row,
+                    Some(timestamp + 1),
+                    Some(timestamp + 3)
+                )));
+                let older =
+                    response_for(&json!({"op":op,"before_ms":timestamp+1,"limit":2}), &state);
+                assert_eq!(older[op].as_array().unwrap().len(), 2);
+                assert!(older["next_cursor"].is_null());
+            }
+            let oldest = response_for(&json!({"op":"investigate","id":"incident-00"}), &state);
+            assert_eq!(oldest["incident"]["id"], "incident-00");
+            assert!(oldest["error"].is_null());
+        }
+    }
+    #[test]
+    fn invalid_cursors_are_rejected_instead_of_restarting_pagination() {
+        let state = Arc::new(Mutex::new(SharedState::new()));
+        for op in ["activity", "incidents"] {
+            assert!(
+                response_for(&json!({"op":op,"before_cursor":"invalid"}), &state)["error"]
+                    .is_string()
+            );
+        }
     }
 }

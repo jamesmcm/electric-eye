@@ -61,13 +61,13 @@ pub fn read_namespace(home: &Path, namespace: &str) -> Option<VoponoContext> {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return None;
     };
-    for entry in entries.flatten() {
+    for entry in entries.flatten().take(4096) {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
         if name == "port-forwarding.json" {
-            if let Ok(text) = std::fs::read_to_string(&path)
+            if let Ok(text) = crate::metadata::read_text(&path, 256 * 1024)
                 && let Some((port, updated)) = json_sidecar(&text)
             {
                 let forwarding = context.port_forwarding.get_or_insert_with(Default::default);
@@ -77,7 +77,7 @@ pub fn read_namespace(home: &Path, namespace: &str) -> Option<VoponoContext> {
             continue;
         }
         if name == "health.json" {
-            if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(text) = crate::metadata::read_text(&path, 256 * 1024) {
                 context.health = parse_health(&text);
             }
             continue;
@@ -89,7 +89,7 @@ pub fn read_namespace(home: &Path, namespace: &str) -> Option<VoponoContext> {
             if !process_in_namespace(pid, namespace) {
                 continue;
             }
-            let text = std::fs::read_to_string(&path).ok();
+            let text = crate::metadata::read_text(&path, 256 * 1024).ok();
             let command = text.as_deref().and_then(parse_command);
             applications.insert(VoponoApplication {
                 pid: Some(pid),
@@ -98,7 +98,7 @@ pub fn read_namespace(home: &Path, namespace: &str) -> Option<VoponoContext> {
             continue;
         }
         if name.chars().all(|character| character.is_ascii_digit()) {
-            primary = std::fs::read_to_string(&path).ok();
+            primary = crate::metadata::read_text(&path, 256 * 1024).ok();
         }
     }
 
@@ -140,7 +140,7 @@ pub fn read_namespace(home: &Path, namespace: &str) -> Option<VoponoContext> {
 pub fn namespace_for_pid(home: &Path, pid: u32) -> Option<String> {
     let root = home.join(".config/vopono/locks");
     let entries = std::fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
+    for entry in entries.flatten().take(4096) {
         let dir = entry.path();
         if !dir.is_dir() {
             continue;

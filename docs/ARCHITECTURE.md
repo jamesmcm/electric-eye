@@ -60,7 +60,8 @@ not intercept HTTPS, proxy traffic, enforce policy or inject into processes.
   starts and download-like activity retain evidence and confidence labels.
 - `electric-eye tui|doctor|status|activity|apps|app|process|tree|file|network|flows|netns|explain|focus|investigate|why|incidents|summaries|noise|db|config|export`
 - built-in noise allowlist for `tailscaled`, `thunar`, `git` and `cargo`; configurable with
-  `rules.builtin_noise_allowlist`
+  `rules.builtin_noise_allowlist`; exemptions require the observed device/inode
+  of an executable in a protected, root-owned system location
 
 Kernel events are collected with Aya. Kernel BTF and tracefs supply live struct
 and tracepoint offsets, so the object is not tied to a specific kernel build.
@@ -84,7 +85,10 @@ failure keeps the event but marks its path uncertain).
 ## Storage and retention
 
 The service stores data in `/var/lib/electric-eye/electric-eye.db` via
-systemd's `StateDirectory`. Retention is tiered:
+systemd's `StateDirectory`. Standalone launches also create private databases
+and sidecars; unsafe existing database files are refused without modification.
+User-owned desktop, known-host and runtime metadata is read through bounded
+workers so those files cannot stall kernel event consumption. Retention is tiered:
 
 - raw events: 5 minutes
 - general activity buckets: 30 days

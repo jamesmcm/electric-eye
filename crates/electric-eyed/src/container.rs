@@ -181,7 +181,7 @@ fn inspect_lxc(name: &str, uid: u32, home: Option<&Path>) -> Option<ContainerCon
         .into_iter()
         .map(|root| root.join(name).join("config"))
         .find(|path| path.is_file())?;
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = crate::metadata::read_text(&path, 256 * 1024).ok()?;
     let addresses = lxc_addresses(&text);
     let mut mappings = Vec::new();
     if !addresses.is_empty()
@@ -217,7 +217,7 @@ fn container_roots(uid: u32, home: Option<&Path>, suffix: &str) -> Vec<PathBuf> 
 fn find_container_dir(root: &Path, name_or_id: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(root).ok()?;
     let mut fallback = None;
-    for entry in entries.flatten() {
+    for entry in entries.flatten().take(4096) {
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -234,8 +234,8 @@ fn find_container_dir(root: &Path, name_or_id: &str) -> Option<PathBuf> {
 }
 
 fn read_json(path: PathBuf) -> Option<Value> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let text = crate::metadata::read_text(&path, 1024 * 1024).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 fn port_mappings(value: &Value) -> Vec<PortMapping> {

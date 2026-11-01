@@ -163,11 +163,13 @@ details show the actual script name, command arguments, and changed-file list.
 Built-in noise handling already allowlists `tailscaled`, `thunar`, `git` and `cargo`, and
 download-like summaries ignore high-churn non-browser applications plus log,
 cache, database and build-output paths. `known_hosts` is public host-key data,
-not a credential store. `ssh` is not globally allowlisted; only `ssh` launched
-by `git` for GitHub/GitLab is suppressed contextually. With
+not a credential store. Automatic exemptions require a protected, root-owned
+executable whose device/inode matches the captured identity. A process or parent
+named `git` does not grant trust. `ssh` is not globally allowlisted. With
 `known_hosts_allow = true` (default), an SSH destination present in the user's
-or system known_hosts is also trusted for that process, including plain,
-wildcard, port-qualified, and hashed entries. Do not treat these defaults as an
+or system known_hosts is trusted for a verified SSH process, including plain,
+wildcard, port-qualified, and hashed entries. Loading is asynchronous and a cache
+miss leaves rules active. Do not treat these defaults as an
 excuse to skip incident review.
 
 Network destinations can be allowlisted per application and direction

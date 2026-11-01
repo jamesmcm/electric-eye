@@ -2,6 +2,7 @@
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::MetadataExt;
 use std::{
     collections::HashMap,
     ffi::{CStr, CString, c_char, c_void},
@@ -47,14 +48,63 @@ pub struct Provenance {
     pub observed_ms: u64,
     pub status: String,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+impl FileIdentity {
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+    pub fn from_record(raw: &crate::wire::Record) -> Option<Self> {
+        (raw.exe_inode != 0).then(|| Self {
+            device: libc::makedev(raw.exe_dev >> 20, raw.exe_dev & 0xfffff),
+            inode: raw.exe_inode,
+        })
+    }
+}
+impl Provenance {
+    pub fn identity(&self) -> Option<FileIdentity> {
+        Some(FileIdentity {
+            device: self.device?,
+            inode: self.inode?,
+        })
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TrustKey {
+    path: String,
+    identity: FileIdentity,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    generation: u64,
+}
+impl TrustKey {
+    fn new(path: &str, metadata: &std::fs::Metadata, generation: u64) -> Self {
+        Self {
+            path: path.into(),
+            identity: FileIdentity::from_metadata(metadata),
+            size: metadata.size(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            generation,
+        }
+    }
+}
 #[derive(Default)]
 struct Index {
     files: HashMap<String, Arc<Package>>,
     error: Option<String>,
+    generation: u64,
 }
 pub struct Provider {
     index: Arc<RwLock<Index>>,
-    trust_cache: Mutex<HashMap<String, PackageTrust>>,
+    trust_cache: Mutex<HashMap<TrustKey, PackageTrust>>,
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -84,8 +134,10 @@ impl Provider {
                     && !Path::new("/var/lib/pacman/db.lck").exists()
                 {
                     match load() {
-                        Ok(new) => {
-                            *shared.write().unwrap() = new;
+                        Ok(mut new) => {
+                            let mut index = shared.write().unwrap();
+                            new.generation = index.generation.wrapping_add(1);
+                            *index = new;
                             fingerprint = next;
                         }
                         Err(e) => log::warn!("ALPM refresh deferred: {e}"),
@@ -102,43 +154,64 @@ impl Provider {
     }
     pub fn identify_record(&self, path: &str, raw: &crate::wire::Record) -> Provenance {
         let mut p = self.identify(path);
-        if raw.exe_inode != 0 {
-            let device = libc::makedev(raw.exe_dev >> 20, raw.exe_dev & 0xfffff);
-            if p.inode != Some(raw.exe_inode) || p.device != Some(device) {
-                p.package = None;
-                p.status = "file_replaced_deleted_or_other_mount_namespace".into();
-            }
-            p.inode = Some(raw.exe_inode);
-            p.device = Some(device);
+        let Some(observed) = FileIdentity::from_record(raw) else {
+            p.package = None;
+            p.device = None;
+            p.inode = None;
+            p.status = "executable_identity_unavailable".into();
+            return p;
+        };
+        if p.identity() != Some(observed) {
+            p.package = None;
+            p.status = "file_replaced_deleted_or_other_mount_namespace".into();
         }
+        p.inode = Some(observed.inode);
+        p.device = Some(observed.device);
         p
     }
+    #[cfg(test)]
     pub fn trust(&self, path: &str) -> PackageTrust {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = std::fs::metadata(path).ok();
-        let cache_key = metadata
-            .as_ref()
-            .map(|m| {
-                format!(
-                    "{}:{}:{}:{}",
-                    path,
-                    m.dev(),
-                    m.ino(),
-                    m.mtime_nsec() ^ m.size() as i64
-                )
-            })
-            .unwrap_or_else(|| path.to_string());
+        let observed = std::fs::metadata(path)
+            .ok()
+            .map(|m| FileIdentity::from_metadata(&m));
+        self.trust_observed(path, observed)
+    }
+    pub fn trust_observed(&self, path: &str, observed: Option<FileIdentity>) -> PackageTrust {
+        let unknown = |status: &str| PackageTrust {
+            executable: path.into(),
+            package: None,
+            validation: None,
+            source: "unknown".into(),
+            hash_match: None,
+            expected_sha256: None,
+            actual_sha256: None,
+            status: status.into(),
+            checked_ms: crate::api::now_ms(),
+        };
+        let Some(observed) = observed else {
+            return unknown("executable_identity_unavailable");
+        };
+        let Ok(mut file) = crate::metadata::open_regular(Path::new(path), 512 * 1024 * 1024) else {
+            return unknown("file_replaced_deleted_or_other_mount_namespace");
+        };
+        let Ok(metadata) = file.metadata() else {
+            return unknown("unverified");
+        };
+        if FileIdentity::from_metadata(&metadata) != observed {
+            return unknown("file_replaced_deleted_or_other_mount_namespace");
+        }
+        let index = self.index.read().unwrap();
+        let cache_key = TrustKey::new(path, &metadata, index.generation);
         if let Some(trust) = self.trust_cache.lock().unwrap().get(&cache_key) {
             return trust.clone();
         }
-        let index = self.index.read().unwrap();
         let package = index.files.get(path).map(|package| (**package).clone());
         let validation = package
             .as_ref()
             .and_then(|package| package.validation.clone());
         let hash = package
             .as_ref()
-            .and_then(|package| package_hash(path, package));
+            .and_then(|package| package_hash(path, package, &mut file));
         let source = match validation.as_deref() {
             Some("pgp") => "arch_repo_signed",
             Some("none") | None => "unsigned_or_foreign",
@@ -165,10 +238,21 @@ impl Provider {
             status,
             checked_ms: crate::api::now_ms(),
         };
-        self.trust_cache
-            .lock()
-            .unwrap()
-            .insert(cache_key, trust.clone());
+        if file
+            .metadata()
+            .ok()
+            .as_ref()
+            .map(|m| TrustKey::new(path, m, index.generation))
+            != Some(cache_key.clone())
+        {
+            return unknown("file_changed_during_verification");
+        }
+        let mut cache = self.trust_cache.lock().unwrap();
+        cache.retain(|key, _| key.generation == index.generation && key.path != path);
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        cache.insert(cache_key, trust.clone());
         trust
     }
 
@@ -386,13 +470,23 @@ fn desc_field(text: &str, field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn package_hash(path: &str, package: &Package) -> Option<(bool, Option<String>, Option<String>)> {
+fn package_hash(
+    path: &str,
+    package: &Package,
+    executable: &mut std::fs::File,
+) -> Option<(bool, Option<String>, Option<String>)> {
     let mtree = Path::new("/var/lib/pacman/local")
         .join(format!("{}-{}", package.name, package.version))
         .join("mtree");
     let file = std::fs::File::open(mtree).ok()?;
     let mut text = String::new();
-    GzDecoder::new(file).read_to_string(&mut text).ok()?;
+    GzDecoder::new(file)
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() > 16 * 1024 * 1024 {
+        return None;
+    }
     let relative = format!("./{}", path.trim_start_matches('/'));
     let expected = text.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -402,11 +496,10 @@ fn package_hash(path: &str, package: &Package) -> Option<(bool, Option<String>, 
         }
         fields.find_map(|field| field.strip_prefix("sha256digest=").map(str::to_string))
     })?;
-    let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file.read(&mut buffer).ok()?;
+        let read = executable.read(&mut buffer).ok()?;
         if read == 0 {
             break;
         }
@@ -433,4 +526,130 @@ mod tests {
         assert!(trust.validation.is_some(), "{trust:?}");
         assert_eq!(trust.hash_match, Some(true), "{trust:?}");
     }
+}
+
+#[cfg(test)]
+mod trust_regressions {
+    use super::*;
+    fn provider() -> Provider {
+        Provider {
+            index: Arc::new(RwLock::new(Index::default())),
+            trust_cache: Mutex::new(HashMap::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            join: None,
+        }
+    }
+    #[test]
+    fn a_matching_path_cannot_verify_a_different_inode_or_missing_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("executable");
+        std::fs::write(&path, b"first").unwrap();
+        let identity = FileIdentity::from_metadata(&std::fs::metadata(&path).unwrap());
+        let other = temp.path().join("replacement");
+        std::fs::write(&other, b"replacement").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        let provider = provider();
+        let trust = provider.trust_observed(path.to_str().unwrap(), Some(identity));
+        assert_eq!(
+            trust.status,
+            "file_replaced_deleted_or_other_mount_namespace"
+        );
+        assert!(trust.package.is_none());
+        assert!(trust.hash_match.is_none());
+        assert_eq!(
+            provider.trust_observed(path.to_str().unwrap(), None).status,
+            "executable_identity_unavailable"
+        );
+    }
+    #[test]
+    fn missing_kernel_identity_cannot_inherit_the_host_path_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("executable");
+        std::fs::write(&path, b"fixture").unwrap();
+        let provider = provider();
+        let record = provider.identify_record(path.to_str().unwrap(), &crate::wire::Record::ZERO);
+        assert!(record.identity().is_none());
+        assert!(record.package.is_none());
+        assert_eq!(record.status, "executable_identity_unavailable");
+        assert!(
+            provider
+                .trust_observed(path.to_str().unwrap(), record.identity())
+                .hash_match
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cache_tracks_full_timestamps_ctime_and_package_generation() {
+        use std::fs::FileTimes;
+        use std::time::UNIX_EPOCH;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("executable");
+        std::fs::write(&path, b"AAAA").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let original = UNIX_EPOCH + Duration::new(1_700_000_000, 0);
+        file.set_times(FileTimes::new().set_modified(original))
+            .unwrap();
+        let provider = provider();
+        let name = path.to_str().unwrap();
+        assert_eq!(provider.trust(name).status, "unowned");
+        let first = provider
+            .trust_cache
+            .lock()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        std::fs::write(&path, b"BBBB").unwrap();
+        file.set_times(FileTimes::new().set_modified(original + Duration::from_secs(60)))
+            .unwrap();
+        provider.trust(name);
+        let second = provider
+            .trust_cache
+            .lock()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        assert_ne!(first, second);
+        assert_eq!(second.modified, (1_700_000_060, 0));
+        assert_eq!(provider.trust_cache.lock().unwrap().len(), 1);
+        // ctime must invalidate even if size and mtime are restored.
+        let mut simulated = std::fs::metadata(&path).unwrap();
+        let before = TrustKey::new(name, &simulated, 0);
+        file.set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        simulated = std::fs::metadata(&path).unwrap();
+        let after = TrustKey::new(name, &simulated, 0);
+        assert_ne!(before.changed, after.changed);
+        {
+            let mut index = provider.index.write().unwrap();
+            index.files.insert(
+                name.into(),
+                Arc::new(Package {
+                    name: "fixture".into(),
+                    version: "2".into(),
+                    description: String::new(),
+                    installed_at: 0,
+                    validation: Some("pgp".into()),
+                    packager: None,
+                }),
+            );
+            index.generation += 1;
+        }
+        let refreshed = provider.trust(name);
+        assert_eq!(refreshed.package.unwrap().version, "2");
+        assert_eq!(refreshed.validation.as_deref(), Some("pgp"));
+        assert!(
+            provider
+                .trust_cache
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|key| key.generation == 1)
+        );
+    }
+    use std::os::unix::fs::PermissionsExt;
 }

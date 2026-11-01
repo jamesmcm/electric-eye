@@ -28,6 +28,7 @@ pub struct Groups {
     pub applications: crate::cache::Recent<Application>,
     desktops: HashMap<String, (String, String)>,
     member_limit: usize,
+    desktop_rx: Option<std::sync::mpsc::Receiver<HashMap<String, (String, String)>>>,
 }
 impl Default for Groups {
     fn default() -> Self {
@@ -40,6 +41,7 @@ impl Groups {
             applications: crate::cache::Recent::new(limits.application_entries),
             desktops: HashMap::new(),
             member_limit: limits.application_members,
+            desktop_rx: None,
         }
     }
 }
@@ -344,25 +346,46 @@ fn program_path(p: &ProcessRecord, script: &str) -> String {
 }
 impl Groups {
     pub fn load(limits: &crate::config::Limits) -> Self {
-        let mut g = Self::with_limits(limits);
-        g.read_desktops(std::path::Path::new("/usr/share/applications"));
-        if let Ok(passwd) = std::fs::read_to_string("/etc/passwd") {
-            for line in passwd.lines() {
-                let fields: Vec<_> = line.split(':').collect();
-                if fields.len() >= 7 {
-                    g.read_desktops(
-                        &std::path::Path::new(fields[5]).join(".local/share/applications"),
-                    );
+        let mut groups = Self::with_limits(limits);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("electric-eye-desktops".into())
+            .spawn(move || {
+                let mut loaded = Self::default();
+                loaded.read_desktops(std::path::Path::new("/usr/share/applications"));
+                if let Ok(passwd) =
+                    crate::metadata::read_text(std::path::Path::new("/etc/passwd"), 1024 * 1024)
+                {
+                    for line in passwd.lines().take(4096) {
+                        let fields: Vec<_> = line.split(':').collect();
+                        if fields.len() >= 7 && loaded.desktops.len() < 4096 {
+                            loaded.read_desktops(
+                                &std::path::Path::new(fields[5]).join(".local/share/applications"),
+                            );
+                        }
+                    }
                 }
+                let _ = tx.send(loaded.desktops);
+            });
+        if worker.is_ok() {
+            // Preserve desktop labels in the initial inventory when discovery
+            // is quick. A slow filesystem must not prevent capture startup.
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(desktops) => groups.desktops = desktops,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => groups.desktop_rx = Some(rx),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
             }
         }
-        g
+        groups
     }
     fn read_desktops(&mut self, root: &std::path::Path) {
         if let Ok(entries) = std::fs::read_dir(root) {
-            for e in entries.flatten() {
+            for e in entries.flatten().take(4096) {
+                if self.desktops.len() >= 4096 {
+                    break;
+                }
                 if e.path().extension().is_some_and(|x| x == "desktop")
-                    && let Ok(s) = std::fs::read_to_string(e.path())
+                    && let Ok(s) = crate::metadata::read_text(&e.path(), 256 * 1024)
                 {
                     let mut active = false;
                     let mut name = None;
@@ -376,7 +399,7 @@ impl Groups {
                             continue;
                         }
                         if let Some(value) = line.strip_prefix("Name=") {
-                            name = Some(value.to_string());
+                            name = Some(value.chars().take(256).collect::<String>());
                         }
                         if let Some(value) = line.strip_prefix("Exec=") {
                             executable = desktop_command(value);
@@ -385,7 +408,10 @@ impl Groups {
                             hidden = true;
                         }
                     }
-                    if !hidden && let (Some(name), Some(exe)) = (name, executable) {
+                    if !hidden
+                        && let (Some(name), Some(exe)) = (name, executable)
+                        && exe.len() <= 4096
+                    {
                         self.desktops
                             .insert(exe, (e.file_name().to_string_lossy().into_owned(), name));
                     }
@@ -399,6 +425,16 @@ impl Groups {
         parent: Option<&ProcessRecord>,
         config: &Config,
     ) -> Attribution {
+        if let Some(rx) = &self.desktop_rx {
+            match rx.try_recv() {
+                Ok(desktops) => {
+                    self.desktops = desktops;
+                    self.desktop_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.desktop_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         let exe = p.executable.as_deref().unwrap_or(&p.comm);
         let own = key(&p.identity);
         let override_name = config
@@ -652,5 +688,27 @@ mod tests {
         let app = groups.assign(&process, None, &config);
         assert_eq!(app.name, "Chosen name");
         assert_eq!(app.reason, "user override");
+    }
+}
+
+#[cfg(test)]
+mod metadata_regressions {
+    use super::*;
+    #[test]
+    fn desktop_discovery_skips_links_and_oversized_files() {
+        let temp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/zero", temp.path().join("device.desktop")).unwrap();
+        let huge = temp.path().join("huge.desktop");
+        let file = std::fs::File::create(huge).unwrap();
+        file.set_len(256 * 1024 + 1).unwrap();
+        std::fs::write(
+            temp.path().join("valid.desktop"),
+            "[Desktop Entry]\nName=Fixture\nExec=/usr/bin/fixture\n",
+        )
+        .unwrap();
+        let mut groups = Groups::default();
+        groups.read_desktops(temp.path());
+        assert_eq!(groups.desktops.len(), 1);
+        assert_eq!(groups.desktops["/usr/bin/fixture"].1, "Fixture");
     }
 }

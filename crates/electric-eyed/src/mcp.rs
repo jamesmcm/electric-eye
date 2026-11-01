@@ -210,24 +210,45 @@ fn handle_client(
     stream.set_read_timeout(Some(CLIENT_POLL))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let max_bytes = state.lock().unwrap().max_request_bytes();
+    let config = state.lock().unwrap().config_snapshot();
+    let max_bytes = config.limits.api_request_bytes;
+    let frame_timeout = Duration::from_millis(config.limits.api_timeout_ms);
     let mut line = Vec::new();
+    let mut deadline: Option<Instant> = None;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                if line.len() > max_bytes {
+        let timeout = match deadline {
+            Some(end) => {
+                let Some(remaining) = end.checked_duration_since(Instant::now()) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "MCP request deadline exceeded",
+                    ));
+                };
+                CLIENT_POLL.min(remaining)
+            }
+            None => CLIENT_POLL,
+        };
+        stream.set_read_timeout(Some(timeout))?;
+        match reader.fill_buf() {
+            Ok([]) => break,
+            Ok(bytes) => {
+                let newline = bytes.iter().position(|byte| *byte == b'\n');
+                let count = newline.unwrap_or(bytes.len());
+                if count > max_bytes.saturating_sub(line.len()) {
                     let response = error_response(Value::Null, -32600, "request too large");
                     write_message(&mut stream, &response)?;
-                    line.clear();
-                    continue;
+                    return Ok(());
                 }
-                if line.ends_with(b"\n") {
+                deadline.get_or_insert_with(|| Instant::now() + frame_timeout);
+                line.extend_from_slice(&bytes[..count]);
+                reader.consume(count + usize::from(newline.is_some()));
+                if newline.is_some() {
                     let text = String::from_utf8_lossy(&line).trim().to_string();
                     line.clear();
+                    deadline = None;
                     if text.is_empty() {
                         continue;
                     }
@@ -941,5 +962,106 @@ mod tests {
 
         drop(server);
         assert!(!path.exists());
+    }
+}
+
+#[cfg(test)]
+mod framing_regressions {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn oversized_unterminated_frames_are_rejected_before_a_newline() {
+        let state = Arc::new(Mutex::new(SharedState::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let join = thread::spawn(move || {
+            handle_client(server, &state, &stopping, &ToolProfile::default())
+        });
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(&vec![b'x'; 32 * 1024]).unwrap();
+        let mut line = String::new();
+        let result = BufReader::new(client.try_clone().unwrap()).read_line(&mut line);
+        stop.store(true, Ordering::Relaxed);
+        drop(client);
+        join.join().unwrap().unwrap();
+        result.unwrap();
+        assert!(line.contains("request too large"), "{line}");
+    }
+
+    #[test]
+    fn incomplete_frames_have_an_absolute_deadline_but_idle_sessions_can_resume() {
+        let mut config = crate::config::Config::default();
+        config.limits.api_timeout_ms = 60;
+        let state = Arc::new(Mutex::new(SharedState::with_config(config)));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let join = thread::spawn(move || {
+            handle_client(
+                server,
+                &state,
+                &AtomicBool::new(false),
+                &ToolProfile::default(),
+            )
+        });
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // An idle MCP session is persistent; only an incomplete frame expires.
+        thread::sleep(Duration::from_millis(90));
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["id"], 1);
+        let start = Instant::now();
+        let mut writer = client.try_clone().unwrap();
+        let drip = thread::spawn(move || {
+            for _ in 0..100 {
+                if writer.write_all(b" ").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let mut byte = [0];
+        assert_eq!(reader.read(&mut byte).unwrap(), 0);
+        let error = join.join().unwrap().unwrap_err();
+        drip.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_millis(800));
+    }
+
+    #[test]
+    fn coalesced_and_fragmented_frames_remain_separate_requests() {
+        let state = Arc::new(Mutex::new(SharedState::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let join = thread::spawn(move || {
+            handle_client(server, &state, &stopping, &ToolProfile::default())
+        });
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(b"{\"id\":1,\"method\":\"ping\"}\n{\"id\":")
+            .unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["id"], 1);
+        client.write_all(b"2,\"method\":\"ping\"}\n").unwrap();
+        response.clear();
+        reader.read_line(&mut response).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["id"], 2);
+        stop.store(true, Ordering::Relaxed);
+        drop(reader);
+        drop(client);
+        join.join().unwrap().unwrap();
     }
 }

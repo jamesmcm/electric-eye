@@ -371,6 +371,7 @@ mod tests {
     use electric_eye_core::{FileEvent, RenameEvent};
     fn entry(event: ObservedEvent) -> ActivityEntry {
         ActivityEntry {
+            executable_identity: None,
             ts_ms: 1000,
             syscall_result: Some(0),
             event_id: Some("test-event".into()),

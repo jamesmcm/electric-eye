@@ -102,22 +102,25 @@ Custom sensitive paths also populate the kernel read-open filter. Set
 your own list. Browser exemptions, high-churn application exclusions, bulk noise
 paths, suspicious executable locations, built-in authentication allowances and
 additional allowlist entries are configurable in this table. An allowlist
-`application` matches a process comm or absolute executable; `subject_prefix = "*"`
-suppresses every detection rule for that identity. `builtin_noise_allowlist`
-defaults to `true` and allowlists `tailscaled`, `thunar`, `git` and `cargo`; their activity
+`application` selects an absolute executable or an installed executable name
+resolved under `/usr/bin`, `/usr/lib`, or `/usr/lib/ssh`. Exemptions require the
+observed executable's device/inode to match a root-owned file beneath protected,
+non-writable directories. Process comm and desktop names never grant an exemption.
+`subject_prefix` matches path components; `"*"` grants a broad exemption for the
+verified executable. `builtin_noise_allowlist` defaults to `true` and allowlists `tailscaled`, `thunar`, `git` and `cargo`; their activity
 remains in history, but routine VPN churn and file-manager credential browsing
 do not become incidents. Set it to `false` to remove those built-ins.
 
-`ssh` is not globally allowlisted. An `ssh` process launched by `git` for a
-GitHub or GitLab remote is recognized contextually from its parent and
-command-line destination; those key reads and connections are suppressed.
-Other SSH use remains visible and can be allowlisted explicitly by destination.
-
-`known_hosts_allow = true` also treats an SSH destination present in the user's
+`ssh` is not globally allowlisted. A parent process named `git` does not grant
+trust. `known_hosts_allow = true` treats an SSH destination present in the user's
 `~/.ssh/known_hosts` or the system `ssh_known_hosts` as a trusted host for that
 SSH process. Plain, wildcard, port-qualified, and OpenSSH hashed (`|1|...`)
 entries are supported. This is a user-approved destination exception, not a
-general SSH allowlist; set it to `false` to disable it.
+general SSH allowlist; set it to `false` to disable it. This exception also
+requires a verified installed SSH executable. Known-host data is loaded in a
+bounded background worker and cached for up to 60 seconds. A cache miss leaves
+that SSH process eligible for alerts. Restart after executable upgrades to refresh
+the identities used for automatic exemptions.
 
 Destination allowlists apply to outbound connects and incoming accepts:
 
@@ -290,9 +293,14 @@ AUR/foreign packages are usually unsigned, so “unsigned_or_foreign” is a tru
 signal, not a malware verdict. Hashing is performed on demand for incidents and
 cached; it is not run for every syscall. Historical snapshots are retained
 across upgrades. If libalpm or package mtree data is unavailable, executable
-filesystem identity remains available.
+filesystem identity remains available. Trust checks hash an opened file only
+when its device/inode matches the observed actor. Missing or mismatched identities
+remain explicitly unverified. Cache keys include full modification/change times,
+size, and package-index generation; refreshes invalidate previous package results.
 Application grouping retains its reason and confidence; desktop files are read
-as data and never executed.
+as data and never executed. Desktop names and user-owned runtime metadata are
+loaded in bounded background workers; initial observations can retain executable
+names or generic namespace context until enrichment is available.
 
 `flows` reports successful application I/O bytes, excluding packet headers and
 retransmissions. Shared sockets keep their original owner and list contributing
@@ -321,7 +329,7 @@ reports kernel capture losses and storage drops; sustained whole-system load is
 not yet covered by a throughput benchmark.
 
 Legacy additional allowlist entries are also read from `/etc/electric-eye/allowlist.conf` (override with
-`ELECTRIC_EYE_ALLOWLIST`). Each line is `<comm-or-exe> <subject-prefix>`; `*`
+`ELECTRIC_EYE_ALLOWLIST`). Each line is `<installed-name-or-exe> <subject-prefix>`; `*`
 suppresses all rules for that identity. Known paths and network destinations
 from recent events/activities form a bounded baseline at startup, and deterministic
 standalone sensitive-path novelty alerts are suppressed for previously seen file

@@ -32,7 +32,7 @@ fn candidate_prefix(path: &str) -> Option<String> {
         "/target/",
         "/node_modules/",
         "/.hermes/",
-        "/dom6bot_runs/",
+        "/workload_runs/",
         "/logs/",
         "/.local/share/opencode/",
         "/var/lib/tailscale/",
@@ -337,8 +337,8 @@ mod tests {
     #[test]
     fn detects_high_churn_prefixes_but_not_sensitive_or_existing_filters() {
         assert_eq!(
-            candidate_prefix("/home/alice/dom6bot_runs/run-1/out.json").as_deref(),
-            Some("/home/alice/dom6bot_runs")
+            candidate_prefix("/home/alice/workload_runs/run-1/out.json").as_deref(),
+            Some("/home/alice/workload_runs")
         );
         assert_eq!(
             candidate_prefix("/home/alice/project/target/debug/out").as_deref(),
@@ -356,19 +356,19 @@ mod tests {
         let mut stats = HashMap::new();
         add_path(
             &mut stats,
-            "/home/alice/dom6bot_runs/run-1/out.json",
+            "/home/alice/workload_runs/run-1/out.json",
             "file.write",
             12,
             4096,
         );
         add_path(
             &mut stats,
-            "/home/alice/dom6bot_runs/run-2/out.json",
+            "/home/alice/workload_runs/run-2/out.json",
             "file.write",
             8,
             2048,
         );
-        let stat = stats.get("/home/alice/dom6bot_runs").unwrap();
+        let stat = stats.get("/home/alice/workload_runs").unwrap();
         assert_eq!(stat.events, 20);
         assert_eq!(stat.bytes, 6144);
         assert_eq!(stat.files.len(), 2);

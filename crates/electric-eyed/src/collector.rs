@@ -560,6 +560,11 @@ fn sensitive_read_prefixes() -> Vec<String> {
         "/root/.kube".to_string(),
     ];
 
+    prefixes.extend(
+        crate::credentials::SYSTEM
+            .iter()
+            .map(|path| (*path).to_string()),
+    );
     let Ok(passwd) = std::fs::read_to_string("/etc/passwd") else {
         return prefixes;
     };
@@ -572,29 +577,12 @@ fn sensitive_read_prefixes() -> Vec<String> {
         if !home.is_absolute() {
             continue;
         }
-        for relative in [
-            ".ssh",
-            ".gnupg",
-            ".aws",
-            ".azure",
-            ".kube",
-            ".config/gcloud",
-            ".config/gh",
-            ".config/keepassxc",
-            ".local/share/keyrings",
-            ".password-store",
-            ".git-credentials",
-            ".netrc",
-        ] {
+        for relative in crate::credentials::HOME
+            .iter()
+            .map(|(path, _)| *path)
+            .chain(crate::credentials::BROWSERS.iter().copied())
+        {
             prefixes.push(home.join(relative).display().to_string());
-        }
-        for browser in [
-            ".mozilla/firefox",
-            ".config/google-chrome",
-            ".config/chromium",
-            ".config/BraveSoftware/Brave-Browser",
-        ] {
-            prefixes.push(home.join(browser).display().to_string());
         }
     }
     prefixes.sort();

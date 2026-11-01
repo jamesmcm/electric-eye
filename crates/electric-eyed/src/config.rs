@@ -175,7 +175,7 @@ pub enum NetworkDirection {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkAllowRule {
-    /// Process comm, executable path, application name, or "*".
+    /// Protected executable path, installed executable name, or "*".
     pub application: String,
     /// Hostname suffix, exact IP, or CIDR (for example "github.com" or
     /// "192.168.0.0/16").
