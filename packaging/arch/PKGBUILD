@@ -9,7 +9,9 @@ license=('MIT')
 depends=('gcc-libs' 'sqlite' 'systemd-libs' 'pacman')
 makedepends=('rustup' 'clang' 'llvm' 'lld' 'bpf-linker' 'pkgconf' 'systemd')
 install=electric-eye.install
-options=('!strip')
+# Keep the BPF object intact, but do not ship the daemon's debug sources in the
+# main package.
+options=('!strip' '!debug')
 backup=('etc/electric-eye/allowlist.conf' 'etc/electric-eye/config.toml')
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
 sha256sums=('737fb35bec45eb9c733f725749d2fea414d5fee9d05ec4a379ed620bd1dbcca0')
@@ -24,8 +26,8 @@ build() {
   rustup toolchain install stable --profile minimal
   rustup default stable
   rustup toolchain install nightly-2026-01-20 --profile minimal --component rust-src
-  cargo xtask build-ebpf
   export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/build --remap-path-prefix=$HOME/.cargo=/build/cargo --remap-path-prefix=$HOME/.rustup=/build/rustup"
+  cargo xtask build-ebpf
   cargo build --release --locked -p electric-eyed -p electric-eye-cli
 }
 
