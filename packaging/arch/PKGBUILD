@@ -25,7 +25,7 @@ build() {
   rustup default stable
   rustup toolchain install nightly-2026-01-20 --profile minimal --component rust-src
   cargo xtask build-ebpf
-  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/build"
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/build --remap-path-prefix=$HOME/.cargo=/build/cargo --remap-path-prefix=$HOME/.rustup=/build/rustup"
   cargo build --release --locked -p electric-eyed -p electric-eye-cli
 }
 

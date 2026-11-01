@@ -170,9 +170,19 @@ fn ebpf_object_path(override_path: Option<&Path>) -> PathBuf {
     if installed.exists() {
         return installed;
     }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../")
-        .join(DEFAULT_OBJECT)
+    // Resolve the development build relative to the running binary so release
+    // packages do not embed the absolute source path. A cargo build places the
+    // binary at target/<profile>/electric-eyed and the BPF object at
+    // target/bpfel-unknown-none/release/electric-eye-ebpf.
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().skip(1).take(8) {
+            let candidate = ancestor.join(DEFAULT_OBJECT);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(DEFAULT_OBJECT)
 }
 
 fn socket_path(override_path: Option<&Path>) -> PathBuf {
@@ -866,7 +876,7 @@ fn run() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args == ["--help"] || args == ["-h"] {
         println!(
-            "electric-eyed — kernel activity monitor\n\nUSAGE: electric-eyed [--stdout] [--json] [--no-bpf] [--no-socket] [--no-mcp] [--no-db] [--socket <path>] [--mcp-socket <path>] [--mcp-tools <default|all|list>] [--db <path>] [--config <path>] [--ebpf-object <path>] [--check-config]\n\nThe read-only query API and MCP server use Unix sockets under /run/electric-eye by default. Use --no-socket or --no-mcp to disable either. Connect MCP clients through: electric-eye mcp\n\nUse --print-default-config to print every supported setting.\nConfiguration: ~/.config/electriceye/config.toml (TOML), --config or ELECTRIC_EYE_CONFIG; system fallback /etc/electric-eye/config.toml.\nLive queries remain available with --no-db; restart history requires SQLite."
+            "electric-eyed — kernel activity monitor\n\nUSAGE: electric-eyed [--stdout] [--json] [--no-bpf] [--no-socket] [--no-mcp] [--no-db] [--socket <path>] [--mcp-socket <path>] [--mcp-tools <default|all|list>] [--db <path>] [--config <path>] [--ebpf-object <path>] [--check-config]\n\nThe read-only query API and MCP server use Unix sockets under /run/electric-eye by default. Use --no-socket or --no-mcp to disable either. Connect MCP clients through: electric-eye mcp\n\nUse --print-default-config to print every supported setting.\nConfiguration: ~/.config/electric-eye/config.toml (TOML), --config or ELECTRIC_EYE_CONFIG; legacy ~/.config/electriceye/config.toml and system /etc/electric-eye/config.toml fallbacks.\nLive queries remain available with --no-db; restart history requires SQLite."
         );
         return ExitCode::SUCCESS;
     }
@@ -1252,7 +1262,10 @@ mod tests {
     #[test]
     fn parses_ebpf_object_override() {
         let parsed = opts(&["--ebpf-object", "/tmp/foo.o"]);
-        assert_eq!(parsed.object_override, Some(PathBuf::from("/tmp/foo.o")));
+        assert_eq!(
+            ebpf_object_path(parsed.object_override.as_deref()),
+            PathBuf::from("/tmp/foo.o")
+        );
     }
 
     #[test]
