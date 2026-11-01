@@ -7,7 +7,7 @@ use serde_json::Value;
 
 pub const DEFAULT_SOCKET: &str = "/run/electric-eye/electric-eye.sock";
 pub const DEFAULT_MCP_SOCKET: &str = "/run/electric-eye/mcp.sock";
-const TIMEOUT: Duration = Duration::from_secs(2);
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn request(socket: &Path, request: &Value) -> anyhow::Result<Value> {
     request_with_timeout(socket, request, TIMEOUT)

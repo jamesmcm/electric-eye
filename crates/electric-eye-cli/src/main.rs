@@ -556,11 +556,14 @@ fn run(command: &Command, options: &Options) -> anyhow::Result<i32> {
     if let Some(cursor) = &options.cursor {
         request["before_cursor"] = cursor.clone().into();
     }
-    let value = if matches!(command, Command::DbCompact) {
-        client::request_with_timeout(&options.socket, &request, Duration::from_secs(60))?
-    } else {
-        client::request(&options.socket, &request)?
+    let timeout = match command {
+        Command::DbCompact => Duration::from_secs(600),
+        Command::DbStatus | Command::Investigate(_) | Command::Export(_) => {
+            Duration::from_secs(120)
+        }
+        _ => Duration::from_secs(10),
     };
+    let value = client::request_with_timeout(&options.socket, &request, timeout)?;
     let mut value = value;
     if matches!(command, Command::Incidents)
         || matches!(command, Command::Export(kind) if kind == "incidents")
