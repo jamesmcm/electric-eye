@@ -136,7 +136,6 @@ and evidence model.
 | [Limitations](docs/LIMITATIONS.md) | bounded metadata, uncertainty and deferred work |
 | [Performance](docs/PERFORMANCE.md) | ring-buffer measurements and tuning |
 | [Toolchain](docs/TOOLCHAIN.md) | pinned nightly, LLVM and `bpf-linker` notes |
-| [0.1.0 release notes](docs/RELEASE_0.1.0.md) | initial release summary |
 
 ## Build from source
 
