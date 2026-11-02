@@ -181,7 +181,13 @@ durable history.
    prefixes to `ignore_paths` or `capture.noise_paths`. For example, a build
    workspace's `target` directory or a cache directory. Resolved paths are
    filtered in-kernel; unresolved paths still reach userspace and are marked
-   uncertain.
+   uncertain. `capture.auto_noise = true` (the default) also recognises
+   conventional output roots such as `target`, `build`, `dist`, `out`,
+   `artifacts`, `node_modules`, `__pycache__`, virtual environments and
+   `*_runs` directories. The first event under such a directory installs its
+   absolute prefix in the kernel filter, so every later event in that build or
+   run is dropped before it reaches the ring. Credential directories are
+   excluded from auto-noise.
 
 3. **Check whether loss is a burst or sustained**
 

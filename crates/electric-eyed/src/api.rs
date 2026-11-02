@@ -71,6 +71,7 @@ pub struct SharedState {
     incidents: VecDeque<Value>,
     store: Option<StoreClient>,
     capture_loss: Vec<u64>,
+    auto_noise_prefixes: Vec<String>,
     processes: crate::cache::Recent<crate::process::ProcessRecord>,
     documents: HashMap<String, crate::cache::Recent<Value>>,
     mcp_socket: Option<String>,
@@ -94,6 +95,7 @@ impl SharedState {
             incidents: VecDeque::new(),
             store: None,
             capture_loss: vec![],
+            auto_noise_prefixes: Vec::new(),
             processes: crate::cache::Recent::new(limits.process_entries),
             documents: HashMap::new(),
             mcp_socket: None,
@@ -194,6 +196,13 @@ impl SharedState {
         self.capture_loss = counts;
     }
 
+    pub fn add_auto_noise_prefix(&mut self, prefix: String) {
+        if !self.auto_noise_prefixes.iter().any(|item| item == &prefix) {
+            self.auto_noise_prefixes.push(prefix);
+            self.auto_noise_prefixes.sort();
+        }
+    }
+
     pub fn set_probes(&mut self, attached: Vec<String>, skipped: Vec<String>) {
         self.attached = attached;
         self.skipped = skipped;
@@ -241,6 +250,7 @@ impl SharedState {
             "events_total": self.events_total,
             "activity_buffered": self.activity.len(),
             "capture_loss": self.capture_loss,
+            "auto_noise_prefixes": self.auto_noise_prefixes,
             "mcp_socket": self.mcp_socket,
             "config": self.config,
         })

@@ -80,7 +80,9 @@ names are marked lexical. When no pathname exists, events retain the descriptor,
 `dirfd`/`cwd` context, and regular-file inode/device identity in a synthetic
 `unresolved:` path. Kernel event losses are exposed in `status` as
 `capture_loss` (ring, pending syscall, identity, and path failures; a path
-failure keeps the event but marks its path uncertain).
+failure keeps the event but marks its path uncertain). Runtime-generated output
+roots installed by automatic noise detection are listed in
+`status.auto_noise_prefixes`.
 
 ## Storage and retention
 
@@ -91,10 +93,10 @@ User-owned desktop, known-host and runtime metadata is read through bounded
 workers so those files cannot stall kernel event consumption. Retention is tiered:
 
 - raw events: 5 minutes
-- general activity buckets: 30 days
-- process/exec history: 30 days
-- flow documents: 30 days
-- summary documents: 30 days
+- general activity buckets: 7 days
+- process/exec history: 7 days
+- flow documents: 7 days
+- summary documents: 7 days
 - heuristic summaries (likely noise): 7 days
 - low-severity incidents: 30 days
 - medium-severity incidents: 90 days

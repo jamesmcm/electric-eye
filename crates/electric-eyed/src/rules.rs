@@ -37,24 +37,47 @@ impl Severity {
 #[derive(Debug, Clone, Default)]
 pub struct BaselineData {
     paths: HashSet<(String, String)>,
-    network: HashSet<(String, String)>,
+    network: crate::bloom::BloomFilter,
     network_counts: HashMap<String, usize>,
 }
 
+/// Network baselines and deduplication keys use the IP:port endpoint without
+/// the optional reverse-DNS label. The same destination must not look novel
+/// merely because one observation had a hostname and another did not.
+fn network_key(destination: &str) -> &str {
+    destination
+        .split_once(" (")
+        .map_or(destination, |(endpoint, _)| endpoint)
+}
+
 impl BaselineData {
+    #[cfg(test)]
     pub fn from_pairs(
         paths: impl IntoIterator<Item = (String, String)>,
         network: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
+        Self::from_pairs_with_capacity(paths, network, 65_536)
+    }
+
+    pub fn from_pairs_with_capacity(
+        paths: impl IntoIterator<Item = (String, String)>,
+        network: impl IntoIterator<Item = (String, String)>,
+        capacity: usize,
+    ) -> Self {
         let paths: HashSet<(String, String)> = paths.into_iter().collect();
-        let network: HashSet<(String, String)> = network.into_iter().collect();
+        let mut filter = crate::bloom::BloomFilter::for_entries(capacity);
         let mut network_counts = HashMap::new();
-        for (comm, _) in &network {
-            *network_counts.entry(comm.clone()).or_insert(0) += 1;
+        for (comm, destination) in network {
+            let destination = network_key(&destination);
+            if filter.contains(&comm, destination) {
+                continue;
+            }
+            filter.insert(&comm, destination);
+            *network_counts.entry(comm).or_insert(0) += 1;
         }
         Self {
             paths,
-            network,
+            network: filter,
             network_counts,
         }
     }
@@ -64,8 +87,20 @@ impl BaselineData {
     }
 
     pub fn knows_network(&self, comm: &str, destination: &str) -> bool {
-        self.network
-            .contains(&(comm.to_string(), destination.to_string()))
+        self.network.contains(comm, network_key(destination))
+    }
+
+    /// Learn a destination after the first observation so that only the first
+    /// contact is reported as novel. Without this, a long-running daemon keeps
+    /// re-reporting every destination first seen after startup. A Bloom filter
+    /// keeps this state bounded even on hosts that contact many endpoints.
+    pub fn learn_network(&mut self, comm: &str, destination: &str) {
+        let destination = network_key(destination);
+        if self.network.contains(comm, destination) {
+            return;
+        }
+        self.network.insert(comm, destination);
+        *self.network_counts.entry(comm.to_string()).or_insert(0) += 1;
     }
 
     pub fn network_destination_count(&self, comm: &str) -> usize {
@@ -97,6 +132,7 @@ impl Allowlist {
                 "sshd",
                 "systemd-userdbd",
                 "pwck",
+                "grpck",
                 "chage",
                 "passwd",
                 "gpasswd",
@@ -111,7 +147,7 @@ impl Allowlist {
                 "groupmod",
                 "groupdel",
             ] {
-                for path in ["/etc/shadow", "/etc/passwd", "/etc/gshadow"] {
+                for path in ["/etc/shadow", "/etc/gshadow"] {
                     allowlist.add(comm, path);
                 }
             }
@@ -175,11 +211,40 @@ impl Allowlist {
             let Ok(path) = path.canonicalize() else {
                 continue;
             };
-            if !path.ancestors().all(|ancestor| {
-                use std::os::unix::fs::MetadataExt;
-                std::fs::metadata(ancestor)
-                    .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
-            }) {
+            if !trusted_path(&path) {
+                continue;
+            }
+            if path.is_dir() {
+                // Browser prefixes are usually package directories rather
+                // than the executable itself (for example
+                // /usr/lib/firefox/firefox). Register executable children so
+                // the browser exemption can verify the actual binary.
+                let Ok(entries) = std::fs::read_dir(&path) else {
+                    continue;
+                };
+                let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                children.sort();
+                for child in children {
+                    if !trusted_path(&child) {
+                        continue;
+                    }
+                    let Ok(file) = crate::metadata::open_regular(&child, 512 * 1024 * 1024) else {
+                        continue;
+                    };
+                    let Ok(metadata) = file.metadata() else {
+                        continue;
+                    };
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.mode() & 0o111 == 0 {
+                        continue;
+                    }
+                    let child = child.to_string_lossy().into_owned();
+                    self.identities.insert(
+                        child.clone(),
+                        crate::provenance::FileIdentity::from_metadata(&metadata),
+                    );
+                    paths.push(child);
+                }
                 continue;
             }
             let Ok(file) = crate::metadata::open_regular(&path, 512 * 1024 * 1024) else {
@@ -298,15 +363,8 @@ impl AnomalyEngine {
             .into_iter()
             .take(config.max_baseline_entries)
             .collect();
-        baseline.network = baseline
-            .network
-            .into_iter()
-            .take(config.max_baseline_entries)
-            .collect();
-        baseline.network_counts.clear();
-        for (app, _) in &baseline.network {
-            *baseline.network_counts.entry(app.clone()).or_default() += 1;
-        }
+        // The network baseline is already a bounded Bloom filter built with
+        // the configured capacity; it cannot be truncated further.
         for application in config
             .high_churn_apps
             .iter()
@@ -516,7 +574,7 @@ impl AnomalyEngine {
                 let title = format!("Sensitive path access: {category}");
                 if self.config.sensitive_path
                     && !known
-                    && self.should_emit(&title, &app, Some(path), now)
+                    && self.should_emit(&title, &app, Some(category.as_str()), now)
                 {
                     incidents.push(Incident {
                         id: String::new(),
@@ -599,15 +657,10 @@ impl AnomalyEngine {
         let (pid, _, comm) = event_identity(&entry.event);
         let now = entry.ts_ms;
         let unit = entry.unit.as_deref();
-        if !self.config.bulk_mutation
-            || self
-                .allowlist
-                .executable(entry)
-                .is_some_and(|path| is_high_churn_app(path, &self.config))
-        {
+        if !self.config.bulk_mutation || self.high_churn_entry(entry) {
             return;
         }
-        let (unique_count, files, files_truncated, scope, severity) = {
+        let (unique_count, files, files_truncated, scope, severity, fresh_output) = {
             let Some(window) = self.mutations.get_mut(actor) else {
                 return;
             };
@@ -619,13 +672,22 @@ impl AnomalyEngine {
             }
             let unique: HashSet<&str> = window.iter().map(|(_, path)| path.as_str()).collect();
             let (scope, severity) = bulk_scope(unique.iter().copied(), home);
+            let fresh_output = severity == Severity::Low
+                && mostly_recent_creations(unique.iter().copied(), now, self.config.bulk_window_ms);
             let mut files: Vec<String> = unique.iter().map(|path| (*path).to_string()).collect();
             files.sort();
             let truncated = files.len() > 32;
             files.truncate(32);
-            (unique.len(), files, truncated, scope, severity)
+            (
+                unique.len(),
+                files,
+                truncated,
+                scope,
+                severity,
+                fresh_output,
+            )
         };
-        if unique_count >= self.config.bulk_file_threshold {
+        if unique_count >= self.config.bulk_file_threshold && !fresh_output {
             let title = "Bulk filesystem mutation".to_string();
             if self.should_emit(&title, app, None, now) {
                 incidents.push(Incident {
@@ -716,10 +778,7 @@ impl AnomalyEngine {
         if !self.config.incoming_connections
             || net.local_port == 0
             || net.addr == [0; 16]
-            || self
-                .allowlist
-                .executable(entry)
-                .is_some_and(|path| is_high_churn_app(path, &self.config))
+            || self.high_churn_entry(entry)
         {
             return;
         }
@@ -730,17 +789,22 @@ impl AnomalyEngine {
         if ip.is_unspecified() {
             return;
         }
-        let source_scope = if is_loopback_ip(ip) {
+        let source_scope = if crate::net_context::is_tailscale_ip(ip) {
+            "tailscale"
+        } else if is_loopback_ip(ip) {
             "same_machine"
         } else if is_private_ip(ip) {
             "local_network"
         } else {
             "remote"
         };
-        if source_scope != "remote" && !self.config.incoming_local_connections {
+        if matches!(source_scope, "same_machine" | "local_network")
+            && !self.config.incoming_local_connections
+        {
             return;
         }
         let source_label = match source_scope {
+            "tailscale" => "Tailscale",
             "same_machine" => "same machine",
             "local_network" => "local network",
             _ => "remote",
@@ -756,8 +820,8 @@ impl AnomalyEngine {
             process: None,
             exe: None,
             ts_ms: entry.ts_ms,
-            // A remote source is materially more exposed than a local or
-            // same-machine peer.
+            // A public remote source is materially more exposed than a local,
+            // same-machine, or Tailscale peer.
             severity: if source_scope == "remote" {
                 Severity::High
             } else {
@@ -800,6 +864,9 @@ impl AnomalyEngine {
         }
         let app = app_key(entry);
         let destination = net.remote_endpoint();
+        let destination_scope = net_ip(net)
+            .map(crate::net_context::address_scope)
+            .unwrap_or("unknown");
         let direction = if matches!(&entry.event, ObservedEvent::Accept(_)) {
             crate::config::NetworkDirection::Inbound
         } else {
@@ -812,7 +879,16 @@ impl AnomalyEngine {
             self.observe_incoming(entry, net, &app, incidents);
             return;
         }
-        if self.allowlist.allows_entry(entry, &destination) || !is_public_destination(net) {
+        if self.allowlist.allows_entry(entry, &destination) {
+            return;
+        }
+        // MagicDNS is the local Tailscale resolver, not an application
+        // destination. Other Tailscale peers are handled explicitly below.
+        if destination_scope == "tailscale-magicdns" {
+            return;
+        }
+        let tailscale_peer = destination_scope == "tailscale";
+        if !is_public_destination(net) && !tailscale_peer {
             return;
         }
         let is_connect = matches!(&entry.event, ObservedEvent::Connect(_));
@@ -822,7 +898,7 @@ impl AnomalyEngine {
 
         let recent = {
             let Some(window) = self.sensitive.get(&timeline_key(entry)) else {
-                self.maybe_novel_network(entry, net, &app, &destination, incidents);
+                self.maybe_novel_network(entry, &app, &destination, destination_scope, incidents);
                 return;
             };
             window
@@ -850,6 +926,7 @@ impl AnomalyEngine {
                         "category": category,
                         "sensitive_ts_ms": ts,
                         "destination": destination,
+                        "destination_scope": destination_scope,
                         "unit": entry.unit,
                     }),
                 });
@@ -857,63 +934,78 @@ impl AnomalyEngine {
             return;
         }
 
-        self.maybe_novel_network(entry, net, &app, &destination, incidents);
+        self.maybe_novel_network(entry, &app, &destination, destination_scope, incidents);
     }
 
     fn maybe_novel_network(
         &mut self,
         entry: &ActivityEntry,
-        net: &NetEvent,
         app: &str,
         destination: &str,
+        destination_scope: &str,
         incidents: &mut Vec<Incident>,
     ) {
-        if !self.config.novel_network
-            || self
-                .allowlist
-                .executable(entry)
-                .is_some_and(|path| is_high_churn_app(path, &self.config))
-        {
+        if !self.config.novel_network || self.high_churn_entry(entry) {
             return;
         }
         let known = self.baseline.knows_network(app, destination);
         let count = self.baseline.network_destination_count(app);
         if !known && count >= self.config.novel_network_min_destinations {
-            self.emit_novel_network(entry, net, app, destination, count, incidents);
+            self.emit_novel_network(entry, app, destination, destination_scope, count, incidents);
         }
+        // A destination is novel only on first contact. Recording it here also
+        // covers destinations observed while the daemon is running, not just
+        // the startup baseline loaded from history.
+        self.baseline.learn_network(app, destination);
     }
 
     fn emit_novel_network(
         &mut self,
         entry: &ActivityEntry,
-        net: &NetEvent,
         app: &str,
         destination: &str,
+        destination_scope: &str,
         known_count: usize,
         incidents: &mut Vec<Incident>,
     ) {
-        let title = "Novel network destination".to_string();
-        if self.should_emit(&title, app, Some(destination), entry.ts_ms) {
+        let (title, severity) = if destination_scope == "tailscale" {
+            ("Novel Tailscale destination", Severity::Low)
+        } else {
+            ("Novel network destination", Severity::Medium)
+        };
+        if self.should_emit(title, app, Some(network_key(destination)), entry.ts_ms) {
+            let (pid, _, comm) = event_identity(&entry.event);
             incidents.push(Incident {
                 id: String::new(),
                 process: None,
                 exe: None,
                 ts_ms: entry.ts_ms,
-                severity: Severity::Medium,
-                title,
-                pid: net.pid,
-                comm: net.comm.clone(),
+                severity,
+                title: title.to_string(),
+                pid,
+                comm,
                 path: Some(destination.to_string()),
                 unit: entry.unit.clone(),
                 details: json!({
                     "rule": "novel_network",
                     "destination": destination,
+                    "destination_scope": destination_scope,
                     "known_destinations": known_count,
                     "app": app,
                     "unit": entry.unit,
                 }),
             });
         }
+    }
+
+    /// High-churn suppression is a noise policy, not a trust boundary. Match
+    /// the observed executable and comm directly so a missing allowlist
+    /// registration (for example `transmission-gtk` without a `transmission`
+    /// symlink) cannot turn a P2P client into a flood of novel destinations.
+    fn high_churn_entry(&self, entry: &ActivityEntry) -> bool {
+        let exe = entry.exe.as_deref().unwrap_or_default();
+        let (_, _, comm) = event_identity(&entry.event);
+        is_high_churn_app(exe, &self.config) || is_high_churn_app(&comm, &self.config)
     }
 
     fn should_emit(&mut self, title: &str, comm: &str, path: Option<&str>, now: u64) -> bool {
@@ -971,6 +1063,14 @@ fn app_key(entry: &ActivityEntry) -> String {
         .unwrap_or_else(|| event_identity(&entry.event).2)
 }
 
+fn trusted_path(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    path.ancestors().all(|ancestor| {
+        std::fs::metadata(ancestor)
+            .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
+    })
+}
+
 pub(crate) fn is_browser_app(app: &str, config: &crate::config::RuleConfig) -> bool {
     config
         .browser_prefixes
@@ -983,6 +1083,9 @@ pub(crate) fn is_browser_app(app: &str, config: &crate::config::RuleConfig) -> b
                 .any(|name| app.contains(name))
 }
 fn is_bulk_noise_path(path: &str, config: &crate::config::RuleConfig) -> bool {
+    if crate::auto_noise::looks_generated(path) {
+        return true;
+    }
     let path = path.to_ascii_lowercase();
     config
         .bulk_noise_paths
@@ -1031,6 +1134,36 @@ pub(crate) fn bulk_scope<'a>(
     } else {
         ("multiple_directories", Severity::Medium)
     }
+}
+
+/// A single-directory burst that mostly creates new files is build output,
+/// screen captures, generated caches, or similar work product, not a bulk
+/// mutation of existing data. Birth times are unavailable on some filesystems;
+/// in that case keep the existing conservative behavior.
+fn mostly_recent_creations<'a>(
+    paths: impl Iterator<Item = &'a str>,
+    now: u64,
+    window_ms: u64,
+) -> bool {
+    let cutoff = now.saturating_sub(window_ms);
+    let mut total = 0usize;
+    let mut recent = 0usize;
+    for path in paths {
+        total += 1;
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        let Ok(created) = metadata.created() else {
+            continue;
+        };
+        let Ok(created) = created.duration_since(std::time::UNIX_EPOCH) else {
+            continue;
+        };
+        if created.as_millis() as u64 >= cutoff {
+            recent += 1;
+        }
+    }
+    total > 0 && recent.saturating_mul(10) >= total.saturating_mul(9)
 }
 
 fn common_parent(paths: &[std::path::PathBuf]) -> std::path::PathBuf {
@@ -1313,17 +1446,26 @@ fn ip_in_cidr(ip: IpAddr, base: IpAddr, prefix: u32) -> bool {
     }
 }
 
-fn is_public_destination(net: &NetEvent) -> bool {
-    let ip = match net.family {
-        electric_eye_core::event::AF_INET => IpAddr::V4(Ipv4Addr::new(
+fn net_ip(net: &NetEvent) -> Option<IpAddr> {
+    match net.family {
+        electric_eye_core::event::AF_INET => Some(IpAddr::V4(Ipv4Addr::new(
             net.addr[0],
             net.addr[1],
             net.addr[2],
             net.addr[3],
-        )),
-        electric_eye_core::event::AF_INET6 => IpAddr::V6(Ipv6Addr::from(net.addr)),
-        _ => return false,
+        ))),
+        electric_eye_core::event::AF_INET6 => Some(IpAddr::V6(Ipv6Addr::from(net.addr))),
+        _ => None,
+    }
+}
+
+fn is_public_destination(net: &NetEvent) -> bool {
+    let Some(ip) = net_ip(net) else {
+        return false;
     };
+    if crate::net_context::is_tailscale_ip(ip) {
+        return false;
+    }
     match ip {
         IpAddr::V4(ip) => {
             !ip.is_private()
@@ -1396,6 +1538,11 @@ mod tests {
             classify_with_home("/home/alice/.ssh/id_ed25519.pub", Some(home)),
             None
         );
+        assert_eq!(classify_with_home("/etc/passwd", None), None);
+        assert_eq!(
+            classify_with_home("/etc/shadow", None).map(|v| v.0),
+            Some("System credentials")
+        );
         assert_eq!(classify_with_home("/etc/ssh/moduli", None), None);
         assert_eq!(classify_with_home("/etc/ssh/ssh_config", None), None);
         assert_eq!(
@@ -1409,6 +1556,15 @@ mod tests {
         assert_eq!(
             classify_with_home("/home/alice/.ssh/known_hosts.old", Some(home)),
             None
+        );
+        assert_eq!(
+            classify_with_home("/home/alice/.config/gh/hosts.yml", Some(home)).map(|v| v.0),
+            Some("GitHub CLI credentials")
+        );
+        assert_eq!(
+            classify_with_home("/home/alice/.config/gh/config.yml", Some(home)),
+            None,
+            "gh preferences do not contain credentials"
         );
     }
 
@@ -1458,6 +1614,20 @@ mod tests {
         };
         let allowlist = Allowlist::load(&disabled);
         assert!(allowlist.rules.is_empty());
+    }
+
+    #[test]
+    fn grpck_is_a_builtin_auth_exemption() {
+        if !Path::new("/usr/bin/grpck").exists() {
+            return;
+        }
+        let allowlist = Allowlist::load_default();
+        assert!(
+            allowlist
+                .rules
+                .iter()
+                .any(|(path, prefix)| { path == "/usr/bin/grpck" && prefix == "/etc/gshadow" })
+        );
     }
 
     #[test]
@@ -1547,34 +1717,77 @@ mod tests {
 
     #[test]
     fn browser_credential_writes_are_not_incidents() {
-        let mut engine = AnomalyEngine::new();
-        let entry = ActivityEntry {
-            executable_identity: None,
-            ts_ms: 1_000,
-            syscall_result: None,
-            event_id: None,
-            process_info: None,
-            application: None,
-            process: None,
-            path_resolution: None,
-            event: ObservedEvent::FileWrite(electric_eye_core::FileEvent {
-                pid: 10,
-                uid: 1000,
-                comm: "sqldb:c~lite #9".into(),
-                path: "/home/alice/.mozilla/firefox/x/cookies.sqlite".into(),
-                kind: FileKind::Write,
-                bytes: Some(4096),
-                count: Some(1),
-            }),
-            unit: None,
-            nix: None,
-            parent: None,
-            exe: Some("/usr/lib/firefox/firefox".into()),
-        };
-        let mut entry = entry;
-        entry.executable_identity =
-            Some(engine.allowlist.trust_fixture("/usr/lib/firefox/firefox"));
-        assert!(engine.observe(&entry).is_empty());
+        for exe in [
+            "/usr/lib/firefox/firefox",
+            "/usr/lib/firefox-developer-edition/firefox",
+        ] {
+            let mut engine = AnomalyEngine::new();
+            let mut entry = ActivityEntry {
+                executable_identity: None,
+                ts_ms: 1_000,
+                syscall_result: None,
+                event_id: None,
+                process_info: None,
+                application: None,
+                process: None,
+                path_resolution: None,
+                event: ObservedEvent::FileWrite(electric_eye_core::FileEvent {
+                    pid: 10,
+                    uid: 1000,
+                    comm: "sqldb:c~lite #9".into(),
+                    path: "/home/alice/.mozilla/firefox/x/cookies.sqlite".into(),
+                    kind: FileKind::Write,
+                    bytes: Some(4096),
+                    count: Some(1),
+                }),
+                unit: None,
+                nix: None,
+                parent: None,
+                exe: Some(exe.into()),
+            };
+            entry.executable_identity = Some(engine.allowlist.trust_fixture(exe));
+            assert!(engine.observe(&entry).is_empty(), "{exe}");
+        }
+    }
+
+    #[test]
+    fn browser_directory_prefixes_register_the_actual_binary() {
+        for exe in [
+            "/usr/lib/firefox/firefox",
+            "/usr/lib/firefox-developer-edition/firefox",
+        ] {
+            let Ok(metadata) = std::fs::metadata(exe) else {
+                continue;
+            };
+            let mut engine = AnomalyEngine::new();
+            let entry = ActivityEntry {
+                executable_identity: Some(crate::provenance::FileIdentity::from_metadata(
+                    &metadata,
+                )),
+                ts_ms: 0,
+                syscall_result: None,
+                event_id: None,
+                process_info: None,
+                application: None,
+                process: None,
+                path_resolution: None,
+                event: ObservedEvent::FileWrite(electric_eye_core::FileEvent {
+                    pid: 10,
+                    uid: 1000,
+                    comm: "firefox".into(),
+                    path: "/home/archie/.mozilla/firefox/test.default/cookies.sqlite".into(),
+                    kind: FileKind::Write,
+                    bytes: Some(4096),
+                    count: Some(1),
+                }),
+                unit: None,
+                nix: None,
+                parent: None,
+                exe: Some(exe.into()),
+            };
+            assert_eq!(engine.allowlist.executable(&entry), Some(exe), "{exe}");
+            assert!(engine.observe(&entry).is_empty(), "{exe}");
+        }
     }
 
     #[test]
@@ -1595,6 +1808,16 @@ mod tests {
             "/usr/lib/firefox/firefox",
             &crate::config::RuleConfig::default()
         ));
+        assert!(is_high_churn_app(
+            "/usr/lib/firefox-developer-edition/firefox",
+            &crate::config::RuleConfig::default()
+        ));
+        for app in ["steam", "steamwebhelper", "spotify", "yt-dlp", "youtube-dl"] {
+            assert!(
+                is_high_churn_app(app, &crate::config::RuleConfig::default()),
+                "{app}"
+            );
+        }
         assert!(!is_high_churn_app(
             "/usr/bin/python3",
             &crate::config::RuleConfig::default()
@@ -1715,6 +1938,247 @@ mod correlation_regressions {
                 .any(|i| i.details["rule"] == "bulk_mutation")
         );
     }
+    #[test]
+    fn freshly_created_output_is_not_bulk_mutation() {
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let probe = dir.path().join("birth-time-probe");
+        std::fs::write(&probe, b"x").unwrap();
+        if std::fs::symlink_metadata(&probe)
+            .unwrap()
+            .created()
+            .is_err()
+        {
+            // The filter intentionally falls back to reporting when birth time
+            // is unavailable, so this assertion only applies to supporting
+            // filesystems.
+            return;
+        }
+        std::fs::remove_file(&probe).unwrap();
+        let mut config = crate::config::RuleConfig {
+            bulk_file_threshold: 2,
+            ..Default::default()
+        };
+        config.dedup_window_ms = 0;
+        let mut engine =
+            AnomalyEngine::configured(BaselineData::default(), Allowlist::default(), config);
+        let mut incidents = Vec::new();
+        for index in 0..4 {
+            let path = dir.path().join(format!("{index}.json"));
+            std::fs::write(&path, b"output").unwrap();
+            let mut entry = file(path.to_str().unwrap(), FileKind::Write);
+            entry.ts_ms = now_ms();
+            incidents.extend(engine.observe(&entry));
+        }
+        assert!(
+            !incidents
+                .iter()
+                .any(|incident| incident.details["rule"] == "bulk_mutation")
+        );
+    }
+
+    #[test]
+    fn novel_network_destinations_are_learned_after_first_contact() {
+        let baseline = BaselineData::from_pairs(
+            [],
+            [("/opt/test-app".to_string(), "1.1.1.1:443".to_string())],
+        );
+        let mut config = crate::config::RuleConfig {
+            novel_network_min_destinations: 1,
+            ..Default::default()
+        };
+        config.dedup_window_ms = 0;
+        let mut engine = AnomalyEngine::configured(baseline, Allowlist::default(), config);
+        let mut first = network();
+        first.ts_ms = 1_000_000;
+        assert!(
+            engine
+                .observe(&first)
+                .iter()
+                .any(|incident| incident.details["rule"] == "novel_network")
+        );
+        let mut second = network();
+        second.ts_ms = 1_000_001;
+        assert!(
+            !engine
+                .observe(&second)
+                .iter()
+                .any(|incident| incident.details["rule"] == "novel_network")
+        );
+    }
+
+    #[test]
+    fn network_baseline_ignores_optional_hostname_label() {
+        let baseline = BaselineData::from_pairs(
+            [],
+            [(
+                "/opt/test-app".to_string(),
+                "8.8.8.8:443 (dns.google)".to_string(),
+            )],
+        );
+        let mut config = crate::config::RuleConfig {
+            novel_network_min_destinations: 1,
+            ..Default::default()
+        };
+        config.dedup_window_ms = 0;
+        let mut engine = AnomalyEngine::configured(baseline, Allowlist::default(), config);
+        assert!(engine.observe(&network()).is_empty());
+
+        let mut resolved = network();
+        if let ObservedEvent::Connect(net) = &mut resolved.event {
+            net.hostname = Some("dns.google".into());
+        }
+        let baseline = BaselineData::from_pairs(
+            [],
+            [("/opt/test-app".to_string(), "8.8.8.8:443".to_string())],
+        );
+        let mut config = crate::config::RuleConfig {
+            novel_network_min_destinations: 1,
+            ..Default::default()
+        };
+        config.dedup_window_ms = 0;
+        let mut engine = AnomalyEngine::configured(baseline, Allowlist::default(), config);
+        assert!(engine.observe(&resolved).is_empty());
+    }
+
+    #[test]
+    fn tailscale_magic_dns_is_not_a_public_destination() {
+        let mut entry = network();
+        if let ObservedEvent::Connect(net) = &mut entry.event {
+            net.addr = [100, 100, 100, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            net.remote_port = 53;
+        }
+        let ObservedEvent::Connect(net) = &entry.event else {
+            unreachable!();
+        };
+        assert!(!is_public_destination(net));
+        assert_eq!(
+            crate::net_context::address_scope(net_ip(net).unwrap()),
+            "tailscale-magicdns"
+        );
+    }
+
+    fn with_destination(mut entry: ActivityEntry, addr: [u8; 4], port: u16) -> ActivityEntry {
+        if let ObservedEvent::Connect(net) = &mut entry.event {
+            net.addr = [
+                addr[0], addr[1], addr[2], addr[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ];
+            net.remote_port = port;
+        }
+        entry
+    }
+
+    #[test]
+    fn high_churn_matches_without_an_allowlist_registration() {
+        let engine = AnomalyEngine::new();
+        let mut entry = network();
+        entry.exe = Some("/usr/bin/transmission-gtk".into());
+        if let ObservedEvent::Connect(net) = &mut entry.event {
+            net.comm = "transmission-gt".into();
+        }
+        assert!(engine.high_churn_entry(&entry));
+    }
+
+    #[test]
+    fn tailscale_magic_dns_is_not_novel_or_egress() {
+        let mut engine = AnomalyEngine::new();
+        engine.observe(&file("/root/.ssh/key", FileKind::Read));
+        let incidents = engine.observe(&with_destination(network(), [100, 100, 100, 100], 53));
+        assert!(!incidents.iter().any(|i| matches!(
+            i.details["rule"].as_str(),
+            Some("novel_network" | "sensitive_egress")
+        )));
+    }
+
+    #[test]
+    fn tailscale_peers_get_a_specific_low_severity_novel_alert() {
+        let mut config = crate::config::RuleConfig {
+            novel_network_min_destinations: 1,
+            ..Default::default()
+        };
+        config.dedup_window_ms = 0;
+        let baseline = BaselineData::from_pairs(
+            [],
+            [("/opt/test-app".to_string(), "1.1.1.1:443".to_string())],
+        );
+        let mut engine = AnomalyEngine::configured(baseline, Allowlist::default(), config);
+        let mut entry = with_destination(network(), [100, 100, 100, 101], 443);
+        entry.ts_ms = 1_000_000;
+        let incidents = engine.observe(&entry);
+        let incident = incidents
+            .iter()
+            .find(|i| i.details["rule"] == "novel_network")
+            .unwrap_or_else(|| panic!("tailscale peer should be novel: {incidents:?}"));
+        assert_eq!(incident.title, "Novel Tailscale destination");
+        assert_eq!(incident.severity, Severity::Low);
+        assert_eq!(incident.details["destination_scope"], "tailscale");
+        let mut second = entry;
+        second.ts_ms = 1_000_001;
+        assert!(
+            !engine
+                .observe(&second)
+                .iter()
+                .any(|i| i.details["rule"] == "novel_network")
+        );
+    }
+
+    #[test]
+    fn sensitive_egress_to_a_tailscale_peer_keeps_the_scope() {
+        let mut engine = AnomalyEngine::new();
+        engine.observe(&file("/root/.ssh/key", FileKind::Read));
+        let incidents = engine.observe(&with_destination(network(), [100, 100, 100, 101], 443));
+        let incident = incidents
+            .iter()
+            .find(|i| i.details["rule"] == "sensitive_egress")
+            .expect("tailscale peer egress should be flagged");
+        assert_eq!(incident.details["destination_scope"], "tailscale");
+    }
+
+    #[test]
+    fn incoming_tailscale_connections_are_scoped_separately() {
+        let mut entry = network();
+        entry.event = ObservedEvent::Accept(NetEvent {
+            pid: 123,
+            uid: 1000,
+            comm: "test-app".into(),
+            family: 2,
+            addr: [100, 100, 100, 101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            local_port: 22,
+            remote_port: 45_000,
+            hostname: Some("peer.tailnet".into()),
+            fd: None,
+        });
+        let incidents = AnomalyEngine::new().observe(&entry);
+        let incident = incidents
+            .iter()
+            .find(|i| i.details["rule"] == "incoming_connection")
+            .expect("tailscale inbound should be reported");
+        assert_eq!(incident.details["source_scope"], "tailscale");
+        assert_eq!(incident.severity, Severity::Medium);
+    }
+
+    #[test]
+    fn one_sensitive_path_incident_per_category_and_actor() {
+        let mut engine = AnomalyEngine::new();
+        let mut incidents =
+            engine.observe(&file("/home/alice/.config/gh/config.yml", FileKind::Read));
+        incidents.extend(engine.observe(&file("/home/alice/.config/gh/hosts.yml", FileKind::Read)));
+        assert_eq!(
+            incidents
+                .iter()
+                .filter(|incident| incident.details["rule"] == "sensitive_path")
+                .count(),
+            1
+        );
+        let other = engine.observe(&file("/home/alice/.ssh/id_ed25519", FileKind::Read));
+        assert_eq!(
+            other
+                .iter()
+                .filter(|incident| incident.details["rule"] == "sensitive_path")
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn bulk_scope_separates_project_workloads_from_broad_mutation() {
         let home = Path::new("/home/alice");

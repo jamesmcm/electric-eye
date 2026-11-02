@@ -104,27 +104,52 @@ fn desktop_command(line: &str) -> Option<String> {
 fn basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
 }
+const TERMINALS: &[&str] = &[
+    "alacritty",
+    "cool-retro-term",
+    "foot",
+    "ghostty",
+    "gnome-terminal-server",
+    "kitty",
+    "konsole",
+    "lxterminal",
+    "mate-terminal",
+    "sakura",
+    "st",
+    "terminator",
+    "tilix",
+    "urxvt",
+    "wezterm",
+    "wezterm-gui",
+    "xfce4-terminal",
+    "xterm",
+];
+
 fn launcher(exe: &str) -> bool {
-    matches!(
-        basename(exe),
-        "bash"
-            | "sh"
-            | "dash"
-            | "zsh"
-            | "fish"
-            | "nu"
-            | "i3"
-            | "sway"
-            | "Hyprland"
-            | "systemd"
-            | "alacritty"
-            | "kitty"
-            | "foot"
-            | "wezterm-gui"
-            | "konsole"
-            | "gnome-terminal-server"
-            | "xterm"
-    )
+    let exe = basename(exe);
+    TERMINALS.contains(&exe)
+        || matches!(
+            exe,
+            "bash" | "sh" | "dash" | "zsh" | "fish" | "nu" | "i3" | "sway" | "Hyprland" | "systemd"
+        )
+}
+
+/// Terminal emulators put every surface in a broad `app-<terminal>-...scope`
+/// cgroup. Treating that scope as an application merges unrelated commands
+/// (and their children) into whichever program ran first.
+fn terminal_scope(group: &str) -> bool {
+    group.split('/').any(|component| {
+        let Some(name) = component.strip_prefix("app-") else {
+            return false;
+        };
+        let name = name
+            .strip_suffix(".scope")
+            .or_else(|| name.strip_suffix(".service"))
+            .unwrap_or(name);
+        TERMINALS.iter().any(|terminal| {
+            name == *terminal || (terminal.len() >= 4 && name.starts_with(&format!("{terminal}-")))
+        })
+    })
 }
 fn interpreted_program(p: &ProcessRecord, exe: &str) -> Option<String> {
     let (name, args) = unwrap_launchers(basename(exe), p.argv.get(1..).unwrap_or_default());
@@ -513,9 +538,10 @@ impl Groups {
             && !inherited_task
             && !launched_task
             && let Some(group) = p.cgroup.as_ref().filter(|g| {
-                g.split('/').any(|s| {
-                    s.starts_with("app-") && (s.ends_with(".scope") || s.ends_with(".service"))
-                })
+                !terminal_scope(g)
+                    && g.split('/').any(|s| {
+                        s.starts_with("app-") && (s.ends_with(".scope") || s.ends_with(".service"))
+                    })
             })
         {
             let task = format!("cgroup:{}:{}:{group}", p.identity.boot_id, p.uid);
@@ -612,6 +638,25 @@ mod tests {
             a.application.unwrap().task_id
         );
     }
+    #[test]
+    fn ghostty_transient_scope_does_not_merge_unrelated_apps() {
+        let mut groups = Groups::default();
+        let config = Config::default();
+        let mut game = p(
+            20,
+            "/home/alice/.local/share/Steam/steamapps/common/Dominions6/dom6_amd64",
+        );
+        game.cgroup = Some("/user.slice/app-ghostty-surface-transient-639301.scope".into());
+        let game_app = groups.assign(&game, None, &config);
+        assert_eq!(game_app.name, "dom6_amd64");
+
+        let mut gh = p(21, "/usr/bin/gh");
+        gh.cgroup = game.cgroup.clone();
+        let gh_app = groups.assign(&gh, None, &config);
+        assert_eq!(gh_app.name, "gh");
+        assert_ne!(gh_app.task_id, game_app.task_id);
+    }
+
     #[test]
     fn python_modules_and_scripts_with_flags_have_distinct_application_identity() {
         let mut groups = Groups::default();

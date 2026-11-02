@@ -162,6 +162,13 @@ impl Collector {
             .map(|i| self.dropped.get(&i, 0).map(|v| v.iter().sum()).unwrap_or(0))
             .collect()
     }
+
+    /// Add runtime-discovered generated-output prefixes to the kernel filter.
+    /// Entries that exceed the verifier's path limit or the finite trie are
+    /// skipped with a warning rather than failing the capture loop.
+    pub fn add_ignore_prefixes(&mut self, prefixes: &[String]) -> Result<()> {
+        insert_ignore_prefixes(&mut self._bpf, prefixes.iter().cloned())
+    }
 }
 fn field(format: &TraceFormat, name: &str) -> Result<u32> {
     format
@@ -352,14 +359,21 @@ fn fill_read_prefixes(bpf: &mut Ebpf, config: &crate::config::Config) -> Result<
 }
 
 fn fill_ignore_prefixes(bpf: &mut Ebpf, config: &crate::config::Config) -> Result<()> {
-    let mut trie: LpmTrie<_, [u8; 128], u8> = bpf
-        .map_mut("IGNORE_PREFIXES")
-        .context("IGNORE_PREFIXES missing")?
-        .try_into()?;
     let mut prefixes = config.ignore_paths.clone();
     prefixes.extend(config.capture.noise_paths.clone());
     prefixes.sort();
     prefixes.dedup();
+    insert_ignore_prefixes(bpf, prefixes)
+}
+
+fn insert_ignore_prefixes(
+    bpf: &mut Ebpf,
+    prefixes: impl IntoIterator<Item = String>,
+) -> Result<()> {
+    let mut trie: LpmTrie<_, [u8; 128], u8> = bpf
+        .map_mut("IGNORE_PREFIXES")
+        .context("IGNORE_PREFIXES missing")?
+        .try_into()?;
     for prefix in prefixes {
         let bytes = prefix.as_bytes();
         if bytes.len() > 128 {

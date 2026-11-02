@@ -11,9 +11,77 @@
 use crate::process::ProcessRecord;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
+
+/// Tailscale's IPv4 address space is the RFC 6598 shared range. MagicDNS is
+/// the well-known resolver address inside that range.
+pub fn is_tailscale_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            octets[0] == 100 && (64..=127).contains(&octets[1])
+        }
+        IpAddr::V6(ip) => {
+            if let Some(ip) = ip.to_ipv4_mapped() {
+                return is_tailscale_ip(IpAddr::V4(ip));
+            }
+            let octets = ip.octets();
+            octets[..6] == [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]
+        }
+    }
+}
+
+pub fn is_magic_dns(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip == Ipv4Addr::new(100, 100, 100, 100),
+        IpAddr::V6(ip) => {
+            ip == Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0x53)
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|ip| ip == Ipv4Addr::new(100, 100, 100, 100))
+        }
+    }
+}
+
+/// Scope labels used by flows and incident details. Tailscale is kept
+/// distinct from both LAN and Internet so callers can treat the overlay
+/// explicitly rather than guessing from a private/public split.
+pub fn address_scope(ip: IpAddr) -> &'static str {
+    if let IpAddr::V6(ip) = ip
+        && let Some(ip) = ip.to_ipv4_mapped()
+    {
+        return address_scope(IpAddr::V4(ip));
+    }
+    if ip.is_loopback() {
+        "localhost"
+    } else if is_magic_dns(ip) {
+        "tailscale-magicdns"
+    } else if is_tailscale_ip(ip) {
+        "tailscale"
+    } else if is_private(ip) {
+        "LAN"
+    } else if ip.is_unspecified() {
+        "unspecified"
+    } else {
+        "Internet"
+    }
+}
+
+fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => {
+            ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|ip| ip.is_private() || ip.is_link_local())
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct NetworkContext {

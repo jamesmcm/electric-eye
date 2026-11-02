@@ -1,4 +1,6 @@
 mod api;
+mod auto_noise;
+mod bloom;
 mod btf;
 mod cache;
 mod collector;
@@ -26,7 +28,7 @@ mod store;
 mod vopono;
 mod wire;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -308,8 +310,35 @@ struct Session {
     flows: flows::Tracker,
     correlation: correlation::Engine,
     udp_peers: cache::Recent<()>,
+    auto_noise_prefixes: HashSet<String>,
+    new_auto_noise_prefixes: Vec<String>,
 }
 impl Session {
+    fn auto_noise(&mut self, path: &str) -> bool {
+        if !self.config.capture.auto_noise {
+            return false;
+        }
+        if self
+            .auto_noise_prefixes
+            .iter()
+            .any(|prefix| path.starts_with(prefix.as_str()))
+        {
+            return true;
+        }
+        let Some(prefix) = crate::auto_noise::prefix(path) else {
+            return false;
+        };
+        log::info!("auto-noise: ignoring {prefix}");
+        self.auto_noise_prefixes.insert(prefix.clone());
+        self.new_auto_noise_prefixes.push(prefix.clone());
+        self.state.lock().unwrap().add_auto_noise_prefix(prefix);
+        true
+    }
+
+    fn take_auto_noise_prefixes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.new_auto_noise_prefixes)
+    }
+
     fn entry(&self, raw: &wire::Record, event: ObservedEvent) -> ActivityEntry {
         let identity = ProcessIdentity {
             boot_id: self.boot_id.clone(),
@@ -510,6 +539,10 @@ impl Session {
             wire::READ | wire::OPEN | wire::WRITE | wire::MMAP | wire::UNLINK | wire::RENAME
         ) {
             let path = collector::cstr(&raw.path);
+            let path2 = collector::cstr(&raw.path2);
+            if self.auto_noise(&path) || (raw.kind == wire::RENAME && self.auto_noise(&path2)) {
+                return;
+            }
             let ignored = |path: &str| {
                 self.config
                     .ignore_paths
@@ -1136,6 +1169,8 @@ fn run() -> ExitCode {
         flows: flows::Tracker::with_limits(&config.limits),
         correlation: correlation::Engine::configured(&config),
         udp_peers: cache::Recent::new(config.limits.flow_entries),
+        auto_noise_prefixes: HashSet::new(),
+        new_auto_noise_prefixes: Vec::new(),
     };
     let mut inventory = session
         .processes
@@ -1198,12 +1233,21 @@ fn run() -> ExitCode {
         if SHUTDOWN.load(Ordering::Relaxed) {
             break;
         }
+        let mut learned_noise = Vec::new();
         let drained = collector
-            .drain_once(&mut |event| session.handle(event))
+            .drain_once(&mut |event| {
+                session.handle(event);
+                learned_noise.append(&mut session.take_auto_noise_prefixes());
+            })
             .unwrap_or_else(|err| {
                 log::warn!("event drain failed: {err:#}");
                 0
             });
+        if !learned_noise.is_empty()
+            && let Err(err) = collector.add_ignore_prefixes(&learned_noise)
+        {
+            log::warn!("could not install auto-noise prefixes: {err:#}");
+        }
         session.dns.poll();
         session.anomalies.prune(api::now_ms());
         if last_traffic.elapsed() >= Duration::from_millis(session.config.limits.aggregation_ms) {
@@ -1338,6 +1382,8 @@ mod regression_tests {
             flows: flows::Tracker::default(),
             correlation: correlation::Engine::default(),
             udp_peers: cache::Recent::new(config::Limits::default().flow_entries),
+            auto_noise_prefixes: HashSet::new(),
+            new_auto_noise_prefixes: Vec::new(),
         }
     }
     fn record(kind: u32, pid: u32, start: u64, path: &str) -> wire::Record {
@@ -1481,6 +1527,22 @@ mod regression_tests {
             "/home/review/link/../secret"
         );
     }
+    #[test]
+    fn session_learns_generated_output_prefixes() {
+        let mut session = session(None);
+        let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), b"[package]\n").unwrap();
+        let path = dir.path().join("target/debug/output");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = record(wire::READ, 1, 1, path.to_str().unwrap());
+        session.handle(record);
+        let prefixes = session.take_auto_noise_prefixes();
+        assert!(
+            prefixes.iter().any(|prefix| prefix.ends_with("/target")),
+            "{prefixes:?}"
+        );
+    }
+
     #[test]
     fn failed_writes_remain_attempts_without_bytes_or_baseline_learning() {
         let temp = tempfile::tempdir().unwrap();

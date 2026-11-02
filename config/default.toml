@@ -24,10 +24,10 @@ mcp_tools = []  # empty/default = status, incidents, investigate, activity, apps
 # paths = ["/home/you/work/project"]
 # log_paths = []  # empty = auto-detect Codex/OpenCode/Hermes/Omarchy logs
 raw_retention_minutes = 5
-activity_retention_days = 30
-process_retention_days = 30
-flow_retention_days = 30
-summary_retention_days = 30
+activity_retention_days = 7
+process_retention_days = 7
+flow_retention_days = 7
+summary_retention_days = 7
 noise_retention_days = 7
 incident_high_retention_days = 365
 incident_medium_retention_days = 90
@@ -62,6 +62,7 @@ allowlist = []
 network_allowlist = []
 browser_prefixes = [
     "/usr/lib/firefox",
+    "/usr/lib/firefox-developer-edition",
     "/usr/bin/firefox",
     "/opt/firefox",
     "/usr/lib/chromium",
@@ -98,6 +99,11 @@ high_churn_apps = [
     "opencode",
     "tailscaled",
     "Plex Media Server",
+    "steam",
+    "steamwebhelper",
+    "spotify",
+    "yt-dlp",
+    "youtube-dl",
 ]
 bulk_noise_paths = [
     "/.cache/",
@@ -105,6 +111,7 @@ bulk_noise_paths = [
     "/cache/",
     "/target/",
     "/node_modules/",
+    "/__pycache__/",
     "/.mozilla/",
     "/.config/chromium/",
     "/.config/google-chrome/",
@@ -166,6 +173,7 @@ idle_sleep_ms = 20
 
 [capture]
 ring_bytes = 16777216
+auto_noise = true
 pending_entries = 8192
 socket_entries = 32768
 network_pending_entries = 8192

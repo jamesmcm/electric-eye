@@ -165,7 +165,12 @@ except FileNotFoundError:
 os.chdir(root)
 
 # More than 32 paths, plus pure document overwrites for the bulk rule.
+# Freshly created files are treated as generated output; wait past the bulk
+# window before overwriting so the birth times are old enough to count.
 (root / "Documents").mkdir()
+for index in range(60):
+    write(root / "Documents" / f"document-{index}", b"payload")
+time.sleep(11)
 for index in range(60):
     write(root / "Documents" / f"document-{index}", b"payload")
 

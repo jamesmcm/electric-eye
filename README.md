@@ -30,6 +30,12 @@ not yet supported.
 - **Deterministic incidents:** sensitive paths, persistence, suspicious execs,
   credential sweeps and scope-aware bulk mutation. Local incoming traffic is
   not an incident by default; remote traffic keeps its higher severity.
+  Tailscale MagicDNS and peers are scoped explicitly instead of being mistaken
+  for Internet destinations.
+- **Automatic noise control:** build trees (`target`, `build`, `dist`,
+  `node_modules`, `__pycache__`), generated run directories such as `*_runs`,
+  and other recognised output roots are filtered in-kernel after first sight,
+  without hand-maintaining every project prefix.
 - **TUI, CLI and MCP:** browse incidents, activity, applications and flows in a
   terminal UI; query with a readable CLI or JSON; connect your own agent over
   MCP with a compact default tool set.

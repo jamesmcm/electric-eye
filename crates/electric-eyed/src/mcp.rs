@@ -1029,7 +1029,13 @@ mod framing_regressions {
             }
         });
         let mut byte = [0];
-        assert_eq!(reader.read(&mut byte).unwrap(), 0);
+        match reader.read(&mut byte) {
+            Ok(0) => {}
+            // A deadline close can surface as RST when the drip writer still
+            // has unread bytes in flight; either way the session ended.
+            Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected closed MCP session, got {other:?}"),
+        }
         let error = join.join().unwrap().unwrap_err();
         drip.join().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);

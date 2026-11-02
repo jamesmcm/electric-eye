@@ -35,10 +35,10 @@ redact_arguments = ["--password", "--token", "--secret", "--api-key"]
 ignore_paths = ["/home/alice/.cache"]
 mcp_tools = []
 raw_retention_minutes = 5
-activity_retention_days = 30
-process_retention_days = 30
-flow_retention_days = 30
-summary_retention_days = 30
+activity_retention_days = 7
+process_retention_days = 7
+flow_retention_days = 7
+summary_retention_days = 7
 noise_retention_days = 7
 incident_high_retention_days = 365
 incident_medium_retention_days = 90
@@ -82,6 +82,7 @@ api_timeout_ms = 500
 
 [capture]
 ring_bytes = 16777216
+auto_noise = true
 read_prefixes = ["/home/alice/another-sensitive-directory"]
 
 [correlation]
@@ -137,9 +138,10 @@ direction = "outbound"
 ```
 
 `destination` accepts a hostname, hostname suffix, exact IP, or CIDR. Incoming
-connections are classified as `remote`, `local_network`, or `same_machine`.
-Only remote sources produce incidents by default; local and same-machine
-traffic remains visible in flows. Set `incoming_local_connections = true` to
+connections are classified as `remote`, `local_network`, `same_machine`, or
+`tailscale`. Only remote sources produce high-severity incidents by default;
+local and same-machine traffic remains visible in flows, while Tailscale peers
+produce medium-severity incidents. Set `incoming_local_connections = true` to
 also emit medium-severity local incidents. `incoming_connections = false`
 disables all incoming incidents. High-churn applications such as P2P clients
 are excluded from incoming alerts. Deduplication is per local port and remote
@@ -148,8 +150,23 @@ source. Incident titles and details include the source scope.
 Bulk mutation severity is scope-aware: writes confined to one project or
 directory are **low**, mutations spanning multiple ordinary directories are
 **medium**, and mutations touching the home root, `/`, or system locations such
-as `/etc`, `/usr`, `/boot` or `/root` are **high**. The incident details include
-the computed `scope` and the affected files.
+as `/etc`, `/usr`, `/boot` or `/root` are **high**. A low-severity
+single-directory burst is treated as generated output when most affected files
+were created within the same window, so builds, screen captures and generated
+caches do not continuously re-alert; overwrites and removals still count. The
+incident details include the computed `scope` and the affected files.
+
+### Automatic generated-output filtering
+
+`capture.auto_noise` (default `true`) recognises conventional build and run
+output directories from the path itself: `target`, `build`, `dist`, `out`,
+`artifacts`, `generated`, `coverage`, `node_modules`, `__pycache__`, virtual
+environments, `*_runs`/`*-runs` directories, and similar project markers. The
+first event under such a directory installs the absolute prefix into the
+kernel ignore map, so the rest of the build or run is dropped before it reaches
+the ring buffer. Only paths under `/home`, `/tmp`, `/var/tmp`, `/mnt` or
+`/media` are considered, and credential directories are never auto-filtered.
+Set `auto_noise = false` to require explicit `ignore_paths` only.
 
 ### Network semantics
 
@@ -187,6 +204,18 @@ Each flow also has a conservative role and exposure:
 
 These roles are port/state heuristics. DHT, tracker and BitTorrent payloads are
 not inspected, so `udp_peer` covers DHT, µTP and other UDP peer discovery.
+
+Flow `scope` distinguishes `localhost`, `LAN`, `tailscale`,
+`tailscale-magicdns` and `Internet`. Tailscale uses the RFC 6598
+`100.64.0.0/10` range and its `fd7a:115c:a1e0::/48` IPv6 prefix. MagicDNS
+(`100.100.100.100` and `fd7a:115c:a1e0::53`) is treated as the local Tailscale
+resolver and is not reported as an application destination or credential
+egress. Other Tailscale
+peers are reported as low-severity `Novel Tailscale destination` incidents
+rather than Internet destinations, and sensitive-path egress to a Tailscale
+peer keeps `destination_scope = "tailscale"`. Novel-network baselines are
+stored as a bounded Bloom filter of hashed application/destination pairs, so a
+long-running daemon does not re-alert on destinations first seen after startup.
 
 Use `electric-eye netns` to list network contexts, listeners, published ports,
 vopono provider/protocol/server details, namespace applications and per-context
@@ -331,10 +360,12 @@ not yet covered by a throughput benchmark.
 Legacy additional allowlist entries are also read from `/etc/electric-eye/allowlist.conf` (override with
 `ELECTRIC_EYE_ALLOWLIST`). Each line is `<installed-name-or-exe> <subject-prefix>`; `*`
 suppresses all rules for that identity. Known paths and network destinations
-from recent events/activities form a bounded baseline at startup, and deterministic
-standalone sensitive-path novelty alerts are suppressed for previously seen file
-paths. Known credential accesses still feed per-process sweep/egress correlation;
-known document writes and truncations still feed bulk mutation. Bulk mutation ignores
+from recent events/activities form a bounded baseline at startup, and network
+destinations are also learned as they are first observed so they are reported as
+novel once rather than on every reconnect. Deterministic standalone sensitive-path
+novelty alerts are suppressed for previously seen file paths. Known credential
+accesses still feed per-process sweep/egress correlation; known document writes
+and truncations still feed bulk mutation. Bulk mutation ignores
 cache/thumbnail/build directories; novel-network rules are skipped for
 browsers and high-churn P2P clients.
 

@@ -3,7 +3,8 @@
 pub const SYSTEM: &[&str] = &[
     "/etc/shadow",
     "/etc/gshadow",
-    "/etc/passwd",
+    // /etc/passwd is world-readable account metadata, not a credential store.
+    // Reading it is routine for shells, log tools and user lookups.
     "/etc/sudoers",
     "/etc/sudoers.d",
 ];
@@ -15,7 +16,8 @@ pub const HOME: &[(&str, &str)] = &[
     (".azure", "Azure credentials"),
     (".kube", "Kubernetes credentials"),
     (".config/gcloud", "GCloud credentials"),
-    (".config/gh", "GitHub CLI credentials"),
+    // config.yml holds preferences and aliases; the OAuth token lives in hosts.yml.
+    (".config/gh/hosts.yml", "GitHub CLI credentials"),
     (".config/keepassxc", "Password manager"),
     (".local/share/keyrings", "Password manager"),
     (".password-store", "Password manager"),

@@ -92,34 +92,7 @@ fn endpoint(family: u32, addr: [u8; 16], port: u32) -> String {
     )
 }
 fn scope(addr: std::net::IpAddr) -> String {
-    match addr {
-        std::net::IpAddr::V4(a) => {
-            if a.is_loopback() {
-                "localhost"
-            } else if a.is_private() || a.is_link_local() {
-                "LAN"
-            } else if a.is_unspecified() {
-                "unspecified"
-            } else {
-                "Internet"
-            }
-        }
-        std::net::IpAddr::V6(a) => {
-            if let Some(v4) = a.to_ipv4_mapped() {
-                return scope(std::net::IpAddr::V4(v4));
-            }
-            if a.is_loopback() {
-                "localhost"
-            } else if a.is_unique_local() || a.is_unicast_link_local() {
-                "LAN"
-            } else if a.is_unspecified() {
-                "unspecified"
-            } else {
-                "Internet"
-            }
-        }
-    }
-    .into()
+    crate::net_context::address_scope(addr).into()
 }
 
 fn direction_for(kind: u32) -> &'static str {
@@ -487,6 +460,16 @@ mod tests {
         assert_eq!(tracker.rows.len(), 0);
         assert!(tracker.sockets.is_empty());
         assert_eq!(scope("::ffff:127.0.0.1".parse().unwrap()), "localhost");
+        assert_eq!(
+            scope("100.100.100.100".parse().unwrap()),
+            "tailscale-magicdns"
+        );
+        assert_eq!(scope("100.100.100.101".parse().unwrap()), "tailscale");
+        assert_eq!(scope("fd7a:115c:a1e0::1".parse().unwrap()), "tailscale");
+        assert_eq!(
+            scope("fd7a:115c:a1e0::53".parse().unwrap()),
+            "tailscale-magicdns"
+        );
     }
     #[test]
     fn flows_expose_roles_and_published_exposure() {

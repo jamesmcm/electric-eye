@@ -408,7 +408,11 @@ impl StoreClient {
         for row in rows {
             network.push(row?);
         }
-        Ok(BaselineData::from_pairs(paths, network))
+        Ok(BaselineData::from_pairs_with_capacity(
+            paths,
+            network,
+            self.baseline_limit,
+        ))
     }
 
     pub fn recent_activities(&self, limit: usize) -> Result<Value> {
@@ -894,6 +898,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS documents_parent ON documents(collection,json_extract(json,'$.parent.pid'),json_extract(json,'$.parent.start_ns'),json_extract(json,'$.parent.boot_id'));
         CREATE INDEX IF NOT EXISTS documents_superseded ON documents(collection,json_extract(json,'$.superseded_by'));
         CREATE INDEX IF NOT EXISTS documents_actor ON documents(collection,json_extract(json,'$.id'));
+        CREATE INDEX IF NOT EXISTS documents_open_flows ON documents(collection)
+            WHERE collection='flows'
+              AND json_extract(json,'$.closed_ms') IS NULL
+              AND COALESCE(json_extract(json,'$.state'),'')<>'observation_ended';
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY,
             ts_ms INTEGER NOT NULL,
@@ -1488,6 +1496,60 @@ mod persistence_regressions {
             "legacy"
         );
         store.shutdown();
+    }
+
+    #[test]
+    fn open_flow_migration_uses_partial_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let plan: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN UPDATE documents SET json=json_set(json,'$.last_known_state',json_extract(json,'$.state'),'$.state','observation_ended','$.observation_ended_ms',1)
+                     WHERE collection='flows' AND json_extract(json,'$.closed_ms') IS NULL AND COALESCE(json_extract(json,'$.state'),'')<>'observation_ended'",
+                )
+                .unwrap();
+            let rows = stmt.query_map([], |row| row.get::<_, String>(3)).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("documents_open_flows")),
+            "startup flow migration did not use the partial index: {plan:?}"
+        );
+
+        conn.execute(
+            "INSERT INTO documents(collection,key,ts_ms,json) VALUES('flows','open',1,?1)",
+            params![r#"{"state":"open"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents(collection,key,ts_ms,json) VALUES('flows','closed',1,?1)",
+            params![r#"{"state":"closed","closed_ms":2}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE documents SET json=json_set(json,'$.last_known_state',json_extract(json,'$.state'),'$.state','observation_ended','$.observation_ended_ms',1)
+             WHERE collection='flows' AND json_extract(json,'$.closed_ms') IS NULL AND COALESCE(json_extract(json,'$.state'),'')<>'observation_ended'",
+            [],
+        )
+        .unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT json_extract(json,'$.state') FROM documents WHERE key='open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "observation_ended");
+        let closed: String = conn
+            .query_row(
+                "SELECT json_extract(json,'$.state') FROM documents WHERE key='closed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(closed, "closed");
     }
 }
 

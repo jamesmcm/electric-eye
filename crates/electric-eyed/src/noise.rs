@@ -78,6 +78,9 @@ fn sensitive_candidate(path: &str) -> bool {
 }
 
 fn already_filtered(path: &str, config: &Config) -> bool {
+    if crate::auto_noise::looks_generated(path) {
+        return true;
+    }
     config
         .ignore_paths
         .iter()
@@ -92,6 +95,59 @@ fn app_already_allowlisted(app: &str, config: &Config) -> bool {
             .allowlist
             .iter()
             .any(|rule| rule.subject_prefix == "*" && rule.application == app)
+}
+
+/// Interpreters, shells and coreutils are process hosts, not applications.
+/// Allowlisting them would suppress activity from every script or command the
+/// user runs, so they must never become allowlist suggestions.
+fn generic_application(app: &str) -> bool {
+    let base = app.rsplit('/').next().unwrap_or(app);
+    let base = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    matches!(
+        base,
+        "python"
+            | "python3"
+            | "node"
+            | "nodejs"
+            | "bun"
+            | "deno"
+            | "ruby"
+            | "perl"
+            | "php"
+            | "java"
+            | "bash"
+            | "sh"
+            | "dash"
+            | "zsh"
+            | "fish"
+            | "nu"
+            | "env"
+            | "sudo"
+            | "doas"
+            | "timeout"
+            | "xargs"
+            | "find"
+            | "make"
+            | "cmake"
+            | "ninja"
+            | "cargo"
+            | "git"
+            | "cp"
+            | "mv"
+            | "rm"
+            | "cat"
+            | "sed"
+            | "awk"
+            | "grep"
+            | "rg"
+            | "jq"
+            | "tar"
+            | "bsdtar"
+            | "curl"
+            | "wget"
+            | "ssh"
+            | "scp"
+    )
 }
 
 fn add_path(stats: &mut HashMap<String, PathStat>, path: &str, kind: &str, count: u64, bytes: u64) {
@@ -212,7 +268,7 @@ pub fn value(store: Option<&StoreClient>, state: &Arc<Mutex<SharedState>>, limit
     let mut app_counts: HashMap<String, (u64, HashMap<String, u64>)> = HashMap::new();
     for incident in incidents(store, state, limit) {
         let app = incident["comm"].as_str().unwrap_or_default();
-        if app.is_empty() || app_already_allowlisted(app, &config) {
+        if app.is_empty() || generic_application(app) || app_already_allowlisted(app, &config) {
             continue;
         }
         let entry = app_counts.entry(app.to_string()).or_default();
@@ -377,6 +433,28 @@ mod tests {
         let value = value(None, &state, 100);
         assert!(value["candidates"].is_array());
         assert!(value["suggested_config"].is_string());
+    }
+
+    #[test]
+    fn generic_process_hosts_are_not_allowlist_candidates() {
+        for app in ["python3", "python3.14", "node", "bash", "cp", "rm", "curl"] {
+            assert!(generic_application(app), "{app}");
+        }
+        for app in ["gh", "spotify", "freeorionca", "opencode"] {
+            assert!(!generic_application(app), "{app}");
+        }
+    }
+
+    #[test]
+    fn auto_noise_paths_are_not_suggested_again() {
+        assert!(already_filtered(
+            "/home/alice/project/target/debug/out",
+            &Config::default()
+        ));
+        assert!(already_filtered(
+            "/home/alice/dom6bot_runs/win-1/out.json",
+            &Config::default()
+        ));
     }
 
     #[test]
